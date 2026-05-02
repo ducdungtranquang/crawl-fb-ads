@@ -1,5 +1,6 @@
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
+const UserAgent = require('user-agents');
 
 // ===== CONFIG =====
 const MONGO_URI = 'mongodb://127.0.0.1:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
@@ -7,9 +8,7 @@ const DB_NAME = 'fb_ads';
 
 const USER_DATA_DIR = './chrome-profile';
 const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-
-// nếu bạn login FB ở profile khác thì đổi
-const PROFILE = 'Default'; // hoặc 'Profile 1'
+const PROFILE = 'Default';
 
 // ===== LOGIC =====
 const SEEN_THRESHOLD = 10 * 60 * 1000;
@@ -17,7 +16,11 @@ let db;
 const seen = new Set();
 
 // ===== UTILS =====
-function randomDelay(min = 1500, max = 3500) {
+function randomDelay(min = 2000, max = 4000) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function randomInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
@@ -127,6 +130,42 @@ function extractAds(json) {
     }
 }
 
+// ===== FINGERPRINT PATCH =====
+async function applyStealth(page) {
+    await page.addInitScript(() => {
+
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => false,
+        });
+
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en'],
+        });
+
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5],
+        });
+
+        Object.defineProperty(navigator, 'hardwareConcurrency', {
+            get: () => Math.floor(Math.random() * 4) + 4,
+        });
+
+        // fake chrome object
+        window.chrome = {
+            runtime: {},
+        };
+
+        // WebGL spoof
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function (param) {
+            if (param === 37445) return 'Intel Inc.';
+            if (param === 37446) return 'Intel Iris OpenGL Engine';
+            return getParameter(param);
+        };
+
+    });
+}
+
 // ===== WORKER =====
 async function worker(context, keywords, id) {
 
@@ -154,7 +193,17 @@ async function worker(context, keywords, id) {
     for (const keyword of keywords) {
         console.log(`W${id} 🔍`, keyword);
 
-        const page = await context.newPage();
+        const ua = new UserAgent();
+
+        const page = await context.newPage({
+            userAgent: ua.toString(),
+            viewport: {
+                width: randomInt(1200, 1920),
+                height: randomInt(700, 1080)
+            }
+        });
+
+        await applyStealth(page);
 
         const url = `https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=ALL&q=${encodeURIComponent(keyword)}`;
 
@@ -164,9 +213,8 @@ async function worker(context, keywords, id) {
                 timeout: 60000
             });
 
-            await page.waitForTimeout(3000);
+            await page.waitForTimeout(randomDelay(3000, 6000));
 
-            // auto close popup adblock nếu có
             try {
                 await page.click('text=OK', { timeout: 3000 });
             } catch { }
@@ -175,21 +223,23 @@ async function worker(context, keywords, id) {
             let same = 0;
 
             while (true) {
-                 await page.mouse.move(
-                        Math.random() * 800,
-                        Math.random() * 600
-                    );
-                const curr = await page.evaluate(() => {
-                    const random = Math.floor(Math.random() * 50);
-                    window.scrollBy(0, window.innerHeight + random);
-                    // await page.evaluate(() => {
-                    //     const random = Math.floor(Math.random() * 500) + 300;
-                    //     window.scrollBy(0, random);
-                    // });
-                    return document.body.scrollHeight;
+
+                // random mouse movement
+                await page.mouse.move(
+                    randomInt(0, 800),
+                    randomInt(0, 600)
+                );
+
+                // random scroll (both up & down)
+                await page.evaluate(() => {
+                    const direction = Math.random() > 0.3 ? 1 : -1;
+                    const amount = Math.random() * 800 + 200;
+                    window.scrollBy(0, direction * amount);
                 });
 
                 await page.waitForTimeout(randomDelay());
+
+                const curr = await page.evaluate(() => document.body.scrollHeight);
 
                 if (curr === prev) same++;
                 else same = 0;
@@ -204,6 +254,9 @@ async function worker(context, keywords, id) {
         }
 
         await page.close();
+
+        // random nghỉ giữa keyword
+        await new Promise(r => setTimeout(r, randomDelay(3000, 6000)));
     }
 }
 
@@ -236,23 +289,22 @@ function chunkArray(arr, n) {
     console.log('🔥 Using REAL Chrome profile');
 
     const keywords = [
-        "decor",
         "nội thất",
-        "furniture",
+        "sách",
+        "tiện ích",
+        "đồ gia dụng",
+        "thời trang nam",
+        "thời trang nữ",
+        "công nghệ",
+        "làm đẹp",
+        "mẹ và bé",
     ];
 
     const chunks = chunkArray(keywords, 2);
-
-    // await Promise.all(
-    //     chunks.map((chunk, i) =>
-    //         worker(context, chunk, i + 1)
-    //     )
-    // );
 
     for (let i = 0; i < chunks.length; i++) {
         await worker(context, chunks[i], i + 1);
     }
 
     console.log('✅ DONE');
-
 })();
