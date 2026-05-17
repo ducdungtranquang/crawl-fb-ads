@@ -1,6 +1,5 @@
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
-const UserAgent = require('user-agents');
 
 // ===== CONFIG =====
 const MONGO_URI = 'mongodb://127.0.0.1:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
@@ -14,6 +13,7 @@ const PROFILE = 'Default';
 const SEEN_THRESHOLD = 10 * 60 * 1000;
 let db;
 const seen = new Set();
+let lastSavedAt = Date.now();
 
 // ===== UTILS =====
 function randomDelay(min = 2000, max = 4000) {
@@ -142,14 +142,6 @@ async function applyStealth(page) {
             get: () => ['en-US', 'en'],
         });
 
-        Object.defineProperty(navigator, 'plugins', {
-            get: () => [1, 2, 3, 4, 5],
-        });
-
-        Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: () => Math.floor(Math.random() * 4) + 4,
-        });
-
         // fake chrome object
         window.chrome = {
             runtime: {},
@@ -157,10 +149,12 @@ async function applyStealth(page) {
 
         // WebGL spoof
         const getParameter = WebGLRenderingContext.prototype.getParameter;
+
         WebGLRenderingContext.prototype.getParameter = function (param) {
             if (param === 37445) return 'Intel Inc.';
             if (param === 37446) return 'Intel Iris OpenGL Engine';
-            return getParameter(param);
+
+            return getParameter.call(this, param);
         };
 
     });
@@ -172,31 +166,39 @@ async function worker(context, keywords, id) {
     context.on('response', async (res) => {
         try {
             const url = res.url();
+
             if (!url.includes('graphql')) return;
 
             const text = await res.text();
+
             if (!text.includes('ad_library_main')) return;
 
             const json = JSON.parse(text);
+
             const ads = extractAds(json);
 
             for (const ad of ads) {
                 if (!seen.has(ad.ad_archive_id)) {
+
                     seen.add(ad.ad_archive_id);
+
                     await saveAd(ad);
+
+                    lastSavedAt = Date.now();
+
                     console.log(`W${id} ✔`, ad.ad_archive_id);
                 }
             }
+
         } catch { }
     });
 
     for (const keyword of keywords) {
+
         console.log(`W${id} 🔍`, keyword);
 
-        const ua = new UserAgent();
-
+        // ❌ bỏ random user-agent
         const page = await context.newPage({
-            userAgent: ua.toString(),
             viewport: {
                 width: randomInt(1200, 1920),
                 height: randomInt(700, 1080)
@@ -205,9 +207,11 @@ async function worker(context, keywords, id) {
 
         await applyStealth(page);
 
-        const url = `https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=ALL&q=${encodeURIComponent(keyword)}`;
+        const url = `https://www.facebook.com/ads/library/?ad_type=all&country=ALL&q=${encodeURIComponent(keyword)}`;
+        lastSavedAt = Date.now();
 
         try {
+
             await page.goto(url, {
                 waitUntil: 'domcontentloaded',
                 timeout: 60000
@@ -224,29 +228,40 @@ async function worker(context, keywords, id) {
 
             while (true) {
 
+                if (Date.now() - lastSavedAt > 200000) {
+                    console.log(`⏱️ W${id} NO DATA >200s → skip keyword`);
+                    break;
+                }
+
                 // random mouse movement
                 await page.mouse.move(
                     randomInt(0, 800),
-                    randomInt(0, 600)
+                    randomInt(0, 600),
+                    {
+                        steps: randomInt(10, 25)
+                    }
                 );
 
-                // random scroll (both up & down)
+                // random scroll
                 await page.evaluate(() => {
                     const direction = Math.random() > 0.3 ? 1 : -1;
                     const amount = Math.random() * 800 + 200;
+
                     window.scrollBy(0, direction * amount);
                 });
 
                 await page.waitForTimeout(randomDelay());
 
-                const curr = await page.evaluate(() => document.body.scrollHeight);
+                const curr = await page.evaluate(
+                    () => document.body.scrollHeight
+                );
 
                 if (curr === prev) same++;
                 else same = 0;
 
                 prev = curr;
 
-                if (same >= 4) break;
+                // if (same >= 5) break;
             }
 
         } catch (e) {
@@ -256,21 +271,26 @@ async function worker(context, keywords, id) {
         await page.close();
 
         // random nghỉ giữa keyword
-        await new Promise(r => setTimeout(r, randomDelay(3000, 6000)));
+        await new Promise(r =>
+            setTimeout(r, randomDelay(3000, 6000))
+        );
     }
 }
 
 // ===== SPLIT =====
 function chunkArray(arr, n) {
     const result = Array.from({ length: n }, () => []);
+
     arr.forEach((item, i) => {
         result[i % n].push(item);
     });
+
     return result;
 }
 
 // ===== MAIN =====
 (async () => {
+
     await connectDB();
 
     const context = await chromium.launchPersistentContext(
@@ -289,15 +309,61 @@ function chunkArray(arr, n) {
     console.log('🔥 Using REAL Chrome profile');
 
     const keywords = [
-        "nội thất",
-        "sách",
-        "tiện ích",
-        "đồ gia dụng",
-        "thời trang nam",
-        "thời trang nữ",
-        "công nghệ",
-        "làm đẹp",
-        "mẹ và bé",
+
+        // 'shopee',
+        // 'lazada',
+        // 'tiktok shop',
+        // 'điện thoại',
+        // 'iphone',
+        // 'samsung',
+        // 'xiaomi',
+        // 'laptop',
+        // 'máy tính',
+        // 'gaming',
+
+        // 'mỹ phẩm',
+        // 'skincare',
+        'serum',
+        'kem chống nắng',
+        'sữa rửa mặt',
+        'nước hoa',
+        'spa',
+        'thẩm mỹ',
+        'giảm cân',
+        'gym',
+
+        'quần áo',
+        'thời trang',
+        'giày dép',
+        'túi xách',
+        'đồng hồ',
+        'phụ kiện',
+        'local brand',
+        'áo thun',
+        'váy',
+        'hoodie',
+
+        'trà sữa',
+        'cafe',
+        'ăn vặt',
+        'nhà hàng',
+        'thực phẩm',
+        'đồ uống',
+        'du lịch',
+        'khách sạn',
+        'vé máy bay',
+        'resort',
+
+        'bất động sản',
+        'chung cư',
+        'vay tiền',
+        'ngân hàng',
+        'bảo hiểm',
+        'đầu tư',
+        'crypto',
+        'bitcoin',
+        'affiliate',
+        'dropshipping'
     ];
 
     const chunks = chunkArray(keywords, 2);
@@ -307,4 +373,5 @@ function chunkArray(arr, n) {
     }
 
     console.log('✅ DONE');
+
 })();
