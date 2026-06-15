@@ -88,9 +88,9 @@ async function initializeInfrastructure() {
         const targetTopics = [
             'fb-ads-events',
             'system-logs',
-            'fb-crawler-logs',
-            'fb-analyzer-logs',
-            'logger-topic'
+            // 'fb-crawler-logs',
+            // 'fb-analyzer-logs',
+            // 'logger-topic'
         ];
 
         // Lấy danh sách các topic hiện tại đang có trên Kafka Broker
