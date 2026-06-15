@@ -1,7 +1,7 @@
 {
   "name": "fb-crawl-2",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "crawler.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },

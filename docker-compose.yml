@@ -1,0 +1,80 @@
+services:
+  # ===== APACHE KAFKA ECOSYSTEM =====
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: fb-ads-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - fb-ads-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: fb-ads-kafka
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fb-ads-network
+
+  # ===== APPLICATION SERVICES =====
+  monitoring-service:
+    build: ./fb-ads-system/monitoring
+    container_name: fb-ads-monitor
+    ports:
+      - "4000:4000"
+    environment:
+      - MONGO_URI=mongodb://host.docker.internal:27017/?directConnection=true
+      - KAFKA_BROKERS=kafka:9092
+      - TZ=UTC
+      - NODE_OPTIONS=--trace-warnings
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - fb-ads-network
+
+  analyzer-service:
+    build: ./fb-ads-system/analyzer
+    container_name: fb-ads-analyzer
+    environment:
+      - MONGO_URI=mongodb://host.docker.internal:27017/?directConnection=true
+      - KAFKA_BROKERS=kafka:9092
+      - TZ=UTC
+      - NODE_OPTIONS=--trace-warnings
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - fb-ads-network
+
+  crawler-service:
+    build: ./fb-ads-system/crawler
+    container_name: fb-ads
+    environment:
+      - MONGO_URI=mongodb://host.docker.internal:27017/?directConnection=true
+      - KAFKA_BROKERS=kafka:9092
+      - TZ=UTC
+      - NODE_OPTIONS=--trace-warnings
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - fb-ads-network
+
+networks:
+  fb-ads-network:
+    driver: bridge
