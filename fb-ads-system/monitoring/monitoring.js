@@ -1,6 +1,7 @@
 const { MongoClient } = require('mongodb');
 const { Kafka } = require('kafkajs');
 const express = require('express');
+const path = require('path');
 
 process.removeAllListeners('warning');
 process.on('warning', (warning) => {
@@ -11,7 +12,7 @@ process.on('warning', (warning) => {
 const originalSetTimeout = global.setTimeout;
 global.setTimeout = function (callback, delay, ...args) {
     if (typeof delay === 'number' && delay < 0) {
-        return originalSetTimeout(callback, 1000, ...args); 
+        return originalSetTimeout(callback, 1000, ...args);
     }
     return originalSetTimeout(callback, delay, ...args);
 };
@@ -41,22 +42,21 @@ let dashboardMetrics = {
 
 // ===== CONNECT DB & START KAFKA =====
 async function startMonitoring() {
-    // 1. Kết nối DB
     const client = new MongoClient(MONGO_URI);
     await client.connect();
     db = client.db(DB_NAME);
     console.log('✅ Monitoring MongoDB connected');
 
-    // Tạo Index cho log_time để sau này truy vấn log nhanh hơn
-    await db.collection('logs').createIndex({ timestamp: -1 });
+    // TỐI ƯU HÓA: Tạo chỉ mục phức hợp để lọc kết hợp đa dạng điều kiện (Service + Level + Time) cực nhanh
+    const logsCol = db.collection('logs');
+    await logsCol.createIndex({ service: 1, level: 1, timestamp: -1 });
+    await logsCol.createIndex({ timestamp: -1 });
 
-    // 2. Kết nối Kafka
     await consumer.connect();
     await consumer.subscribe({ topic: LOG_TOPIC, fromBeginning: false });
 
     console.log('🖥️  Monitoring Service đang lắng nghe log hệ thống từ Kafka...');
 
-    // Xử lý gom Batch Log để lưu vào DB cho nhanh
     await consumer.run({
         eachBatch: async ({ batch, resolveOffset, heartbeat }) => {
             const bulkLogs = [];
@@ -64,18 +64,23 @@ async function startMonitoring() {
             for (const message of batch.messages) {
                 try {
                     const logEntry = JSON.parse(message.value.toString());
+                    // Đảm bảo cấu trúc timestamp luôn là dạng Number
+                    if (logEntry.timestamp && typeof logEntry.timestamp === 'string') {
+                        logEntry.timestamp = new Date(logEntry.timestamp).getTime();
+                    } else if (!logEntry.timestamp) {
+                        logEntry.timestamp = Date.now();
+                    }
+
                     bulkLogs.push(logEntry);
 
-                    // Cập nhật số liệu Real-time metrics
                     dashboardMetrics.total_logs++;
                     if (logEntry.level === 'INFO') dashboardMetrics.info_count++;
                     if (logEntry.level === 'WARN') dashboardMetrics.warn_count++;
                     if (logEntry.level === 'ERROR') {
                         dashboardMetrics.error_count++;
-                        // Gom lỗi mới nhất lên đầu mảng
                         dashboardMetrics.recent_errors.unshift(logEntry);
                         if (dashboardMetrics.recent_errors.length > 10) {
-                            dashboardMetrics.recent_errors.pop(); 
+                            dashboardMetrics.recent_errors.pop();
                         }
                     }
                 } catch (e) {
@@ -84,7 +89,7 @@ async function startMonitoring() {
             }
 
             if (bulkLogs.length > 0) {
-                await db.collection('logs').insertMany(bulkLogs);
+                await logsCol.insertMany(bulkLogs);
             }
 
             for (const message of batch.messages) { resolveOffset(message.offset); }
@@ -93,27 +98,52 @@ async function startMonitoring() {
     });
 }
 
-// ===== API SERVER ĐỂ CHECK LOG & ERROR =====
+// ===== API SERVER =====
 const app = express();
 app.use(express.json());
 
-// 1. API lấy tổng quan số lượng lỗi/log (Dùng cho giao diện Dashboard)
+// Phục vụ thư mục UI tĩnh
+app.use(express.static(path.join(__dirname, 'public')));
+
+// 1. API lấy tổng quan số liệu thống kê nhanh
 app.get('/api/monitor/summary', (req, res) => {
     res.json({ success: true, metrics: dashboardMetrics });
 });
 
-// 2. API Tra cứu Log lịch sử, hỗ trợ filter theo Service hoặc Level (ERROR/INFO)
+// 2. API ĐÃ ĐƯỢC NÂNG CẤP: Hỗ trợ lọc đa dạng theo Dịch vụ, Trạng thái (INFO/WARN/ERROR), Thời gian
 app.get('/api/monitor/logs', async (req, res) => {
     try {
-        const { service, level, limit = 50 } = req.query;
-        const query = {};
-        if (service) query.service = service;
-        if (level) query.level = level.toUpperCase();
+        const { service, level, startTime, endTime, limit = 50 } = req.query;
 
+        // Khởi tạo Object query động
+        const query = {};
+
+        // Lọc theo Service cụ thể
+        if (service) {
+            query.service = service;
+        }
+
+        // Lọc theo Trạng thái / Cấp độ lỗi
+        if (level) {
+            query.level = level.toUpperCase();
+        }
+
+        // Lọc theo Khoảng thời gian (Kiểm tra mốc Timestamp dạng số)
+        if (startTime || endTime) {
+            query.timestamp = {};
+            if (startTime) {
+                query.timestamp.$gte = parseInt(startTime, 10);
+            }
+            if (endTime) {
+                query.timestamp.$lte = parseInt(endTime, 10);
+            }
+        }
+
+        // Thực thi tìm kiếm trên Database đã được Index
         const logs = await db.collection('logs')
             .find(query)
-            .sort({ timestamp: -1 })
-            .limit(parseInt(limit))
+            .sort({ timestamp: -1 }) // Ưu tiên các dòng log mới nhất lên đầu
+            .limit(Math.min(parseInt(limit, 10), 200)) // Đặt lằn ranh giới hạn để bảo vệ băng thông ứng dụng
             .toArray();
 
         res.json({ success: true, count: logs.length, data: logs });

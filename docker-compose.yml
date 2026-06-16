@@ -60,6 +60,8 @@ services:
         condition: service_healthy
     networks:
       - fb-ads-network
+    ports:
+      - "5002:5002"
 
   crawler-service:
     build: ./fb-ads-system/crawler

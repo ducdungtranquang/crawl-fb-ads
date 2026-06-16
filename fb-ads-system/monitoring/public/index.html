@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hệ Thống Phân Tích Log Tập Trung</title>
+    <script src="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.js"></script>
+    <style>
+        body { background-color: #0b0f19; color: #cbd5e1; }
+        .card { background-color: #111827; border: 1px solid #1f2937; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #111827; }
+        ::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+    </style>
+</head>
+<body class="p-6 font-sans">
+    <div class="max-w-7xl mx-auto">
+        <div class="flex justify-between items-center mb-8 pb-4 border-b border-gray-800">
+            <div>
+                <h1 class="text-2xl font-bold text-white tracking-tight">📡 Trung Tâm Kiểm Soát & Phân Tích Log</h1>
+                <p class="text-gray-400 text-xs mt-1">Hệ thống phân tích, lọc trạng thái vận hành của Crawler & Analyzer</p>
+            </div>
+            <div class="flex items-center space-x-4">
+                <button onclick="fetchLogs()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-xs font-semibold transition">
+                    🔄 Làm mới bộ lọc
+                </button>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+            <div class="card p-4 rounded-xl">
+                <p class="text-xs text-gray-400 font-medium">Tổng Log Thu Thập (Realtime)</p>
+                <p id="metric-total" class="text-2xl font-bold text-blue-400 mt-1">0</p>
+            </div>
+            <div class="card p-4 rounded-xl">
+                <p class="text-xs text-gray-400 font-medium">Trạng Thái Thành Công (INFO)</p>
+                <p id="metric-info" class="text-2xl font-bold text-emerald-400 mt-1">0</p>
+            </div>
+            <div class="card p-4 rounded-xl">
+                <p class="text-xs text-gray-400 font-medium">Cảnh Báo Hệ Thống (WARN)</p>
+                <p id="metric-warn" class="text-2xl font-bold text-amber-400 mt-1">0</p>
+            </div>
+            <div class="card p-4 rounded-xl">
+                <p class="text-xs text-gray-400 font-medium">Lỗi Nghiêm Trọng (ERROR)</p>
+                <p id="metric-error" class="text-2xl font-bold text-rose-500 mt-1">0</p>
+            </div>
+        </div>
+
+        <div class="card p-4 rounded-xl mb-6 grid grid-cols-1 md:grid-cols-5 gap-4 items-end">
+            <div>
+                <label class="block text-xs font-medium text-gray-400 mb-2">Dịch vụ vận hành</label>
+                <select id="filter-service" class="w-full bg-gray-900 border border-gray-700 text-gray-200 rounded-lg text-xs p-2.5 focus:outline-none focus:border-indigo-500">
+                    <option value="">Tất cả dịch vụ</option>
+                    <option value="crawler-service">Crawler Service</option>
+                    <option value="analyzer-service">Analyzer Service</option>
+                </select>
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-400 mb-2">Trạng thái / Cấp độ</label>
+                <select id="filter-level" class="w-full bg-gray-900 border border-gray-700 text-gray-200 rounded-lg text-xs p-2.5 focus:outline-none focus:border-indigo-500">
+                    <option value="">Tất cả trạng thái</option>
+                    <option value="INFO">INFO (Thành công / Luồng chạy)</option>
+                    <option value="WARN">WARN (Cảnh báo hệ thống)</option>
+                    <option value="ERROR">ERROR (Lỗi logic sập luồng)</option>
+                </select>
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-400 mb-2">Từ ngày / Giờ</label>
+                <input type="datetime-local" id="filter-start" class="w-full bg-gray-900 border border-gray-700 text-gray-200 rounded-lg text-xs p-2 focus:outline-none focus:border-indigo-500">
+            </div>
+            <div>
+                <label class="block text-xs font-medium text-gray-400 mb-2">Đến ngày / Giờ</label>
+                <input type="datetime-local" id="filter-end" class="w-full bg-gray-900 border border-gray-700 text-gray-200 rounded-lg text-xs p-2 focus:outline-none focus:border-indigo-500">
+            </div>
+            <div>
+                <button onclick="fetchLogs()" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs py-2.5 rounded-lg transition shadow-md">
+                    🔍 Áp dụng bộ lọc
+                </button>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+            <div class="card p-4 rounded-xl lg:col-span-1 flex flex-col h-[550px]">
+                <h3 class="text-sm font-semibold text-rose-400 mb-3 flex items-center">
+                    🚨 Sự cố phát sinh gần đây
+                </h3>
+                <div id="error-list" class="space-y-2 overflow-y-auto flex-1 pr-1">
+                    </div>
+            </div>
+            
+            <div class="card p-4 rounded-xl lg:col-span-3 flex flex-col h-[550px]">
+                <div class="flex justify-between items-center mb-3">
+                    <h3 class="text-sm font-semibold text-white">🖥️ Kết quả truy vấn Log chi tiết trong Database</h3>
+                    <span id="log-count" class="text-xs font-mono text-gray-400 bg-gray-800 px-2 py-0.5 rounded">Hiển thị: 0 bản ghi</span>
+                </div>
+                <div id="logs-terminal" class="bg-gray-950 p-4 rounded-lg font-mono text-xs overflow-y-auto flex-1 text-gray-300 space-y-1.5 border border-gray-800">
+                    </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function updateMetricsSummary() {
+            try {
+                const res = await fetch('/api/monitor/summary');
+                const data = await res.json();
+                if (!data.success) return;
+
+                document.getElementById('metric-total').innerText = data.metrics.total_logs;
+                document.getElementById('metric-info').innerText = data.metrics.info_count;
+                document.getElementById('metric-warn').innerText = data.metrics.warn_count;
+                document.getElementById('metric-error').innerText = data.metrics.error_count;
+
+                const errorList = document.getElementById('error-list');
+                errorList.innerHTML = data.metrics.recent_errors.length === 0
+                    ? '<p class="text-xs text-gray-500 italic p-2 text-center">Chưa có sự cố nào xảy ra.</p>'
+                    : data.metrics.recent_errors.map(err => `
+                        <div class="p-2.5 bg-rose-950/20 border border-rose-900/40 rounded-lg text-xs">
+                            <div class="flex justify-between text-rose-400 font-semibold mb-1">
+                                <span>${err.service}</span>
+                                <span>${new Date(err.timestamp).toLocaleTimeString()}</span>
+                            </div>
+                            <p class="text-gray-300 break-all">${err.message}</p>
+                        </div>
+                    `).join('');
+            } catch (err) { console.error('Metrics loading error:', err); }
+        }
+
+        async function fetchLogs() {
+            try {
+                const service = document.getElementById('filter-service').value;
+                const level = document.getElementById('filter-level').value;
+                const startTime = document.getElementById('filter-start').value;
+                const endTime = document.getElementById('filter-end').value;
+
+                // Xây dựng URL query string động
+                let params = new URLSearchParams();
+                params.append('limit', '100'); // Trả về tối đa 100 dòng phân tích cho nhẹ mạng
+                if (service) params.append('service', service);
+                if (level) params.append('level', level);
+                if (startTime) params.append('startTime', new Date(startTime).getTime());
+                if (endTime) params.append('endTime', new Date(endTime).getTime());
+
+                const res = await fetch(`/api/monitor/logs?${params.toString()}`);
+                const data = await res.json();
+                if (!data.success) return;
+
+                document.getElementById('log-count').innerText = `Hiển thị: ${data.count} bản ghi`;
+
+                const terminal = document.getElementById('logs-terminal');
+                if (data.data.length === 0) {
+                    terminal.innerHTML = '<p class="text-gray-500 italic text-center pt-4">Không tìm thấy dữ liệu log phù hợp với điều kiện lọc.</p>';
+                    return;
+                }
+
+                terminal.innerHTML = data.data.map(log => {
+                    let levelColor = 'text-emerald-400';
+                    let rowBg = '';
+                    if (log.level === 'WARN') levelColor = 'text-amber-400';
+                    if (log.level === 'ERROR') {
+                        levelColor = 'text-rose-500 font-bold';
+                        rowBg = 'bg-rose-950/10 px-1 rounded';
+                    }
+                    return `
+                        <div class="flex items-start space-x-2 py-0.5 hover:bg-gray-900 transition tracking-wide ${rowBg}">
+                            <span class="text-gray-500 shrink-0">[${new Date(log.timestamp).toISOString()}]</span>
+                            <span class="${levelColor} font-semibold shrink-0">[${log.level}]</span>
+                            <span class="text-indigo-400 font-medium shrink-0">[${log.service}]:</span>
+                            <span class="text-gray-300 break-all">${log.message}</span>
+                        </div>
+                    `;
+                }).join('');
+            } catch (err) { console.error('Querying logs failure:', err); }
+        }
+
+        // Định kỳ cập nhật nhẹ số liệu tổng quan realtime mỗi 4 giây
+        setInterval(updateMetricsSummary, 4000);
+        
+        // Khởi động load lần đầu
+        updateMetricsSummary();
+        fetchLogs();
+    </script>
+</body>
+</html>

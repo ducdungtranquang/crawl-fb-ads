@@ -1,5 +1,6 @@
 const { MongoClient } = require('mongodb');
 const { Kafka } = require('kafkajs');
+const { initSearchServer } = require('./searchApi');
 
 process.removeAllListeners('warning');
 process.on('warning', (warning) => {
@@ -245,10 +246,24 @@ async function main() {
   const db = client.db(DB_NAME);
   const adsCol = db.collection('analyzed_ads');
 
+  initSearchServer(db);
+
   const kafka = new Kafka({ clientId: 'fb-analyzer-service', brokers: KAFKA_BROKERS });
   const consumer = kafka.consumer({ 
-    groupId: CONSUMER_GROUP,
-    maxWaitTimeInMs: 5000 // Chờ gom tối đa 5 giây để đóng gói được một Cụm lớn (Batch)
+   groupId: CONSUMER_GROUP,
+    
+    // 1. Chờ gom tối đa 75 giây (75000ms) nếu chưa đủ dữ liệu
+    maxWaitTimeInMs: 75 * 1000, 
+    
+    // 2. Thời gian tối đa giữa 2 lần xử lý Batch (Phải lớn hơn thời gian gom + thời gian chạy DB)
+    // Gom mất 75s + xử lý DB mất khoảng vài giây -> Đặt 2 phút (120000ms) là cực kỳ an toàn
+    maxPollInterval: 120 * 1000, 
+    
+    // 3. Thời gian Kafka Broker kích hoạt sập kết nối (Giữ nguyên mặc định hoặc nâng nhẹ)
+    sessionTimeout: 30000,
+    
+    // 4. Giữ kết nối ngầm (Bằng 1/3 sessionTimeout)
+    heartbeatInterval: 10000
   });
   
   await logger.initLogger('analyzer-service');
