@@ -55,3 +55,9 @@ docker exec -it fb-ads-kafka kafka-consumer-groups --bootstrap-server localhost:
 docker exec -it fb-ads-kafka kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group analyzer-group
 
 docker exec -it fb-ads-kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic <tên_topic> --from-beginning
+
+#Đường dẫn Dev env
+http://localhost:8080/ -- Kafka dashboard
+http://localhost:4000/ -- Monitor dashboard
+http://localhost:5002/ -- API 
+http://localhost:3001/ -- Application
