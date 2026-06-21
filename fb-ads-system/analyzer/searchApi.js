@@ -1,63 +1,73 @@
 const express = require('express');
+const cors = require('cors');
+
 const app = express();
 
-app.use(express.json());
-
-// ===== CONFIG =====
 const PORT = process.env.API_PORT || 5002;
-// Dấu hiệu đặc biệt ở Header để xác thực nội bộ (Thay đổi chuỗi này theo ý bạn)
 const INTERNAL_SECRET_HEADER = 'x-fb-internal-token';
 const INTERNAL_SECRET_VALUE = process.env.INTERNAL_API_TOKEN || 'fb-analyzer-secret-2026';
+const KAFKA_TOPIC = 'fb-ads-events';
 
 /**
- * Middleware kiểm tra Header đặc biệt (Không can thiệp sâu vào Auth)
+ * Middleware kiểm tra Header đặc biệt
  */
 function checkSpecialHeader(req, res, next) {
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+
     const token = req.headers[INTERNAL_SECRET_HEADER];
     if (!token || token !== INTERNAL_SECRET_VALUE) {
-        return res.status(403).json({ 
-            success: false, 
-            message: 'Forbidden: Invalid or missing internal system sign.' 
+        return res.status(403).json({
+            success: false,
+            message: 'Forbidden: Invalid or missing internal system sign.'
         });
     }
     next();
 }
 
 /**
- * Khởi tạo API Server kiếm tìm dữ liệu quảng cáo quảng cáo đã phân tích
+ * Khởi tạo API Server 
  * @param {import('mongodb').Db} dbInstance 
+ * @param {import('kafkajs').Kafka} kafkaInstance 
  */
-function initSearchServer(dbInstance) {
+function initSearchServer(dbInstance, kafkaInstance) {
     const adsCol = dbInstance.collection('analyzed_ads');
 
-    // Áp dụng middleware kiểm tra Header cho toàn bộ các route tìm kiếm
+    // ===== ĐĂNG KÝ MIDDLEWARE THEO ĐÚNG THỨ TỰ TRONG NÀY =====
+    app.use(express.json());
+
+    // 1. Mở cổng CORS trước
+    app.use(cors({
+        origin: '*',
+        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+        allowedHeaders: ['Content-Type', 'Authorization', 'x-fb-internal-token'],
+        credentials: true
+    }));
+
+    // 2. Chặn bộ lọc Header ngay sau CORS
     app.use(checkSpecialHeader);
 
-    /**
-     * API GET /api/ads/search
-     * Các Query Filters hỗ trợ: text, country, date_from, date_to, min_score, max_score, level
-     */
+    // 3. Khởi tạo Router xử lý dữ liệu
     app.get('/api/ads/search', async (req, res) => {
         try {
             const { text, country, date_from, date_to, min_score, max_score, level } = req.query;
-            
             const query = {};
 
-            // 1. Filter theo Tên / Nội dung quảng cáo (Tìm kiếm tương đối không phân biệt hoa thường)
+            // 1. Filter theo Tên / Nội dung quảng cáo
             if (text) {
-               query.$text = { $search: `\"${text}\"` };
+                query.$text = { $search: `\"${text}\"` };
             }
 
             // 2. Filter theo Đất nước
             if (country) {
-                // Hỗ trợ nếu trường dữ liệu của bạn lưu dạng mảng hoặc chuỗi text đơn thuần
                 query.$or = [
-                    { publisher_platforms: { $regex: country, $options: 'i' } }, 
-                    { text: { $regex: country, $options: 'i' } } // Fallback nếu lưu nước trong text
+                    { publisher_platforms: { $regex: country, $options: 'i' } },
+                    { text: { $regex: country, $options: 'i' } }
                 ];
             }
 
-            // 3. Filter theo Khoảng ngày (Dựa trên start_date của bài Ads - lưu dạng Timestamp giây)
+            // 3. Filter theo Khoảng ngày
             if (date_from || date_to) {
                 query.start_date = {};
                 if (date_from) {
@@ -75,23 +85,21 @@ function initSearchServer(dbInstance) {
                 if (max_score) query.score.$lte = parseInt(max_score, 10);
             }
 
-            // 5. Filter theo Sản phẩm Winning (Dựa trên nhãn '🔥 WINNER' của hệ thống chấm điểm)
+            // 5. Filter theo Sản phẩm Winning
             if (level) {
-                // level nhận vào có thể là: '🔥 WINNER', '⚡ GOOD', 'LOW'
                 query.level = level.toUpperCase().includes('WINNER') ? '🔥 WINNER' : level.toUpperCase();
             }
 
-            // Thực thi phân trang mặc định để tránh nghẽn băng thông hệ thống (100 record/lượt)
             const page = parseInt(req.query.page, 10) || 1;
             const limit = parseInt(req.query.limit, 10) || 100;
             const skip = (page - 1) * limit;
 
             const total = await adsCol.countDocuments(query);
             const results = await adsCol.find(query)
-                                        .sort({ score: -1, analyzed_at: -1 }) // Ưu tiên hàng Winner và mới nhất lên đầu
-                                        .skip(skip)
-                                        .limit(limit)
-                                        .toArray();
+                .sort({ score: -1, analyzed_at: -1 })
+                .skip(skip)
+                .limit(limit)
+                .toArray();
 
             return res.json({
                 success: true,
@@ -105,18 +113,40 @@ function initSearchServer(dbInstance) {
             });
 
         } catch (error) {
-            return res.status(500).json({ 
-                success: false, 
-                message: 'Internal Server Error', 
-                error: error.message 
+            return res.status(500).json({
+                success: false,
+                message: 'Internal Server Error',
+                error: error.message
             });
         }
     });
 
-    // Lắng nghe cổng kết nối
-    app.listen(PORT, () => {
-        console.log(`🖥️  API Search Server đang hoạt động độc lập tại cổng: http://localhost:${PORT}`);
+    app.listen(PORT, async () => {
+        console.log(`🖥️  API Search Server đang hoạt động tại cổng: http://localhost:${PORT}`);
+
+        // Kích hoạt một chu kỳ Producer ngắn để báo trạng thái Online
+        try {
+            const initProducer = kafkaInstance.producer();
+            await initProducer.connect();
+            await initProducer.send({
+                topic: KAFKA_TOPIC,
+                messages: [{
+                    value: JSON.stringify({
+                        event: 'SYSTEM_STARTUP',
+                        service: 'search-api',
+                        timestamp: Date.now(),
+                        message: `🟢 API Search Server đã khởi tạo thành công trên cổng ${PORT} và sẵn sàng kết nối!`
+                    })
+                }]
+            });
+            await initProducer.disconnect(); // Bắn xong đóng luôn, không chạy ngầm ngốn RAM
+            console.log(`🔹 [Kafka Log] Đã gửi thông báo khởi tạo hệ thống thành công.`);
+        } catch (kafkaErr) {
+            console.error(`❌ [Kafka Log] Không thể gửi log khởi tạo:`, kafkaErr.message);
+        }
     });
 }
 
 module.exports = { initSearchServer };
+
+

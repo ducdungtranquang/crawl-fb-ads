@@ -10,6 +10,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+     "cors": "^2.8.6",
     "express": "^5.2.1",
     "fs-extra": "^11.3.4",
     "kafkajs": "^2.2.4",
