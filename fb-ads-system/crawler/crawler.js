@@ -262,7 +262,7 @@ async function worker(context, keywords, id) {
                     seen.add(ad.ad_archive_id);
                     await saveAdAndPublish(ad);
                     lastSavedAt = Date.now();
-                    logger.info(`W${id} ✔ Saved & Published:`, ad.ad_archive_id);
+                    logger.info(`W${id}: ${keywords} -- Saved & Published: {ad_archive_id: ${ad.ad_archive_id}}`, { ad });
                 }
             }
         } catch { }
@@ -349,8 +349,8 @@ const isDocker = process.env.MONGO_URI ? true : false;
 
     const keywords = [
         // 'du lịch',
-        'khách sạn',
-        'vé máy bay',
+        // 'khách sạn',
+        // 'vé máy bay',
         'resort',
         'bất động sản',
         'chung cư',
