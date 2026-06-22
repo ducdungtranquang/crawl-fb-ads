@@ -4,16 +4,16 @@ const { initSearchServer } = require('./searchApi');
 
 process.removeAllListeners('warning');
 process.on('warning', (warning) => {
-    if (warning.name === 'TimeoutNegativeWarning') return;
-    console.warn(warning.stack);
+  if (warning.name === 'TimeoutNegativeWarning') return;
+  console.warn(warning.stack);
 });
 
 const originalSetTimeout = global.setTimeout;
 global.setTimeout = function (callback, delay, ...args) {
-    if (typeof delay === 'number' && delay < 0) {
-        return originalSetTimeout(callback, 1000, ...args); 
-    }
-    return originalSetTimeout(callback, delay, ...args);
+  if (typeof delay === 'number' && delay < 0) {
+    return originalSetTimeout(callback, 1000, ...args);
+  }
+  return originalSetTimeout(callback, delay, ...args);
 };
 
 process.env.TZ = 'UTC';
@@ -243,13 +243,13 @@ const logger = require('./logger');
 // ===== MAIN CONSUMER PROCESS =====
 async function main() {
   console.log("[System] Bắt đầu khởi chạy tiến trình Analyzer tổng hợp...");
-  
+
   // 1. Khởi tạo thực thể Kafka tổng trước
   const kafka = new Kafka({ clientId: 'fb-analyzer-service', brokers: KAFKA_BROKERS });
 
   // 2. Kết nối MongoDB độc lập
   const client = new MongoClient(MONGO_URI);
-  
+
   try {
     await client.connect();
     console.log("💾 [DB] Kết nối thành công tới MongoDB Cluster.");
@@ -267,32 +267,100 @@ async function main() {
     console.error("❌ [API Error] Thất bại khi dựng cổng 5002:", apiErr.message);
   }
 
-  // 4. KHỞI TẠO LOGGER & KAFKA CONSUMER (Bọc riêng biệt)
+  // 4. KHỞI TẠO LOGGER & KAFKA CONSUMER
   try {
     await logger.initLogger('analyzer-service');
     logger.info('Dịch vụ phân tích điểm số đã Online và đang chờ Batch...');
 
-    const consumer = kafka.consumer({ 
-       groupId: CONSUMER_GROUP,
-       maxWaitTimeInMs: 75 * 1000, 
-       maxPollInterval: 120 * 1000, 
-       sessionTimeout: 30000,
-       heartbeatInterval: 10000
+    // Đảm bảo bóc tách chuỗi Broker chính xác tuyệt đối
+    const brokers = process.env.KAFKA_BROKERS
+      ? process.env.KAFKA_BROKERS.split(',')
+      : ['kafka:9092'];
+
+    const kafkaInstance = new Kafka({ clientId: 'fb-analyzer-service', brokers });
+
+    const consumer = kafkaInstance.consumer({
+      groupId: CONSUMER_GROUP,
+      maxWaitTimeInMs: 75 * 1000,
+      maxPollInterval: 120 * 1000,
+      sessionTimeout: 30000,
+      heartbeatInterval: 10000
     });
 
-    await consumer.connect();
-    await consumer.subscribe({ topic: KAFKA_TOPIC, fromBeginning: false });
-    logger.info('⚡ Analyzer Service đang đợi lắng nghe hàng đợi Kafka theo cơ chế BATCH...');
+    let isConnected = false;
+    let retryCount = 10;
+
+    while (!isConnected && retryCount > 0) {
+      try {
+        console.log(`🔄 [Kafka Consumer] Đang kết nối tới Broker: ${brokers} (Nhóm: ${CONSUMER_GROUP})...`);
+        await consumer.connect();
+
+        // Trước khi subscribe, kiểm tra hoặc đăng ký để ép Broker tạo Topic nếu chưa có
+        const admin = kafkaInstance.admin();
+        await admin.connect();
+        const existingTopics = await admin.listTopics();
+
+        if (!existingTopics.includes(KAFKA_TOPIC)) {
+          console.log(`📣 [Kafka] Topic ${KAFKA_TOPIC} chưa tồn tại, đang tiến hành khởi tạo tự động...`);
+          await admin.createTopics({
+            topics: [{ topic: KAFKA_TOPIC, numPartitions: 1, replicationFactor: 1 }]
+          });
+        }
+        await admin.disconnect();
+
+        // Tiến hành đăng ký lắng nghe
+        await consumer.subscribe({ topic: KAFKA_TOPIC, fromBeginning: false });
+        isConnected = true;
+        logger.info('⚡ [Kafka Consumer] Đã kết nối và đăng ký Topic thành công!');
+      } catch (connErr) {
+        retryCount--;
+        console.warn(`⚠️ [Kafka Consumer Warning] Lỗi kết nối hoặc bầu Leader (${connErr.message}). Thử lại sau 5s...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
+
+    if (!isConnected) {
+      throw new Error("Không thể kết nối tới Kafka Broker sau nhiều lần thử lại.");
+    }
+
+    const adsCol = db.collection('analyzed_ads');
 
     await consumer.run({
       eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning, isStale }) => {
-        // ... giữ nguyên logic xử lý batch cũ ...
+        const rawAdsList = [];
+
+        logger.info(`Kafka vừa gom được ${batch.messages.length} ads. Kích hoạt analyze...`);
+
+        for (const message of batch.messages) {
+          if (!isRunning() || isStale()) break;
+
+          try {
+            const event = JSON.parse(message.value.toString());
+            rawAdsList.push(event.data);
+          } catch (e) {
+            logger.error('❌ Thất bại khi phân rã Message dữ liệu:', e.message);
+          }
+        }
+
+        if (rawAdsList.length > 0) {
+          logger.info(`🚀 Bắt đầu chấm điểm tập trung cho ${rawAdsList.length} Ads cùng lúc...`);
+          const processedAds = analyzeAdsBatch(rawAdsList);
+
+          // Lưu đồng bộ trực tiếp xuống DB Analyzer
+          await updateAdsCollection(adsCol, processedAds);
+          await updateProductsCollection(db, processedAds);
+        }
+
+        // Xác nhận hoàn tất việc xử lý cả cụm để đẩy Offset của Kafka lên
+        for (const message of batch.messages) {
+          resolveOffset(message.offset);
+        }
+        await heartbeat();
       }
     });
 
   } catch (servicesErr) {
-     console.error("⚠️ [Warning] Luồng Kafka Consumer hoặc Logger gặp lỗi:", servicesErr.message);
-     // Không dùng process.exit ở đây để API cổng 5002 bên trên vẫn tiếp tục sống chạy độc lập!
+    console.error("❌ [Critical Error] Luồng khởi tạo Consumer sập hoàn toàn:", servicesErr.message);
   }
 }
 
