@@ -49,6 +49,10 @@ function initSearchServer(dbInstance, kafkaInstance) {
     app.use(checkSpecialHeader);
 
     // 3. Khởi tạo Router xử lý dữ liệu
+
+    /**
+         * 🟢 API 1: TÌM KIẾM QUẢNG CÁO (Đã bổ sung Media thu gọn để tăng tốc độ)
+         */
     app.get('/api/ads/search', async (req, res) => {
         try {
             const { text, country, date_from, date_to, min_score, max_score, level } = req.query;
@@ -61,10 +65,7 @@ function initSearchServer(dbInstance, kafkaInstance) {
 
             // 2. Filter theo Đất nước
             if (country) {
-                query.$or = [
-                    { publisher_platforms: { $regex: country, $options: 'i' } },
-                    { text: { $regex: country, $options: 'i' } }
-                ];
+                query.platforms = country.toUpperCase();
             }
 
             // 3. Filter theo Khoảng ngày
@@ -87,7 +88,7 @@ function initSearchServer(dbInstance, kafkaInstance) {
 
             // 5. Filter theo Sản phẩm Winning
             if (level) {
-                query.level = level.toUpperCase().includes('WINNER') ? '🔥 WINNER' : level.toUpperCase();
+                query.level = level.toUpperCase().includes('WINNER') ? 'WINNER' : level.toUpperCase();
             }
 
             const page = parseInt(req.query.page, 10) || 1;
@@ -95,7 +96,27 @@ function initSearchServer(dbInstance, kafkaInstance) {
             const skip = (page - 1) * limit;
 
             const total = await adsCol.countDocuments(query);
+
+            // 💡 NÂNG CẤP PROJECTION: Lấy thêm Media đại diện (chỉ lấy 1 phần tử đầu tiên để tối ưu băng thông)
             const results = await adsCol.find(query)
+                .project({
+                    ad_archive_id: 1,
+                    page_name: 1,
+                    page_like_count: 1,
+                    text: { $substrCP: ["$text", 0, 150] },
+                    link: 1,
+                    domain: 1,
+                    start_date: 1,
+                    seen_count: 1,
+                    score: 1,
+                    level: 1,
+                    scaling_level: 1,
+                    funnel: 1,
+                    analyzed_at: 1,
+                    // Chỉ bốc duy nhất 1 ảnh/video đầu tiên làm thumbnail hiển thị trên Card UI danh sách
+                    images: { $slice: ["$images", 1] },
+                    videos: { $slice: ["$videos", 1] }
+                })
                 .sort({ score: -1, analyzed_at: -1 })
                 .skip(skip)
                 .limit(limit)
@@ -121,10 +142,44 @@ function initSearchServer(dbInstance, kafkaInstance) {
         }
     });
 
+    /**
+     * 🟢 API 2: LẤY CHI TIẾT QUẢNG CÁO (Trả ra toàn bộ Object gồm lịch sử tăng trưởng)
+     */
+    app.get('/api/ads/detail/:id', async (req, res) => {
+        try {
+            const adId = req.params.id;
+
+            if (!adId) {
+                return res.status(400).json({ success: false, message: 'Missing ad archive id parameters.' });
+            }
+
+            // Tìm kiếm bản ghi chi tiết đầy đủ thuộc tính trong MongoDB
+            const adDetail = await adsCol.findOne({ ad_archive_id: adId });
+
+            if (!adDetail) {
+                return res.status(404).json({
+                    success: false,
+                    message: `Không tìm thấy thông tin chi tiết cho quảng cáo có ID: ${adId}`
+                });
+            }
+
+            return res.json({
+                success: true,
+                data: adDetail
+            });
+
+        } catch (error) {
+            return res.status(500).json({
+                success: false,
+                message: 'Internal Server Error',
+                error: error.message
+            });
+        }
+    });
+
     app.listen(PORT, async () => {
         console.log(`🖥️  API Search Server đang hoạt động tại cổng: http://localhost:${PORT}`);
 
-        // Kích hoạt một chu kỳ Producer ngắn để báo trạng thái Online
         try {
             const initProducer = kafkaInstance.producer();
             await initProducer.connect();
@@ -139,7 +194,7 @@ function initSearchServer(dbInstance, kafkaInstance) {
                     })
                 }]
             });
-            await initProducer.disconnect(); // Bắn xong đóng luôn, không chạy ngầm ngốn RAM
+            await initProducer.disconnect();
             console.log(`🔹 [Kafka Log] Đã gửi thông báo khởi tạo hệ thống thành công.`);
         } catch (kafkaErr) {
             console.error(`❌ [Kafka Log] Không thể gửi log khởi tạo:`, kafkaErr.message);
@@ -148,5 +203,3 @@ function initSearchServer(dbInstance, kafkaInstance) {
 }
 
 module.exports = { initSearchServer };
-
-

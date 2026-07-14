@@ -61,3 +61,6 @@ http://localhost:8080/ -- Kafka dashboard
 http://localhost:4000/ -- Monitor dashboard
 http://localhost:5002/ -- API 
 http://localhost:3001/ -- Application
+
+#ĐƯờng dẫn git source APP
+https://github.com/ducdungtranquang/Youtube-ads-library -- Ads spy tool
