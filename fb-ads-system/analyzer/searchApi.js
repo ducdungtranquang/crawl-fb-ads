@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const { Client } = require('@elastic/elasticsearch');
 
 const app = express();
 
@@ -34,8 +35,13 @@ function checkSpecialHeader(req, res, next) {
  * @param {import('kafkajs').Kafka} kafkaInstance 
  */
 function initSearchServer(dbInstance, kafkaInstance) {
+    // ===== ELASTICSEARCH CONFIG =====
+    const esClient = new Client({ node: process.env.ELASTICSEARCH_URL || 'http://localhost:9200' });
+    const ELASTIC_INDEX = 'fb_ads';
+
     const adsCol = dbInstance.collection('analyzed_ads');
     const productsCol = dbInstance.collection('products');
+
 
     // Đường dẫn tới thư mục lưu trữ ảnh được chia sẻ qua Docker volume
     const imageStoragePath = path.join(__dirname, '..', '..', 'storage', 'images');
@@ -80,9 +86,40 @@ function initSearchServer(dbInstance, kafkaInstance) {
             } = req.query;
             const query = {};
 
-            // 1. Filter theo Tên / Nội dung quảng cáo
+            const page = parseInt(req.query.page, 10) || 1;
+            const limit = parseInt(req.query.limit, 10) || 100;
+            const skip = (page - 1) * limit;
+
+            // 1. TÍCH HỢP ELASTICSEARCH: Nếu có `text`, tìm kiếm ID trên ES trước
             if (text) {
-                query.$text = { $search: `\"${text}\"` };
+                try {
+                    const { body } = await esClient.search({
+                        index: ELASTIC_INDEX,
+                        body: {
+                            query: {
+                                multi_match: {
+                                    query: text,
+                                    fields: ['text', 'headline', 'description'],
+                                    fuzziness: "AUTO" // Cho phép tìm kiếm mờ (gõ sai chính tả)
+                                }
+                            },
+                            _source: false, // Chỉ lấy ID, không cần nội dung
+                            size: 10000,    // Giới hạn số lượng ID trả về, có thể điều chỉnh
+                            from: 0
+                        }
+                    });
+
+                    const adIdsFromEs = body.hits.hits.map(hit => hit._id);
+
+                    // Nếu ES không trả về kết quả nào, kết thúc sớm
+                    if (adIdsFromEs.length === 0) {
+                        return res.json({ success: true, pagination: { total: 0, page, limit, pages: 0 }, data: [] });
+                    }
+                    query.ad_archive_id = { $in: adIdsFromEs };
+                } catch (esError) {
+                    console.error("❌ [Elasticsearch Error]", esError.meta ? JSON.stringify(esError.meta.body) : esError);
+                    return res.status(500).json({ success: false, message: 'Lỗi khi tìm kiếm trên Elasticsearch.', error: esError.message });
+                }
             }
 
             // 2. Filter theo Đất nước
@@ -131,10 +168,6 @@ function initSearchServer(dbInstance, kafkaInstance) {
                 const funnels = funnel.split(',').map(f => f.trim().toUpperCase());
                 query.funnel = { $in: funnels };
             }
-
-            const page = parseInt(req.query.page, 10) || 1;
-            const limit = parseInt(req.query.limit, 10) || 100;
-            const skip = (page - 1) * limit;
 
             const total = await adsCol.countDocuments(query);
 

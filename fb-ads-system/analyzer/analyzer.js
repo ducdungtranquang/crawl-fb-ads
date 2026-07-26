@@ -1,5 +1,6 @@
 const { MongoClient } = require('mongodb');
 const { Kafka } = require('kafkajs');
+const { Client } = require('@elastic/elasticsearch');
 const { initSearchServer } = require('./searchApi');
 
 process.removeAllListeners('warning');
@@ -26,6 +27,9 @@ const DB_NAME = 'fb_ads_analyzer'; // Database riêng biệt phân tích
 const KAFKA_BROKERS = process.env.KAFKA_BROKERS ? [process.env.KAFKA_BROKERS] : ['localhost:9092'];
 const KAFKA_TOPIC = 'fb-ads-events';
 const CONSUMER_GROUP = 'analyzer-group';
+
+const ELASTICSEARCH_URL = process.env.ELASTICSEARCH_URL || 'http://localhost:9200';
+const ELASTIC_INDEX = 'fb_ads';
 
 // ===== UTILS =====
 function normalize(text) {
@@ -272,6 +276,97 @@ async function updateProductsCollection(db, analyzedAds) {
   }
 }
 
+/**
+ * Đồng bộ dữ liệu đã phân tích sang Elasticsearch để tìm kiếm.
+ * @param {import('@elastic/elasticsearch').Client} esClient 
+ * @param {Array<object>} analyzedAds 
+ */
+async function syncToElasticsearch(esClient, analyzedAds) {
+  if (!analyzedAds.length) return;
+
+  // Chuẩn bị body cho bulk request. Mỗi document cần 2 dòng: action và source.
+  const body = analyzedAds.flatMap(ad => {
+    // Quan trọng: Không gửi trường _id của MongoDB vào Elasticsearch
+    const { _id, ...adData } = ad;
+    return [
+      // Action: index (hoặc update) document với _id là ad_archive_id
+      { index: { _index: ELASTIC_INDEX, _id: ad.ad_archive_id } },
+      // Source: Dữ liệu của document
+      adData
+    ];
+  });
+
+  try {
+    const { body: bulkResponse } = await esClient.bulk({ refresh: true, body });
+
+    if (bulkResponse.errors) {
+      const erroredDocuments = [];
+      bulkResponse.items.forEach((action, i) => {
+        const operation = Object.keys(action)[0];
+        if (action[operation].error) {
+          erroredDocuments.push({
+            status: action[operation].status,
+            error: action[operation].error,
+          });
+        }
+      });
+      console.error(`❌ [Elasticsearch Sync] Có lỗi xảy ra trong quá trình bulk index:`, erroredDocuments);
+    } else {
+      console.log(`🚀 [Elasticsearch Sync] Đã đồng bộ thành công ${analyzedAds.length} bản ghi.`);
+    }
+  } catch (err) {
+    console.error('❌ [Elasticsearch Sync] Lỗi nghiêm trọng khi đồng bộ dữ liệu:', err.meta ? err.meta.body : err);
+  }
+}
+
+/**
+ * Đảm bảo index tồn tại trên Elasticsearch với mapping chính xác.
+ * Nếu index chưa có, nó sẽ được tạo tự động.
+ * @param {import('@elastic/elasticsearch').Client} esClient
+ */
+async function ensureIndexExists(esClient) {
+  console.log(`🔎 [Elasticsearch] Đang kiểm tra sự tồn tại của index '${ELASTIC_INDEX}'...`);
+  const { body: indexExists } = await esClient.indices.exists({ index: ELASTIC_INDEX });
+
+  if (indexExists) {
+    console.log(`✅ [Elasticsearch] Index '${ELASTIC_INDEX}' đã tồn tại.`);
+    return;
+  }
+
+  console.log(`⚠️ [Elasticsearch] Index '${ELASTIC_INDEX}' không tồn tại. Bắt đầu tạo mới với mapping...`);
+  try {
+    await esClient.indices.create({
+      index: ELASTIC_INDEX,
+      body: {
+        settings: {
+          analysis: {
+            analyzer: { default: { type: "standard" } }
+          }
+        },
+        mappings: {
+          properties: {
+            text: { type: "text" },
+            headline: { type: "text" },
+            description: { type: "text" },
+            score: { type: "double" },
+            start_date: { type: "date", format: "epoch_second" },
+            domain: { type: "keyword" },
+            level: { type: "keyword" },
+            estimated_spend: { type: "keyword" },
+            funnel: { type: "keyword" },
+            ad_archive_id: { type: "keyword" }
+          }
+        }
+      }
+    });
+    console.log(`🎉 [Elasticsearch] Đã tạo thành công index '${ELASTIC_INDEX}' với mapping.`);
+  } catch (err) {
+    console.error(`❌ [Elasticsearch] Lỗi nghiêm trọng khi tạo index:`, err.meta ? err.meta.body : err);
+    // Nếu không tạo được index thì nên dừng ứng dụng để tránh các lỗi phát sinh sau này
+    process.exit(1);
+  }
+}
+
 const logger = require('./logger');
 
 // main().catch(err => {
@@ -298,6 +393,12 @@ async function main() {
   }
 
   const db = client.db(DB_NAME);
+
+  // Khởi tạo Elasticsearch Client
+  const esClient = new Client({ node: ELASTICSEARCH_URL });
+
+  // Đảm bảo index và mapping đã tồn tại trước khi làm bất cứ điều gì khác
+  await ensureIndexExists(esClient);
 
   // 3. 🔥 KÍCH HOẠT API SERVER NGAY (Bọc try-catch riêng để nếu lỗi Kafka cũ không làm sập cổng 5002)
   try {
@@ -413,6 +514,9 @@ async function main() {
           // Lưu đồng bộ trực tiếp xuống DB Analyzer
           await updateAdsCollection(adsCol, processedAds);
           await updateProductsCollection(db, processedAds);
+
+          // ĐỒNG BỘ SANG ELASTICSEARCH
+          await syncToElasticsearch(esClient, processedAds);
         }
 
         // Xác nhận hoàn tất việc xử lý cả cụm để đẩy Offset của Kafka lên
