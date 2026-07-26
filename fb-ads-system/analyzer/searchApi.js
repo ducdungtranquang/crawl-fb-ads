@@ -1,5 +1,7 @@
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 
@@ -33,6 +35,13 @@ function checkSpecialHeader(req, res, next) {
  */
 function initSearchServer(dbInstance, kafkaInstance) {
     const adsCol = dbInstance.collection('analyzed_ads');
+    const productsCol = dbInstance.collection('products');
+
+    // Đường dẫn tới thư mục lưu trữ ảnh được chia sẻ qua Docker volume
+    const imageStoragePath = path.join(__dirname, '..', '..', 'storage', 'images');
+    if (!fs.existsSync(imageStoragePath)) {
+        fs.mkdirSync(imageStoragePath, { recursive: true });
+    }
 
     // ===== ĐĂNG KÝ MIDDLEWARE THEO ĐÚNG THỨ TỰ TRONG NÀY =====
     app.use(express.json());
@@ -45,6 +54,9 @@ function initSearchServer(dbInstance, kafkaInstance) {
         credentials: true
     }));
 
+    // 1.5. Phục vụ các file ảnh tĩnh từ thư mục storage
+    app.use('/static/images', express.static(imageStoragePath));
+
     // 2. Chặn bộ lọc Header ngay sau CORS
     app.use(checkSpecialHeader);
 
@@ -55,7 +67,17 @@ function initSearchServer(dbInstance, kafkaInstance) {
          */
     app.get('/api/ads/search', async (req, res) => {
         try {
-            const { text, country, date_from, date_to, min_score, max_score, level } = req.query;
+            const {
+                text,
+                country,
+                date_from, date_to,
+                min_score, max_score,
+                level,
+                estimated_spend, // Mới: Lọc theo mức chi tiêu
+                min_trending_score, // Mới: Lọc theo điểm trending
+                funnel, // Mới: Lọc theo phễu
+                scaling_level // Mới: Lọc theo mức độ scaling
+            } = req.query;
             const query = {};
 
             // 1. Filter theo Tên / Nội dung quảng cáo
@@ -87,8 +109,27 @@ function initSearchServer(dbInstance, kafkaInstance) {
             }
 
             // 5. Filter theo Sản phẩm Winning
+            // Hỗ trợ lọc nhiều level, ví dụ: level=WINNER,LEGEND
             if (level) {
-                query.level = level.toUpperCase().includes('WINNER') ? 'WINNER' : level.toUpperCase();
+                const levels = level.split(',').map(l => l.trim().toUpperCase());
+                query.level = { $in: levels };
+            }
+
+            // 6. Mới: Filter theo Mức chi tiêu ước tính (có thể chọn nhiều)
+            if (estimated_spend) {
+                const spendLevels = estimated_spend.split(',').map(s => s.trim().toUpperCase());
+                query.estimated_spend = { $in: spendLevels };
+            }
+
+            // 7. Mới: Filter theo Điểm trending tối thiểu
+            if (min_trending_score) {
+                query.trending_score = { $gte: parseInt(min_trending_score, 10) };
+            }
+
+            // 8. Mới: Filter theo Phễu Marketing (có thể chọn nhiều)
+            if (funnel) {
+                const funnels = funnel.split(',').map(f => f.trim().toUpperCase());
+                query.funnel = { $in: funnels };
             }
 
             const page = parseInt(req.query.page, 10) || 1;
@@ -110,10 +151,13 @@ function initSearchServer(dbInstance, kafkaInstance) {
                     seen_count: 1,
                     score: 1,
                     level: 1,
+                    trending_score: 1, // Bổ sung các trường mới vào projection
+                    estimated_spend: 1,
                     scaling_level: 1,
                     funnel: 1,
                     analyzed_at: 1,
                     // Chỉ bốc duy nhất 1 ảnh/video đầu tiên làm thumbnail hiển thị trên Card UI danh sách
+                    thumbnail_local: 1, // Trả về đường dẫn ảnh đã lưu
                     images: { $slice: ["$images", 1] },
                     videos: { $slice: ["$videos", 1] }
                 })
@@ -174,6 +218,106 @@ function initSearchServer(dbInstance, kafkaInstance) {
                 message: 'Internal Server Error',
                 error: error.message
             });
+        }
+    });
+
+    /**
+     * 🟢 API 3: TÌM KIẾM SẢN PHẨM/DOMAIN (MỚI)
+     * API này cho phép tìm kiếm và lọc các domain dựa trên điểm tổng hợp.
+     */
+    app.get('/api/products/search', async (req, res) => {
+        try {
+            const {
+                domain,
+                min_product_score,
+                min_winning_ads,
+                min_total_ads,
+                sort_by = 'product_score', // Mặc định sắp xếp theo điểm sản phẩm
+                sort_order = -1 // Mặc định giảm dần (cao nhất trước)
+            } = req.query;
+
+            const query = {};
+
+            if (domain) {
+                query.domain = { $regex: domain, $options: 'i' };
+            }
+            if (min_product_score) {
+                query.product_score = { $gte: parseInt(min_product_score, 10) };
+            }
+            if (min_winning_ads) {
+                query.winning_ads = { $gte: parseInt(min_winning_ads, 10) };
+            }
+            if (min_total_ads) {
+                query.total_ads = { $gte: parseInt(min_total_ads, 10) };
+            }
+
+            const page = parseInt(req.query.page, 10) || 1;
+            const limit = parseInt(req.query.limit, 10) || 50;
+            const skip = (page - 1) * limit;
+
+            const total = await productsCol.countDocuments(query);
+
+            const results = await productsCol.find(query)
+                .sort({ [sort_by]: parseInt(sort_order, 10) })
+                .skip(skip)
+                .limit(limit)
+                .toArray();
+
+            return res.json({
+                success: true,
+                pagination: {
+                    total,
+                    page,
+                    limit,
+                    pages: Math.ceil(total / limit)
+                },
+                data: results
+            });
+
+        } catch (error) {
+            return res.status(500).json({
+                success: false,
+                message: 'Internal Server Error',
+                error: error.message
+            });
+        }
+    });
+
+    /**
+     * 🟢 API 4: LẤY CHI TIẾT SẢN PHẨM/DOMAIN (MỚI)
+     * Trả về thông tin tổng hợp của domain và các quảng cáo tốt nhất liên quan.
+     */
+    app.get('/api/products/detail/:domain', async (req, res) => {
+        try {
+            const { domain } = req.params;
+            if (!domain) {
+                return res.status(400).json({ success: false, message: 'Domain is required.' });
+            }
+
+            // 1. Lấy thông tin tổng hợp của sản phẩm
+            const productInfo = await productsCol.findOne({ domain });
+
+            if (!productInfo) {
+                return res.status(404).json({ success: false, message: `Product with domain '${domain}' not found.` });
+            }
+
+            // 2. Lấy 20 quảng cáo có điểm cao nhất thuộc domain này
+            const topAds = await adsCol.find({ domain })
+                .sort({ score: -1 })
+                .limit(20)
+                .project({ ad_archive_id: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1, level: 1, images: { $slice: ["$images", 1] }, videos: { $slice: ["$videos", 1] } })
+                .toArray();
+
+            return res.json({
+                success: true,
+                data: {
+                    ...productInfo,
+                    top_ads: topAds
+                }
+            });
+
+        } catch (error) {
+            return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
         }
     });
 

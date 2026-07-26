@@ -78,6 +78,24 @@ function detectFunnel(ad) {
   return 'UNKNOWN';
 }
 
+/**
+ * Ước tính mức độ chi tiêu cho quảng cáo dựa trên các chỉ số gián tiếp.
+ * @param {object} ad Đối tượng quảng cáo.
+ * @returns {{level: 'LOW'|'MEDIUM'|'HIGH'|'VERY HIGH', score: number}}
+ */
+function estimateSpendLevel(ad) {
+    let spendScore = 0;
+    if (ad.seen_count > 5) spendScore += 1;
+    if (ad.seen_count > 10) spendScore += 2;
+    if (ad.platforms?.length > 1) spendScore += 1;
+    if (ad.is_active) spendScore += 1;
+
+    if (spendScore >= 4) return { level: 'VERY HIGH', score: 4 };
+    if (spendScore >= 3) return { level: 'HIGH', score: 3 };
+    if (spendScore >= 2) return { level: 'MEDIUM', score: 2 };
+    return { level: 'LOW', score: 1 };
+}
+
 // ===== CORE ANALYZE PROCESS =====
 function analyzeAdsBatch(ads) {
   const now = Date.now();
@@ -99,6 +117,9 @@ function analyzeAdsBatch(ads) {
     let score = 0;
     const text = ad.normalized_text || normalize(ad.text || '');
     const domain = extractDomain(ad.link);
+
+    // 1. Ước tính mức chi tiêu
+    const spend = estimateSpendLevel(ad);
 
     const days = (now - (ad.start_date || now) * 1000) / (1000 * 3600 * 24);
     if (days > 3) score += 2;
@@ -125,6 +146,7 @@ function analyzeAdsBatch(ads) {
     if (like > 10000) score += 2;
     if (like > 50000) score += 3;
 
+    // 2. Tính toán các chỉ số tăng trưởng
     const delta = calcDelta(ad.growth_history);
     const smooth = calcSmoothDelta(ad.growth_history);
     const burst = calcBurst(ad.growth_history);
@@ -152,14 +174,24 @@ function analyzeAdsBatch(ads) {
     if (recentMinutes < 60) scalingScore += 3;
     if (recentMinutes < 15) scalingScore += 5;
 
-    score += scalingScore;
+    // 3. Tính điểm Trending dựa trên sự đột biến
+    let trendingScore = 0;
+    if (burst > 2) trendingScore += 5;
+    if (burst > 4) trendingScore += 10;
+    if (delta > 1) trendingScore += 5;
+
+    // 4. TÍNH ĐIỂM TỔNG HỢP CUỐI CÙNG
+    // Trọng số: Tăng trưởng > Điểm cơ bản > Mức chi tiêu > Trending
+    score = scalingScore * 1.5 + score + spend.score + trendingScore * 0.5;
 
     return {
       ...ad,
       domain,
       score,
-      level: score >= 12 ? '🔥 WINNER' : score >= 7 ? '⚡ GOOD' : 'LOW',
+      level: score >= 40 ? '🏆 LEGEND' : score >= 25 ? '🔥 WINNER' : score >= 15 ? '⚡ POTENTIAL' : 'REGULAR',
       scaling_score: scalingScore,
+      trending_score: trendingScore,
+      estimated_spend: spend.level,
       scaling_level: scalingScore >= 12 ? '🚀 SCALING HARD' : scalingScore >= 6 ? '⚡ SCALING' : 'NORMAL',
       delta,
       smooth_delta: smooth,
@@ -208,18 +240,25 @@ async function updateProductsCollection(db, analyzedAds) {
   const bulk = Object.values(map).map(p => {
     const totalAds = p.ads.length;
     const pages = p.pages.size;
-    const score = totalAds + pages * 2;
+    const totalScore = p.ads.reduce((sum, ad) => sum + (ad.score || 0), 0);
+    const winningAdsCount = p.ads.filter(ad => ad.level === '🔥 WINNER' || ad.level === '🏆 LEGEND').length;
+
+    // Điểm sản phẩm = Tổng điểm ads + (số page * 2) + (số ads winning * 5)
+    const productScore = totalScore + pages * 2 + winningAdsCount * 5;
 
     return {
       updateOne: {
         filter: { domain: p.domain },
         update: {
           $set: {
-            domain: p.domain,
+            updated_at: Date.now(),
+          },
+          $inc: {
             total_ads: totalAds,
-            pages,
-            score,
-            updated_at: Date.now()
+            total_pages: pages,
+            total_score: totalScore,
+            winning_ads: winningAdsCount,
+            product_score: productScore
           }
         },
         upsert: true
@@ -229,7 +268,7 @@ async function updateProductsCollection(db, analyzedAds) {
 
   if (bulk.length) {
     await col.bulkWrite(bulk);
-    console.log(`🔥 [DB Products] Đã Bulk Write thành công các sản phẩm tổng hợp.`);
+    console.log(`🔥 [DB Products] Đã cập nhật ${bulk.length} sản phẩm/domain.`);
   }
 }
 
@@ -324,6 +363,31 @@ async function main() {
     }
 
     const adsCol = db.collection('analyzed_ads');
+    
+    // TỐI ƯU HÓA: Đảm bảo các index quan trọng cho việc tìm kiếm đã được tạo
+    console.log("🚀 [DB Index] Đang kiểm tra và khởi tạo các chỉ mục tối ưu hóa truy vấn...");
+    await adsCol.createIndexes([
+        { key: { ad_archive_id: 1 }, name: "ad_archive_id_unique", unique: true },
+        { key: { score: -1, analyzed_at: -1 }, name: "score_analyzed_sort" },
+        { key: { text: "text" }, name: "text_search" },
+        { key: { domain: 1 }, name: "domain_filter" },
+        { key: { level: 1 }, name: "level_filter" },
+        { key: { estimated_spend: 1 }, name: "spend_filter" },
+        { key: { trending_score: -1 }, name: "trending_sort" },
+        { key: { funnel: 1 }, name: "funnel_filter" },
+        { key: { start_date: -1 }, name: "date_sort" }
+    ]);
+    console.log("✅ [DB Index] Hoàn tất việc đảm bảo các chỉ mục đã sẵn sàng.");
+
+    // TỐI ƯU HÓA: Tạo index cho collection 'products'
+    const productsCol = db.collection('products');
+    console.log("🚀 [DB Index] Đang kiểm tra và khởi tạo các chỉ mục cho collection 'products'...");
+    await productsCol.createIndexes([
+        { key: { domain: 1 }, name: "domain_unique", unique: true },
+        { key: { product_score: -1 }, name: "product_score_sort" },
+        { key: { winning_ads: -1 }, name: "winning_ads_sort" }
+    ]);
+    console.log("✅ [DB Index] Hoàn tất việc đảm bảo các chỉ mục 'products' đã sẵn sàng.");
 
     await consumer.run({
       eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning, isStale }) => {
@@ -357,6 +421,9 @@ async function main() {
         }
         await heartbeat();
       }
+    }).then(() => {
+        console.log('✅ Analyzer đã xử lý xong tất cả các tin nhắn đang chờ. Tiến trình sẽ tự động kết thúc.');
+        process.exit(0);
     });
 
   } catch (servicesErr) {

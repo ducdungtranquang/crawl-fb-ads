@@ -30,6 +30,7 @@ const DB_NAME = 'fb_ads';
 
 const USER_DATA_DIR = './chrome-profile';
 const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const STORAGE_PATH = path.join(__dirname, '..', '..', 'storage', 'images'); // Đường dẫn tới thư mục lưu ảnh
 const PROFILE = 'Default';
 
 const KAFKA_BROKERS = process.env.KAFKA_BROKERS ? [process.env.KAFKA_BROKERS] : ['localhost:9092'];
@@ -45,6 +46,9 @@ let isKafkaConnected = false;
 // ===== KAFKA INITIALIZATION =====
 const kafka = new Kafka({ clientId: 'fb-crawler-service', brokers: KAFKA_BROKERS });
 const producer = kafka.producer();
+
+// Đảm bảo thư mục lưu trữ tồn tại
+fs.mkdirSync(STORAGE_PATH, { recursive: true });
 
 // ===== UTILS =====
 function randomDelay(min = 2000, max = 4000) {
@@ -119,8 +123,35 @@ async function initializeInfrastructure() {
     }
 }
 
+/**
+ * Tải ảnh thumbnail về và lưu vào storage.
+ * @param {import('playwright').Page} page - Đối tượng page của Playwright để tận dụng context.
+ * @param {string} imageUrl - URL của ảnh cần tải.
+ * @param {string} adId - ID của quảng cáo để đặt tên file.
+ * @returns {Promise<string|null>} - Trả về đường dẫn file local hoặc null nếu lỗi.
+ */
+async function downloadThumbnail(page, imageUrl, adId) {
+    if (!imageUrl || !adId) return null;
+
+    try {
+        const response = await page.request.get(imageUrl);
+        if (!response.ok()) {
+            logger.warn(`W? ⚠️ Tải ảnh thất bại cho ad ${adId}, status: ${response.status()}`);
+            return null;
+        }
+        const buffer = await response.body();
+        const fileName = `${adId}.jpg`;
+        const filePath = path.join(STORAGE_PATH, fileName);
+        await fs.promises.writeFile(filePath, buffer);
+        return `/images/${fileName}`; // Trả về đường dẫn tương đối để lưu vào DB
+    } catch (error) {
+        logger.error(`W? ❌ Lỗi nghiêm trọng khi tải ảnh cho ad ${adId}:`, error);
+        return null;
+    }
+}
+
 // ===== SAVE AD & SEND TO KAFKA =====
-async function saveAdAndPublish(ad) {
+async function saveAdAndPublish(ad, page) {
     const col = db.collection('ads');
     const now = Date.now();
     const domain = extractDomain(ad.link);
@@ -128,8 +159,13 @@ async function saveAdAndPublish(ad) {
 
     const existing = await col.findOne({ ad_archive_id: ad.ad_archive_id });
     let updatedAd = null;
+    let localThumbnailPath = null;
 
     if (!existing) {
+        // Chỉ tải ảnh cho quảng cáo mới để tránh tải lại không cần thiết
+        if (ad.images && ad.images.length > 0) {
+            localThumbnailPath = await downloadThumbnail(page, ad.images[0].original_image_url, ad.ad_archive_id);
+        }
         updatedAd = {
             ...ad,
             domain,
@@ -144,6 +180,7 @@ async function saveAdAndPublish(ad) {
         const shouldIncrease = now - (existing.last_seen || 0) > SEEN_THRESHOLD;
         const newCount = shouldIncrease ? (existing.seen_count || 0) + 1 : existing.seen_count;
 
+        // Giữ lại đường dẫn ảnh cũ nếu đã có
         updatedAd = {
             ...ad,
             domain,
@@ -151,7 +188,8 @@ async function saveAdAndPublish(ad) {
             seen_count: newCount,
             growth_history: [...(existing.growth_history || [])]
         };
-        if (shouldIncrease) {
+        // Chỉ cập nhật growth history nếu cần
+        if (shouldIncrease && updatedAd.growth_history.length < 100) { // Giới hạn để tránh document quá lớn
             updatedAd.growth_history.push({ t: now, c: newCount });
         }
 
@@ -260,7 +298,7 @@ async function worker(context, keywords, id) {
             for (const ad of ads) {
                 if (!seen.has(ad.ad_archive_id)) {
                     seen.add(ad.ad_archive_id);
-                    await saveAdAndPublish(ad);
+                    await saveAdAndPublish(ad, res.request().frame().page());
                     lastSavedAt = Date.now();
                     logger.info(`W${id}: ${keywords} -- Saved & Published: {ad_archive_id: ${ad.ad_archive_id}}`, { ad });
                 }
@@ -328,11 +366,12 @@ function chunkArray(arr, n) {
 }
 
 // ===== MAIN =====
-const isDocker = process.env.MONGO_URI ? true : false;
+const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
 (async () => {
     await initializeInfrastructure();
     await logger.initLogger('crawler-service'); // Khởi tạo logger cho Crawler
 
+    console.log(`💡 Chế độ chạy: ${isDocker ? 'Docker (Headless)' : 'Thủ công (Giao diện đồ họa)'}`);
     logger.info('Hệ thống cào dữ liệu bắt đầu khởi động Chrome...');
     const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
         headless: isDocker, // Nếu chạy trong Docker thì bắt buộc phải ẩn giao diện (headless: true)
@@ -348,9 +387,9 @@ const isDocker = process.env.MONGO_URI ? true : false;
     logger.info('🔥 Using REAL Chrome profile');
 
     const keywords = [
-        // 'du lịch',
-        // 'khách sạn',
-        // 'vé máy bay',
+        'du lịch',
+        'khách sạn',
+        'vé máy bay',
         'resort',
         'bất động sản',
         'chung cư',
