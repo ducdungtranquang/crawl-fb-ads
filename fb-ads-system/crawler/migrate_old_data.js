@@ -52,14 +52,36 @@ function detectFunnel(ad) {
   return 'UNKNOWN';
 }
 
-// Hàm chấm điểm tích hợp
+/**
+ * Ước tính mức độ chi tiêu cho quảng cáo dựa trên các chỉ số gián tiếp.
+ * @param {object} ad Đối tượng quảng cáo.
+ * @returns {{level: 'LOW'|'MEDIUM'|'HIGH'|'VERY HIGH', score: number}}
+ */
+function estimateSpendLevel(ad) {
+    let spendScore = 0;
+    if (ad.seen_count > 5) spendScore += 1;
+    if (ad.seen_count > 10) spendScore += 2;
+    if (ad.platforms?.length > 1) spendScore += 1;
+    if (ad.is_active) spendScore += 1;
+
+    if (spendScore >= 4) return { level: 'VERY HIGH', score: 4 };
+    if (spendScore >= 3) return { level: 'HIGH', score: 3 };
+    if (spendScore >= 2) return { level: 'MEDIUM', score: 2 };
+    return { level: 'LOW', score: 1 };
+}
+
+// ===== CORE ANALYZE PROCESS (Copied from analyzer.js) =====
 function analyzeAdsBatch(ads) {
   const now = Date.now();
-  const pageMap = {}, textMap = {}, domainMap = {};
+  const pageMap = {};
+  const textMap = {};
+  const domainMap = {};
 
+  // Xây dựng ngữ cảnh tần suất xuất hiện theo cả cụm dữ liệu nhận về
   for (const ad of ads) {
     const text = ad.normalized_text || normalize(ad.text || '');
     const domain = extractDomain(ad.link);
+
     pageMap[ad.page_name] = (pageMap[ad.page_name] || 0) + 1;
     textMap[text] = (textMap[text] || 0) + 1;
     if (domain) domainMap[domain] = (domainMap[domain] || 0) + 1;
@@ -70,17 +92,24 @@ function analyzeAdsBatch(ads) {
     const text = ad.normalized_text || normalize(ad.text || '');
     const domain = extractDomain(ad.link);
 
+    // 1. Ước tính mức chi tiêu
+    const spend = estimateSpendLevel(ad);
+
     const days = (now - (ad.start_date || now) * 1000) / (1000 * 3600 * 24);
     if (days > 3) score += 2;
     if (days > 7) score += 4;
     if (days > 14) score += 6;
 
-    if ((pageMap[ad.page_name] || 0) > 5) score += 2;
-    if ((pageMap[ad.page_name] || 0) > 10) score += 4;
+    const pageAds = pageMap[ad.page_name] || 0;
+    if (pageAds > 5) score += 2;
+    if (pageAds > 10) score += 4;
 
-    if ((textMap[text] || 0) > 3) score += 3;
-    if ((textMap[text] || 0) > 5) score += 5;
-    if (domain && (domainMap[domain] || 0) > 5) score += 2;
+    const clones = textMap[text] || 0;
+    if (clones > 3) score += 3;
+    if (clones > 5) score += 5;
+
+    const domainAds = domainMap[domain] || 0;
+    if (domainAds > 5) score += 2;
 
     if (ad.platforms?.length > 1) score += 2;
     if (ad.videos?.length > 0) score += 2;
@@ -91,6 +120,7 @@ function analyzeAdsBatch(ads) {
     if (like > 10000) score += 2;
     if (like > 50000) score += 3;
 
+    // 2. Tính toán các chỉ số tăng trưởng
     const delta = calcDelta(ad.growth_history);
     const smooth = calcSmoothDelta(ad.growth_history);
     const burst = calcBurst(ad.growth_history);
@@ -100,13 +130,17 @@ function analyzeAdsBatch(ads) {
     if (delta >= 1) scalingScore += 2;
     if (delta >= 2) scalingScore += 4;
     if (delta >= 3) scalingScore += 6;
+
     if (smooth >= 1) scalingScore += 3;
     if (smooth >= 2) scalingScore += 5;
+
     if (burst >= 2) scalingScore += 4;
     if (burst >= 4) scalingScore += 7;
     if (burst >= 6) scalingScore += 10;
+
     if (fallback > 1) scalingScore += 2;
     if (fallback > 3) scalingScore += 4;
+
     if (ad.seen_count > 3) scalingScore += 2;
     if (ad.seen_count > 6) scalingScore += 4;
 
@@ -114,14 +148,24 @@ function analyzeAdsBatch(ads) {
     if (recentMinutes < 60) scalingScore += 3;
     if (recentMinutes < 15) scalingScore += 5;
 
-    score += scalingScore;
+    // 3. Tính điểm Trending dựa trên sự đột biến
+    let trendingScore = 0;
+    if (burst > 2) trendingScore += 5;
+    if (burst > 4) trendingScore += 10;
+    if (delta > 1) trendingScore += 5;
+
+    // 4. TÍNH ĐIỂM TỔNG HỢP CUỐI CÙNG
+    // Trọng số: Tăng trưởng > Điểm cơ bản > Mức chi tiêu > Trending
+    score = scalingScore * 1.5 + score + spend.score + trendingScore * 0.5;
 
     return {
       ...ad,
       domain,
       score,
-      level: score >= 12 ? '🔥 WINNER' : score >= 7 ? '⚡ GOOD' : 'LOW',
+      level: score >= 40 ? '🏆 LEGEND' : score >= 25 ? '🔥 WINNER' : score >= 15 ? '⚡ POTENTIAL' : 'REGULAR',
       scaling_score: scalingScore,
+      trending_score: trendingScore,
+      estimated_spend: spend.level,
       scaling_level: scalingScore >= 12 ? '🚀 SCALING HARD' : scalingScore >= 6 ? '⚡ SCALING' : 'NORMAL',
       delta,
       smooth_delta: smooth,
@@ -215,23 +259,38 @@ async function processAndSave(rawBatch, adsCol, prodCol) {
   for (const ad of analyzedBatch) {
     if (!ad.domain) continue;
     if (!productMap[ad.domain]) {
-      productMap[ad.domain] = { domain: ad.domain, adsCount: 0, pages: new Set() };
+      productMap[ad.domain] = { domain: ad.domain, ads: [], pages: new Set() };
     }
-    productMap[ad.domain].adsCount++;
+    productMap[ad.domain].ads.push(ad);
     productMap[ad.domain].pages.add(ad.page_name);
   }
 
-  const prodBulkOps = Object.values(productMap).map(p => ({
-    updateOne: {
-      filter: { domain: p.domain },
-      // Tăng tiến độ cộng dồn ($inc) thay vì ghi đè nếu chạy nhiều đợt dữ liệu
-      update: {
-        $set: { domain: p.domain, updated_at: Date.now() },
-        $inc: { total_ads: p.adsCount, pages: p.pages.size } 
-      },
-      upsert: true
-    }
-  }));
+  const prodBulkOps = Object.values(productMap).map(p => {
+    const totalAds = p.ads.length;
+    const pages = p.pages.size;
+    const totalScore = p.ads.reduce((sum, ad) => sum + (ad.score || 0), 0);
+    const winningAdsCount = p.ads.filter(ad => ad.level === '🔥 WINNER' || ad.level === '🏆 LEGEND').length;
+
+    // Điểm sản phẩm = Tổng điểm ads + (số page * 2) + (số ads winning * 5)
+    const productScore = totalScore + pages * 2 + winningAdsCount * 5;
+
+    return {
+      updateOne: {
+        filter: { domain: p.domain },
+        update: {
+          $set: { updated_at: Date.now() },
+          $inc: {
+            total_ads: totalAds,
+            total_pages: pages,
+            total_score: totalScore,
+            winning_ads: winningAdsCount,
+            product_score: productScore
+          }
+        },
+        upsert: true
+      }
+    };
+  });
 
   if (prodBulkOps.length > 0) {
     await prodCol.bulkWrite(prodBulkOps, { ordered: false });
