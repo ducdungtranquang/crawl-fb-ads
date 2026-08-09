@@ -76,207 +76,380 @@ function initSearchServer(dbInstance, kafkaInstance) {
             const {
                 text,
                 country,
-                date_from, date_to,
-                min_score, max_score,
+                date_from,
+                date_to,
+                min_score,
+                max_score,
                 level,
-                estimated_spend, // Mới: Lọc theo mức chi tiêu
-                min_trending_score, // Mới: Lọc theo điểm trending
-                funnel,           // Mới: Lọc theo phễu
-                scaling_level,    // Mới: Lọc theo mức độ scaling
-                sort_by = 'score',      // Mới: Cho phép tùy chọn trường sort
-                sort_order = -1         // Mới: Cho phép tùy chọn thứ tự sort
+                estimated_spend,
+                min_trending_score,
+                funnel,
+                scaling_level,
+                sort_by = 'score',
+                sort_order = -1
             } = req.query;
-            const query = {};
 
-            const page = parseInt(req.query.page, 10) || 1;
-            const limit = parseInt(req.query.limit, 10) || 100;
+            const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+            const limit = Math.min(
+                Math.max(parseInt(req.query.limit, 10) || 100, 1),
+                100
+            );
             const skip = (page - 1) * limit;
 
-            // 1. TÍCH HỢP ELASTICSEARCH: Nếu có `text`, tìm kiếm ID trên ES trước
+            const query = {};
+
+            // =========================================================
+            // 1. SEARCH TEXT BẰNG ELASTICSEARCH
+            // =========================================================
             if (text) {
-                try {
-                    const keyword = Array.isArray(text)
-                        ? text.join(" ").trim()
-                        : String(text).trim();
+                const keyword = Array.isArray(text)
+                    ? text
+                        .map(x => String(x).trim())
+                        .filter(Boolean)
+                        .join(" ")
+                    : String(text).trim();
 
-                    // Chỉ lấy đủ dữ liệu cho page hiện tại
-                    const esLimit = Math.min(page * limit * 3, 1000);
+                if (keyword) {
+                    try {
+                        /*
+                         * QUAN TRỌNG:
+                         * Không lấy ES _id nữa.
+                         *
+                         * Lấy ad_archive_id từ _source để đảm bảo
+                         * đúng field MongoDB đang query.
+                         */
+                        const esLimit = Math.min(
+                            Math.max(page * limit * 5, 100),
+                            5000
+                        );
 
-                    const searchQuery = keyword.length <= 2
-                        ? {
-                            multi_match: {
-                                query: keyword,
-                                fields: [
-                                    "normalized_text^5",
-                                    "text^3",
-                                    "page_name^2"
+                        const searchQuery = {
+                            bool: {
+                                should: [
+                                    // Field tổng hợp nếu index có field này
+                                    {
+                                        match: {
+                                            full_text_search: {
+                                                query: keyword,
+                                                boost: 5
+                                            }
+                                        }
+                                    },
+
+                                    // Field thực tế đang có trong data
+                                    {
+                                        match: {
+                                            normalized_text: {
+                                                query: keyword,
+                                                boost: 4
+                                            }
+                                        }
+                                    },
+
+                                    {
+                                        match: {
+                                            text: {
+                                                query: keyword,
+                                                boost: 3
+                                            }
+                                        }
+                                    },
+
+                                    {
+                                        match: {
+                                            page_name: {
+                                                query: keyword,
+                                                boost: 2
+                                            }
+                                        }
+                                    }
                                 ],
-                                operator: "and",
-                                type: "best_fields"
-                            }
-                        }
-                        : {
-                            multi_match: {
-                                query: keyword,
-                                fields: [
-                                    "normalized_text^5",
-                                    "text^3",
-                                    "page_name^2"
-                                ],
-                                fuzziness: "AUTO",
-                                prefix_length: 2,
-                                type: "best_fields"
+                                minimum_should_match: 1
                             }
                         };
 
-                    let esResponse;
-
-                    try {
-                        esResponse = await esClient.search({
+                        const esResponse = await esClient.search({
                             index: ELASTIC_INDEX,
                             query: searchQuery,
-                            _source: false,
+
+                            // Không cần lấy toàn bộ document
+                            _source: ['ad_archive_id'],
+
                             size: esLimit,
+
                             track_total_hits: false
                         });
-                    } catch {
-                        // Fallback nếu fuzziness gây lỗi
-                        esResponse = await esClient.search({
-                            index: ELASTIC_INDEX,
-                            query: {
-                                multi_match: {
-                                    query: keyword,
-                                    fields: [
-                                        "normalized_text^5",
-                                        "text^3",
-                                        "page_name^2"
-                                    ],
-                                    operator: "and",
-                                    type: "best_fields"
-                                }
-                            },
-                            _source: false,
-                            size: esLimit,
-                            track_total_hits: false
+
+                        const hits = esResponse.hits?.hits || [];
+
+                        /*
+                         * Lấy ad_archive_id từ _source
+                         *
+                         * KHÔNG:
+                         * hits.map(x => x._id)
+                         */
+                        const adIdsFromEs = [
+                            ...new Set(
+                                hits
+                                    .map(hit => hit?._source?.ad_archive_id)
+                                    .filter(Boolean)
+                                    .map(String)
+                            )
+                        ];
+
+                        console.log(
+                            `[ADS SEARCH] keyword="${keyword}" | ES hits=${hits.length} | Mongo IDs=${adIdsFromEs.length}`
+                        );
+
+                        /*
+                         * ES có hit nhưng document không có
+                         * ad_archive_id => index đang thiếu field này.
+                         */
+                        if (!adIdsFromEs.length) {
+                            return res.json({
+                                success: true,
+                                pagination: {
+                                    total: 0,
+                                    page,
+                                    limit,
+                                    pages: 0
+                                },
+                                data: []
+                            });
+                        }
+
+                        query.ad_archive_id = {
+                            $in: adIdsFromEs
+                        };
+
+                    } catch (esError) {
+                        console.error(
+                            '[ADS SEARCH] Elasticsearch Error:',
+                            esError
+                        );
+
+                        return res.status(500).json({
+                            success: false,
+                            message: 'Lỗi khi tìm kiếm trên Elasticsearch.',
+                            error: esError.message
                         });
                     }
-
-                    const hits = esResponse.hits?.hits ?? [];
-                    const adIdsFromEs = hits.map(x => x._id);
-
-                    if (!adIdsFromEs.length) {
-                        return res.json({
-                            success: true,
-                            pagination: {
-                                total: 0,
-                                page,
-                                limit,
-                                pages: 0
-                            },
-                            data: []
-                        });
-                    }
-
-                    query.ad_archive_id = {
-                        $in: adIdsFromEs
-                    };
-
-                } catch (esError) {
-
-                    console.error("Elasticsearch Error:", esError);
-
-                    return res.status(500).json({
-                        success: false,
-                        message: "Lỗi khi tìm kiếm trên Elasticsearch.",
-                        error: esError.message
-                    });
                 }
             }
 
-            // 2. Filter theo Đất nước
+            // =========================================================
+            // 2. FILTER COUNTRY
+            // =========================================================
             if (country) {
-                query.platforms = country.toUpperCase();
+                query.platforms = String(country).toUpperCase();
             }
 
-            // 3. Filter theo Khoảng ngày
+            // =========================================================
+            // 3. FILTER DATE
+            // =========================================================
             if (date_from || date_to) {
                 query.start_date = {};
+
                 if (date_from) {
-                    query.start_date.$gte = Math.floor(new Date(date_from).getTime() / 1000);
+                    const from = new Date(date_from);
+
+                    if (!Number.isNaN(from.getTime())) {
+                        query.start_date.$gte = Math.floor(
+                            from.getTime() / 1000
+                        );
+                    }
                 }
+
                 if (date_to) {
-                    query.start_date.$lte = Math.floor(new Date(date_to).getTime() / 1000);
+                    const to = new Date(date_to);
+
+                    if (!Number.isNaN(to.getTime())) {
+                        query.start_date.$lte = Math.floor(
+                            to.getTime() / 1000
+                        );
+                    }
+                }
+
+                // Nếu date không hợp lệ thì bỏ filter
+                if (Object.keys(query.start_date).length === 0) {
+                    delete query.start_date;
                 }
             }
 
-            // 4. Filter theo khoảng Điểm số (Score)
-            if (min_score || max_score) {
+            // =========================================================
+            // 4. FILTER SCORE
+            // =========================================================
+            const minScore = Number(min_score);
+            const maxScore = Number(max_score);
+
+            if (
+                Number.isFinite(minScore) ||
+                Number.isFinite(maxScore)
+            ) {
                 query.score = {};
-                if (min_score) query.score.$gte = parseInt(min_score, 10);
-                if (max_score) query.score.$lte = parseInt(max_score, 10);
+
+                if (Number.isFinite(minScore)) {
+                    query.score.$gte = minScore;
+                }
+
+                if (Number.isFinite(maxScore)) {
+                    query.score.$lte = maxScore;
+                }
             }
 
-            // 5. Filter theo Sản phẩm Winning
-            // Hỗ trợ lọc nhiều level, ví dụ: level=WINNER,LEGEND
+            // =========================================================
+            // 5. FILTER LEVEL
+            // =========================================================
             if (level) {
-                const levels = (level || '').split(',').map(l => l.trim().toUpperCase()).filter(Boolean);
-                query.level = { $in: levels };
+                const levels = String(level)
+                    .split(',')
+                    .map(x => x.trim().toUpperCase())
+                    .filter(Boolean);
+
+                if (levels.length) {
+                    query.level = {
+                        $in: levels
+                    };
+                }
             }
 
-            // 6. Mới: Filter theo Mức chi tiêu ước tính (có thể chọn nhiều)
+            // =========================================================
+            // 6. FILTER ESTIMATED SPEND
+            // =========================================================
             if (estimated_spend) {
-                const spendLevels = (estimated_spend || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-                query.estimated_spend = { $in: spendLevels };
+                const spendLevels = String(estimated_spend)
+                    .split(',')
+                    .map(x => x.trim().toUpperCase())
+                    .filter(Boolean);
+
+                if (spendLevels.length) {
+                    query.estimated_spend = {
+                        $in: spendLevels
+                    };
+                }
             }
 
-            // 7. Mới: Filter theo Điểm trending tối thiểu
-            if (min_trending_score) {
-                query.trending_score = { $gte: parseInt(min_trending_score, 10) || 0 };
+            // =========================================================
+            // 7. FILTER TRENDING SCORE
+            // =========================================================
+            const minTrendingScore = Number(min_trending_score);
+
+            if (Number.isFinite(minTrendingScore)) {
+                query.trending_score = {
+                    $gte: minTrendingScore
+                };
             }
 
-            // 8. Mới: Filter theo Phễu Marketing (có thể chọn nhiều)
-            if (funnel) { // Thêm filter(Boolean) để loại bỏ các giá trị rỗng
-                const funnels = (funnel || '').split(',').map(f => f.trim().toUpperCase()).filter(Boolean);
-                query.funnel = { $in: funnels };
+            // =========================================================
+            // 8. FILTER FUNNEL
+            // =========================================================
+            if (funnel) {
+                const funnels = String(funnel)
+                    .split(',')
+                    .map(x => x.trim().toUpperCase())
+                    .filter(Boolean);
+
+                if (funnels.length) {
+                    query.funnel = {
+                        $in: funnels
+                    };
+                }
             }
 
-            // TỐI ƯU HIỆU NĂNG: Nếu không có filter, dùng estimatedDocumentCount để có kết quả ngay lập tức
-            // thay vì countDocuments quét toàn bộ collection.
-            const total = Object.keys(query).length === 0
-                ? await adsCol.estimatedDocumentCount()
-                : await adsCol.countDocuments(query);
+            // =========================================================
+            // 9. FILTER SCALING LEVEL
+            // =========================================================
+            if (scaling_level) {
+                const scalingLevels = String(scaling_level)
+                    .split(',')
+                    .map(x => x.trim().toUpperCase())
+                    .filter(Boolean);
 
-            // Tạo object sort động dựa trên query params
-            const sortOptions = { [sort_by]: parseInt(sort_order, 10) };
+                if (scalingLevels.length) {
+                    query.scaling_level = {
+                        $in: scalingLevels
+                    };
+                }
+            }
 
-            // 💡 NÂNG CẤP PROJECTION: Lấy thêm Media đại diện (chỉ lấy 1 phần tử đầu tiên để tối ưu băng thông)
-            const results = await adsCol.find(query)
+            // =========================================================
+            // 10. COUNT
+            // =========================================================
+            const total =
+                Object.keys(query).length === 0
+                    ? await adsCol.estimatedDocumentCount()
+                    : await adsCol.countDocuments(query);
+
+            // =========================================================
+            // 11. SORT
+            // =========================================================
+            const sortDirection =
+                Number(sort_order) === 1 ? 1 : -1;
+
+            /*
+             * Whitelist field sort để tránh nhận field linh tinh
+             */
+            const allowedSortFields = new Set([
+                'score',
+                'trending_score',
+                'start_date',
+                'seen_count',
+                'analyzed_at',
+                'first_seen',
+                'last_seen',
+                'scaling_score'
+            ]);
+
+            const safeSortField = allowedSortFields.has(String(sort_by))
+                ? String(sort_by)
+                : 'score';
+
+            const sortOptions = {
+                [safeSortField]: sortDirection
+            };
+
+            // =========================================================
+            // 12. QUERY MONGODB
+            // =========================================================
+            const results = await adsCol
+                .find(query)
                 .project({
                     ad_archive_id: 1,
                     page_name: 1,
                     page_like_count: 1,
-                    text: { $substrCP: ["$text", 0, 150] },
+
+                    // Giữ nguyên text đầy đủ nếu Mongo driver hỗ trợ
+                    text: 1,
+
                     link: 1,
                     domain: 1,
                     start_date: 1,
                     seen_count: 1,
                     score: 1,
                     level: 1,
-                    trending_score: 1, // Bổ sung các trường mới vào projection
+                    trending_score: 1,
                     estimated_spend: 1,
                     scaling_level: 1,
                     funnel: 1,
                     analyzed_at: 1,
-                    // Chỉ bốc duy nhất 1 ảnh/video đầu tiên làm thumbnail hiển thị trên Card UI danh sách
-                    thumbnail_local: 1, // Trả về đường dẫn ảnh đã lưu
-                    images: { $slice: ["$images", 1] },
-                    videos: { $slice: ["$videos", 1] }
+                    thumbnail_local: 1,
+
+                    images: {
+                        $slice: 1
+                    },
+
+                    videos: {
+                        $slice: 1
+                    }
                 })
                 .sort(sortOptions)
                 .skip(skip)
                 .limit(limit)
                 .toArray();
 
+            // =========================================================
+            // 13. RESPONSE
+            // =========================================================
             return res.json({
                 success: true,
                 pagination: {
@@ -289,6 +462,8 @@ function initSearchServer(dbInstance, kafkaInstance) {
             });
 
         } catch (error) {
+            console.error('[ADS SEARCH] Internal Error:', error);
+
             return res.status(500).json({
                 success: false,
                 message: 'Internal Server Error',
@@ -296,6 +471,7 @@ function initSearchServer(dbInstance, kafkaInstance) {
             });
         }
     });
+
 
     /**
      * 🟢 API 2: LẤY CHI TIẾT QUẢNG CÁO (Trả ra toàn bộ Object gồm lịch sử tăng trưởng)

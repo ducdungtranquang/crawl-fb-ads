@@ -88,16 +88,16 @@ function detectFunnel(ad) {
  * @returns {{level: 'LOW'|'MEDIUM'|'HIGH'|'VERY HIGH', score: number}}
  */
 function estimateSpendLevel(ad) {
-    let spendScore = 0;
-    if (ad.seen_count > 5) spendScore += 1;
-    if (ad.seen_count > 10) spendScore += 2;
-    if (ad.platforms?.length > 1) spendScore += 1;
-    if (ad.is_active) spendScore += 1;
+  let spendScore = 0;
+  if (ad.seen_count > 5) spendScore += 1;
+  if (ad.seen_count > 10) spendScore += 2;
+  if (ad.platforms?.length > 1) spendScore += 1;
+  if (ad.is_active) spendScore += 1;
 
-    if (spendScore >= 4) return { level: 'VERY HIGH', score: 4 };
-    if (spendScore >= 3) return { level: 'HIGH', score: 3 };
-    if (spendScore >= 2) return { level: 'MEDIUM', score: 2 };
-    return { level: 'LOW', score: 1 };
+  if (spendScore >= 4) return { level: 'VERY HIGH', score: 4 };
+  if (spendScore >= 3) return { level: 'HIGH', score: 3 };
+  if (spendScore >= 2) return { level: 'MEDIUM', score: 2 };
+  return { level: 'LOW', score: 1 };
 }
 
 // ===== CORE ANALYZE PROCESS =====
@@ -282,57 +282,92 @@ async function updateProductsCollection(db, analyzedAds) {
  * @param {Array<object>} analyzedAds 
  */
 async function syncToElasticsearch(esClient, analyzedAds) {
-  if (!analyzedAds.length) return;
+  if (!analyzedAds || analyzedAds.length === 0) {
+    return;
+  }
 
-  // Chuẩn bị body cho bulk request. Mỗi document cần 2 dòng: action và source.
-  const body = analyzedAds.flatMap(ad => {    
-    // TẠO OBJECT SẠCH: Chỉ lấy các trường đã định nghĩa trong mapping của ES
-    // để đảm bảo `copy_to` hoạt động chính xác và không lưu trữ dữ liệu thừa.
-    const doc = {
-      // SỬA LỖI: Phải lấy đúng trường text đã được chuẩn hóa mà logic chấm điểm sử dụng
-      text: ad.normalized_text || ad.text,
-      headline: ad.headline,
-      description: ad.description,
-      score: ad.score,
+  const operations = analyzedAds.flatMap(ad => {
+    const adId = String(ad.ad_archive_id);
+
+    const document = {
+      ad_archive_id: adId,
+
+      // Nội dung tìm kiếm
+      text: ad.text || '',
+      headline: ad.headline || '',
+      description: ad.description || '',
+      page_name: ad.page_name || '',
+
+      // Thông tin cơ bản
+      domain: ad.domain || '',
       start_date: ad.start_date,
-      domain: ad.domain,
-      level: ad.level,
-      estimated_spend: ad.estimated_spend,
-      funnel: ad.funnel,
-      scaling_level: ad.scaling_level,
-      ad_archive_id: ad.ad_archive_id
+
+      // Các field phân tích
+      score: ad.score ?? 0,
+      level: ad.level || '',
+      estimated_spend: ad.estimated_spend || '',
+      funnel: ad.funnel || '',
+      scaling_level: ad.scaling_level || ''
     };
 
     return [
-      // Action: index (hoặc update) document với _id là ad_archive_id
-      { index: { _index: ELASTIC_INDEX, _id: ad.ad_archive_id } },
-      // Source: Dữ liệu của document
-      doc
+      {
+        index: {
+          _index: ELASTIC_INDEX,
+          _id: adId
+        }
+      },
+      document
     ];
   });
 
   try {
-    const { body: bulkResponse } = await esClient.bulk({ refresh: true, body });
+    const response = await esClient.bulk({
+      refresh: false,
+      operations
+    });
 
-    if (bulkResponse.errors) {
-      const erroredDocuments = [];
-      bulkResponse.items.forEach((action, i) => {
-        const operation = Object.keys(action)[0];
-        if (action[operation].error) {
-          erroredDocuments.push({
-            status: action[operation].status,
-            error: action[operation].error,
+    // Elasticsearch client 8.x trả response trực tiếp
+    if (response.errors) {
+      const errors = [];
+
+      for (let i = 0; i < response.items.length; i++) {
+        const item = response.items[i];
+        const operation = item.index || item.create || item.update;
+
+        if (operation?.error) {
+          errors.push({
+            index: i,
+            id: operation._id,
+            status: operation.status,
+            error: operation.error
           });
         }
-      });
-      console.error(`❌ [Elasticsearch Sync] Có lỗi xảy ra trong quá trình bulk index:`, erroredDocuments);
-    } else {
-      console.log(`🚀 [Elasticsearch Sync] Đã đồng bộ thành công ${analyzedAds.length} bản ghi.`);
+      }
+
+      console.error(
+        `⚠️ [Elasticsearch Sync] Có ${errors.length}/${analyzedAds.length} document lỗi.`
+      );
+
+      console.error(
+        JSON.stringify(errors.slice(0, 10), null, 2)
+      );
+
+      return false;
     }
-  } catch (err) {
-    console.error('❌ [Elasticsearch Sync] Lỗi nghiêm trọng khi đồng bộ dữ liệu:', err.meta ? err.meta.body : err);
+
+    return true;
+
+  } catch (error) {
+    console.error(
+      '❌ [Elasticsearch Sync] Lỗi nghiêm trọng khi đồng bộ dữ liệu:',
+      error?.meta?.body || error?.message || error
+    );
+
+    return false;
   }
 }
+
 
 /**
  * Đảm bảo index tồn tại trên Elasticsearch với mapping chính xác.
@@ -340,69 +375,156 @@ async function syncToElasticsearch(esClient, analyzedAds) {
  * @param {import('@elastic/elasticsearch').Client} esClient
  */
 async function ensureIndexExists(esClient) {
-  console.log(`🔎 [Elasticsearch] Đang kiểm tra sự tồn tại của index '${ELASTIC_INDEX}'...`);
-  // Sửa lỗi: Với client ES v8, kết quả boolean nằm trong thuộc tính `body` của response.
-  const response = await esClient.indices.exists({ index: ELASTIC_INDEX });
+  const exists = await esClient.indices.exists({
+    index: ELASTIC_INDEX
+  });
 
-  if (response.body) {
-    console.log(`✅ [Elasticsearch] Index '${ELASTIC_INDEX}' đã tồn tại.`);
-    // TODO: Cân nhắc thêm logic cập nhật mapping nếu cần thiết trong tương lai (update-by-query)
-    return;
+  if (exists) {
+    console.log(
+      `ℹ️ [Elasticsearch] Index '${ELASTIC_INDEX}' đã tồn tại. Bỏ qua reindex.`
+    );
+
+    return false;
   }
 
-  console.log(`⚠️ [Elasticsearch] Index '${ELASTIC_INDEX}' không tồn tại. Bắt đầu tạo mới với mapping...`);
-  try {
-    await esClient.indices.create({
-      index: ELASTIC_INDEX,
-      body: {
-        settings: {
-          // Tối ưu hóa analyzer cho tìm kiếm tiếng Việt và tổng quát
-          analysis: {
-            analyzer: {
-              vietnamese_analyzer: {
-                type: "custom",
-                tokenizer: "standard",
-                filter: ["lowercase", "asciifolding"] // Chuyển về chữ thường và bỏ dấu
-              }
-            }
-          }
-        },
-        mappings: {
-          properties: {
-            // Gộp các trường text chính vào một trường `full_text_search` để tìm kiếm tập trung
-            text: { type: "text", analyzer: "vietnamese_analyzer", copy_to: "full_text_search" },
-            headline: { type: "text", analyzer: "vietnamese_analyzer", copy_to: "full_text_search" },
-            description: { type: "text", analyzer: "vietnamese_analyzer", copy_to: "full_text_search" },
-            full_text_search: { type: "text", analyzer: "vietnamese_analyzer" }, // Trường tổng hợp để query
+  console.log(
+    `🆕 [Elasticsearch] Index '${ELASTIC_INDEX}' chưa tồn tại. Đang tạo...`
+  );
 
-            // Các trường khác để filter và sort
-            score: { type: "double" },
-            start_date: { type: "date", format: "epoch_second" },
-            domain: { type: "keyword" },
-            level: { type: "keyword" },
-            estimated_spend: { type: "keyword" },
-            funnel: { type: "keyword" },
-            scaling_level: { type: "keyword" },
-            ad_archive_id: { type: "keyword" }
+  await esClient.indices.create({
+    index: ELASTIC_INDEX,
+    settings: {
+      analysis: {
+        analyzer: {
+          vietnamese_analyzer: {
+            type: 'custom',
+            tokenizer: 'standard',
+            filter: [
+              'lowercase',
+              'asciifolding'
+            ]
           }
         }
       }
-    });
-    console.log(`🎉 [Elasticsearch] Đã tạo thành công index '${ELASTIC_INDEX}' với mapping.`);
-  } catch (err) {
-    console.error(`❌ [Elasticsearch] Lỗi nghiêm trọng khi tạo index:`, err.meta ? err.meta.body : err);
-    // Nếu không tạo được index thì nên dừng ứng dụng để tránh các lỗi phát sinh sau này
-    process.exit(1);
+    },
+    mappings: {
+      properties: {
+        ad_archive_id: {
+          type: 'keyword'
+        },
+        text: {
+          type: 'text',
+          analyzer: 'vietnamese_analyzer',
+          copy_to: 'full_text_search'
+        },
+        headline: {
+          type: 'text',
+          analyzer: 'vietnamese_analyzer',
+          copy_to: 'full_text_search'
+        },
+        description: {
+          type: 'text',
+          analyzer: 'vietnamese_analyzer',
+          copy_to: 'full_text_search'
+        },
+        page_name: {
+          type: 'text',
+          analyzer: 'vietnamese_analyzer',
+          copy_to: 'full_text_search'
+        },
+        domain: {
+          type: 'keyword'
+        },
+        score: {
+          type: 'double'
+        },
+        level: {
+          type: 'keyword'
+        },
+        estimated_spend: {
+          type: 'keyword'
+        },
+        funnel: {
+          type: 'keyword'
+        },
+        scaling_level: {
+          type: 'keyword'
+        },
+        start_date: {
+          type: 'date',
+          format: 'epoch_second'
+        },
+        full_text_search: {
+          type: 'text',
+          analyzer: 'vietnamese_analyzer'
+        }
+      }
+    }
+  });
+
+  console.log(
+    `✅ [Elasticsearch] Đã tạo index '${ELASTIC_INDEX}'.`
+  );
+
+  return true;
+}
+
+async function reindexAllAds(adsCol, esClient) {
+  const BATCH_SIZE = 1000;
+
+  const total = await adsCol.countDocuments();
+
+  console.log(
+    `🔄 [Reindex] Bắt đầu index ${total.toLocaleString()} ads...`
+  );
+
+  const cursor = adsCol.find(
+    {},
+    {
+      batchSize: BATCH_SIZE
+    }
+  );
+
+  let batch = [];
+  let processed = 0;
+
+  try {
+    for await (const ad of cursor) {
+      batch.push(ad);
+
+      if (batch.length >= BATCH_SIZE) {
+        await syncToElasticsearch(esClient, batch);
+
+        processed += batch.length;
+
+        console.log(
+          `📊 [Reindex] ${processed.toLocaleString()} / ${total.toLocaleString()}`
+        );
+
+        batch = [];
+      }
+    }
+
+    if (batch.length > 0) {
+      await syncToElasticsearch(esClient, batch);
+
+      processed += batch.length;
+
+      console.log(
+        `📊 [Reindex] ${processed.toLocaleString()} / ${total.toLocaleString()}`
+      );
+    }
+
+    console.log(
+      `✅ [Reindex] Hoàn tất ${processed.toLocaleString()} ads.`
+    );
+  } finally {
+    await cursor.close();
   }
 }
 
 const logger = require('./logger');
 
-// main().catch(err => {
-//     logger.error('Sập dịch vụ Analyzer chính', err);
-// });
-
-// ===== MAIN CONSUMER PROCESS =====
 // ===== MAIN CONSUMER PROCESS =====
 async function main() {
   console.log("[System] Bắt đầu khởi chạy tiến trình Analyzer tổng hợp...");
@@ -426,8 +548,15 @@ async function main() {
   // Khởi tạo Elasticsearch Client
   const esClient = new Client({ node: ELASTICSEARCH_URL });
 
-  // Đảm bảo index và mapping đã tồn tại trước khi làm bất cứ điều gì khác
-  await ensureIndexExists(esClient);
+  // // Đảm bảo index và mapping đã tồn tại trước khi làm bất cứ điều gì khác
+  // await ensureIndexExists(esClient);
+  const isNewIndex = await ensureIndexExists(esClient);
+
+  if (isNewIndex) {
+    const adsCol = db.collection('analyzed_ads');
+
+    await reindexAllAds(adsCol, esClient);
+  }
 
   // 3. 🔥 KÍCH HOẠT API SERVER NGAY (Bọc try-catch riêng để nếu lỗi Kafka cũ không làm sập cổng 5002)
   try {
@@ -493,37 +622,37 @@ async function main() {
     }
 
     const adsCol = db.collection('analyzed_ads');
-    
+
     // TỐI ƯU HÓA: Đảm bảo các index quan trọng cho việc tìm kiếm đã được tạo
     console.log("🚀 [DB Index] Đang kiểm tra và khởi tạo các chỉ mục tối ưu hóa truy vấn...");
     try {
-        await adsCol.createIndexes([
-            { key: { ad_archive_id: 1 }, name: "ad_archive_id_unique", unique: true },
-            { key: { score: -1, analyzed_at: -1 }, name: "score_analyzed_sort" },
-            { key: { text: "text" }, name: "text_search" },
-            { key: { domain: 1 }, name: "domain_filter" },
-            { key: { level: 1 }, name: "level_filter" },
-            { key: { estimated_spend: 1 }, name: "spend_filter" },
-            { key: { trending_score: -1 }, name: "trending_sort" },
-            { key: { funnel: 1 }, name: "funnel_filter" },
-            { key: { start_date: -1 }, name: "date_sort" }
-        ]);
-        console.log("✅ [DB Index] Hoàn tất việc đảm bảo các chỉ mục 'analyzed_ads' đã sẵn sàng.");
+      await adsCol.createIndexes([
+        { key: { ad_archive_id: 1 }, name: "ad_archive_id_unique", unique: true },
+        { key: { score: -1, analyzed_at: -1 }, name: "score_analyzed_sort" },
+        { key: { text: "text" }, name: "text_search" },
+        { key: { domain: 1 }, name: "domain_filter" },
+        { key: { level: 1 }, name: "level_filter" },
+        { key: { estimated_spend: 1 }, name: "spend_filter" },
+        { key: { trending_score: -1 }, name: "trending_sort" },
+        { key: { funnel: 1 }, name: "funnel_filter" },
+        { key: { start_date: -1 }, name: "date_sort" }
+      ]);
+      console.log("✅ [DB Index] Hoàn tất việc đảm bảo các chỉ mục 'analyzed_ads' đã sẵn sàng.");
     } catch (indexError) {
-        // Bắt lỗi "Index already exists with a different name" và cho qua
-        if (indexError.codeName === 'IndexOptionsConflict' || indexError.code === 85) {
-            console.warn(`⚠️ [DB Index Warning] Bỏ qua lỗi tạo index đã tồn tại với tên khác. Hệ thống sẽ tiếp tục hoạt động với index cũ. Lỗi: ${indexError.message}`);
-        } else {
-            throw indexError; // Ném lại các lỗi nghiêm trọng khác
-        }
+      // Bắt lỗi "Index already exists with a different name" và cho qua
+      if (indexError.codeName === 'IndexOptionsConflict' || indexError.code === 85) {
+        console.warn(`⚠️ [DB Index Warning] Bỏ qua lỗi tạo index đã tồn tại với tên khác. Hệ thống sẽ tiếp tục hoạt động với index cũ. Lỗi: ${indexError.message}`);
+      } else {
+        throw indexError; // Ném lại các lỗi nghiêm trọng khác
+      }
     }
 
     // TỐI ƯU HÓA: Tạo index cho collection 'products'
     const productsCol = db.collection('products');
     await productsCol.createIndexes([
-        { key: { domain: 1 }, name: "domain_unique", unique: true },
-        { key: { product_score: -1 }, name: "product_score_sort" },
-        { key: { winning_ads: -1 }, name: "winning_ads_sort" }
+      { key: { domain: 1 }, name: "domain_unique", unique: true },
+      { key: { product_score: -1 }, name: "product_score_sort" },
+      { key: { winning_ads: -1 }, name: "winning_ads_sort" }
     ]);
     console.log("✅ [DB Index] Hoàn tất việc đảm bảo các chỉ mục 'products' đã sẵn sàng.");
 
