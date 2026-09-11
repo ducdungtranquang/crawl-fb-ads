@@ -1,16 +1,14 @@
 const { MongoClient } = require('mongodb');
 
-// ===== CONFIGURATION =====
 const MONGO_URI = 'mongodb://127.0.0.1:27017/?directConnection=true';
 
-const SRC_DB_NAME = 'fb_ads'; 
-const SRC_COL_NAME = 'ads';        
+const SRC_DB_NAME = 'fb_ads';
+const SRC_COL_NAME = 'ads';
 
 const DEST_DB_NAME = 'fb_ads_analyzer';
 const DEST_ADS_COL = 'analyzed_ads';
 const DEST_PROD_COL = 'products';
 
-// ===== ANALYZER LOGIC EMBEDDED =====
 function normalize(text) {
   return text?.toLowerCase().replace(/\s+/g, ' ').trim();
 }
@@ -52,75 +50,82 @@ function detectFunnel(ad) {
   return 'UNKNOWN';
 }
 
-/**
- * Ước tính mức độ chi tiêu cho quảng cáo dựa trên các chỉ số gián tiếp.
- * @param {object} ad Đối tượng quảng cáo.
- * @returns {{level: 'LOW'|'MEDIUM'|'HIGH'|'VERY HIGH', score: number}}
- */
 function estimateSpendLevel(ad) {
-    let spendScore = 0;
-    if (ad.seen_count > 5) spendScore += 1;
-    if (ad.seen_count > 10) spendScore += 2;
-    if (ad.platforms?.length > 1) spendScore += 1;
-    if (ad.is_active) spendScore += 1;
+  let spendScore = 0;
+  if (ad.seen_count > 5) spendScore += 1;
+  if (ad.seen_count > 10) spendScore += 2;
+  if (ad.platforms?.length > 1) spendScore += 1;
+  if (ad.is_active) spendScore += 1;
 
-    if (spendScore >= 4) return { level: 'VERY HIGH', score: 4 };
-    if (spendScore >= 3) return { level: 'HIGH', score: 3 };
-    if (spendScore >= 2) return { level: 'MEDIUM', score: 2 };
-    return { level: 'LOW', score: 1 };
+  if (spendScore >= 4) return { level: 'VERY HIGH', score: 4 };
+  if (spendScore >= 3) return { level: 'HIGH', score: 3 };
+  if (spendScore >= 2) return { level: 'MEDIUM', score: 2 };
+  return { level: 'LOW', score: 1 };
 }
 
-// ===== CORE ANALYZE PROCESS (Copied from analyzer.js) =====
-function analyzeAdsBatch(ads) {
+function summarizeDetailHistory(ad) {
+  const history = Array.isArray(ad.detail_history) ? ad.detail_history : [];
+  const latest = history[history.length - 1] || {};
+  const firstSeen = ad.first_seen || Date.now();
+  const totalDays = Math.max(1, ((Date.now() - firstSeen) / (1000 * 3600 * 24)));
+
+  return {
+    ad_lifecycle_days: Number(totalDays.toFixed(2)),
+    text_change_count: ad.text_change_count || history.filter(item => item.text && item.text !== latest.text).length,
+    headline_change_count: ad.headline_change_count || history.filter(item => item.headline && item.headline !== latest.headline).length,
+    domain_change_count: ad.domain_change_count || (Array.isArray(ad.domain_history) ? ad.domain_history.length - 1 : 0),
+    cta_change_count: ad.cta_change_count || (Array.isArray(ad.cta_history) ? ad.cta_history.length - 1 : 0),
+    creative_change_count: ad.creative_change_count || (Array.isArray(ad.media_change_history) ? ad.media_change_history.length : 0),
+    keyword_count: Array.isArray(ad.keyword_mentions) ? ad.keyword_mentions.length : 0,
+    country_count: Array.isArray(ad.country_mentions) ? ad.country_mentions.length : 0,
+    unique_keywords: Array.isArray(ad.keyword_mentions) ? [...new Set(ad.keyword_mentions)].length : 0,
+    unique_countries: Array.isArray(ad.country_mentions) ? [...new Set(ad.country_mentions)].length : 0,
+    detail_history_length: history.length,
+    longest_creative_streak_days: history.length > 0 ? Math.max(1, history.length) : 1,
+    latest_detail_country: latest.country || ad.last_country || 'ALL'
+  };
+}
+
+function analyzeAllAdsGlobally(ads) {
   const now = Date.now();
   const pageMap = {};
   const textMap = {};
   const domainMap = {};
 
-  // Xây dựng ngữ cảnh tần suất xuất hiện theo cả cụm dữ liệu nhận về
   for (const ad of ads) {
     const text = ad.normalized_text || normalize(ad.text || '');
     const domain = extractDomain(ad.link);
-
-    pageMap[ad.page_name] = (pageMap[ad.page_name] || 0) + 1;
+    const pageName = ad.page_name || 'unknown';
+    pageMap[pageName] = (pageMap[pageName] || 0) + 1;
     textMap[text] = (textMap[text] || 0) + 1;
     if (domain) domainMap[domain] = (domainMap[domain] || 0) + 1;
   }
 
   return ads.map(ad => {
-    let score = 0;
     const text = ad.normalized_text || normalize(ad.text || '');
     const domain = extractDomain(ad.link);
-
-    // 1. Ước tính mức chi tiêu
     const spend = estimateSpendLevel(ad);
+    const detailSummary = summarizeDetailHistory(ad);
+
+    let score = 0;
+    const pageAds = pageMap[ad.page_name] || 0;
+    const clones = textMap[text] || 0;
+    const domainAds = domainMap[domain] || 0;
 
     const days = (now - (ad.start_date || now) * 1000) / (1000 * 3600 * 24);
     if (days > 3) score += 2;
     if (days > 7) score += 4;
     if (days > 14) score += 6;
-
-    const pageAds = pageMap[ad.page_name] || 0;
     if (pageAds > 5) score += 2;
     if (pageAds > 10) score += 4;
-
-    const clones = textMap[text] || 0;
     if (clones > 3) score += 3;
     if (clones > 5) score += 5;
-
-    const domainAds = domainMap[domain] || 0;
     if (domainAds > 5) score += 2;
-
     if (ad.platforms?.length > 1) score += 2;
     if (ad.videos?.length > 0) score += 2;
     if (ad.cta === 'Shop Now') score += 2;
     if (ad.cta === 'Learn more') score += 1;
 
-    const like = ad.snapshot?.page_like_count || 0;
-    if (like > 10000) score += 2;
-    if (like > 50000) score += 3;
-
-    // 2. Tính toán các chỉ số tăng trưởng
     const delta = calcDelta(ad.growth_history);
     const smooth = calcSmoothDelta(ad.growth_history);
     const burst = calcBurst(ad.growth_history);
@@ -130,17 +135,13 @@ function analyzeAdsBatch(ads) {
     if (delta >= 1) scalingScore += 2;
     if (delta >= 2) scalingScore += 4;
     if (delta >= 3) scalingScore += 6;
-
     if (smooth >= 1) scalingScore += 3;
     if (smooth >= 2) scalingScore += 5;
-
     if (burst >= 2) scalingScore += 4;
     if (burst >= 4) scalingScore += 7;
     if (burst >= 6) scalingScore += 10;
-
     if (fallback > 1) scalingScore += 2;
     if (fallback > 3) scalingScore += 4;
-
     if (ad.seen_count > 3) scalingScore += 2;
     if (ad.seen_count > 6) scalingScore += 4;
 
@@ -148,15 +149,12 @@ function analyzeAdsBatch(ads) {
     if (recentMinutes < 60) scalingScore += 3;
     if (recentMinutes < 15) scalingScore += 5;
 
-    // 3. Tính điểm Trending dựa trên sự đột biến
     let trendingScore = 0;
     if (burst > 2) trendingScore += 5;
     if (burst > 4) trendingScore += 10;
     if (delta > 1) trendingScore += 5;
 
-    // 4. TÍNH ĐIỂM TỔNG HỢP CUỐI CÙNG
-    // Trọng số: Tăng trưởng > Điểm cơ bản > Mức chi tiêu > Trending
-    score = scalingScore * 1.5 + score + spend.score + trendingScore * 0.5;
+    score = scalingScore * 1.5 + score + spend.score + trendingScore * 0.5 + (detailSummary.detail_history_length * 0.5);
 
     return {
       ...ad,
@@ -171,79 +169,27 @@ function analyzeAdsBatch(ads) {
       smooth_delta: smooth,
       burst,
       fallback_growth: fallback,
-      funnel: detectFunnel(ad)
+      funnel: detectFunnel(ad),
+      ...detailSummary
     };
   });
 }
 
-// ===== MAIN MIGRATION PROCESS =====
-async function runDirectMigration() {
-  const client = new MongoClient(MONGO_URI);
-  await client.connect();
-  console.log('✅ Đã kết nối thành công tới MongoDB Local.');
-
-  const srcDb = client.db(SRC_DB_NAME);
-  const destDb = client.db(DEST_DB_NAME);
-
-  const srcCol = srcDb.collection(SRC_COL_NAME);
-  const destAdsCol = destDb.collection(DEST_ADS_COL);
-  const destProdCol = destDb.collection(DEST_PROD_COL);
-
-  // Tạo index trước để lát query bên Monitor UI cho mượt
-  await destAdsCol.createIndex({ ad_archive_id: 1 }, { unique: true });
-  await destAdsCol.createIndex({ score: -1, timestamp: -1 });
-
-  const totalRecords = await srcCol.countDocuments();
-  console.log(`📊 Tìm thấy tổng cộng ${totalRecords.toLocaleString()} bản ghi cần xử lý.`);
-
-  const cursor = srcCol.find({});
-  let buffer = [];
-  let processedCount = 0;
-
-  console.log('Bắt đầu quét phân rã và tính toán điểm trực tiếp...');
-
-  while (await cursor.hasNext()) {
-    const rawAd = await cursor.next();
-    buffer.push(rawAd);
-
-    // Gom cụm 1000 bản ghi xử lý một lần để tối ưu RAM và Bulk Write
-    if (buffer.length >= 1000) {
-      await processAndSave(buffer, destAdsCol, destProdCol);
-      processedCount += buffer.length;
-      console.log(`⏩ Tiến độ: Đã phân tích & lưu thành công ${processedCount.toLocaleString()} / ${totalRecords.toLocaleString()} bản ghi.`);
-      buffer = []; // Clear buffer
-    }
-  }
-
-  // Xử lý nốt số lượng dư còn lại trong mảng
-  if (buffer.length > 0) {
-    await processAndSave(buffer, destAdsCol, destProdCol);
-    processedCount += buffer.length;
-    console.log(`🏁 Hoàn thành xử lý mớ dư cuối cùng. Tổng số bản ghi thực tế: ${processedCount.toLocaleString()}`);
-  }
-
-  console.log('🎉 QUÁ TRÌNH MIGRATION TRỰC TIẾP HOÀN THÀNH ĐẸP ĐẼ!');
-  await client.close();
-}
-
 async function processAndSave(rawBatch, adsCol, prodCol) {
-  // 1. Chấm điểm trực tiếp bằng hàm chuyên dụng
-  const analyzedBatch = analyzeAdsBatch(rawBatch);
+  const analyzedBatch = analyzeAllAdsGlobally(rawBatch);
 
-  // 2. Chuẩn bị Bulk Write cho bảng dán nhãn Ads độc nhất
   const adsBulkOps = analyzedBatch
-    .filter(ad => ad && ad.ad_archive_id) // Chống rỗng ID
+    .filter(ad => ad && ad.ad_archive_id)
     .map(ad => {
-      const { _id, ...adDataWithoutId } = ad; 
-
+      const { _id, ...adDataWithoutId } = ad;
       return {
         updateOne: {
           filter: { ad_archive_id: ad.ad_archive_id },
-          update: { 
-            $set: { 
-              ...adDataWithoutId, // 🔥 Chỉ update những trường còn lại, KHÔNG CÓ _id
-              analyzed_at: Date.now() 
-            } 
+          update: {
+            $set: {
+              ...adDataWithoutId,
+              analyzed_at: Date.now()
+            }
           },
           upsert: true
         }
@@ -254,7 +200,6 @@ async function processAndSave(rawBatch, adsCol, prodCol) {
     await adsCol.bulkWrite(adsBulkOps, { ordered: false });
   }
 
-  // 3. Chuẩn bị Bulk Write cho bảng tổng hợp Domain (Products)
   const productMap = {};
   for (const ad of analyzedBatch) {
     if (!ad.domain) continue;
@@ -270,8 +215,6 @@ async function processAndSave(rawBatch, adsCol, prodCol) {
     const pages = p.pages.size;
     const totalScore = p.ads.reduce((sum, ad) => sum + (ad.score || 0), 0);
     const winningAdsCount = p.ads.filter(ad => ad.level === '🔥 WINNER' || ad.level === '🏆 LEGEND').length;
-
-    // Điểm sản phẩm = Tổng điểm ads + (số page * 2) + (số ads winning * 5)
     const productScore = totalScore + pages * 2 + winningAdsCount * 5;
 
     return {
@@ -297,5 +240,39 @@ async function processAndSave(rawBatch, adsCol, prodCol) {
   }
 }
 
-// Kích hoạt tiến trình
+async function runDirectMigration() {
+  const client = new MongoClient(MONGO_URI);
+  await client.connect();
+  console.log('✅ Đã kết nối thành công tới MongoDB Local.');
+
+  const srcDb = client.db(SRC_DB_NAME);
+  const destDb = client.db(DEST_DB_NAME);
+
+  const srcCol = srcDb.collection(SRC_COL_NAME);
+  const destAdsCol = destDb.collection(DEST_ADS_COL);
+  const destProdCol = destDb.collection(DEST_PROD_COL);
+
+  await destAdsCol.createIndex({ ad_archive_id: 1 }, { unique: true });
+  await destAdsCol.createIndex({ score: -1, analyzed_at: -1 });
+
+  const totalRecords = await srcCol.countDocuments();
+  console.log(`📊 Tìm thấy tổng cộng ${totalRecords.toLocaleString()} bản ghi cần xử lý.`);
+
+  const rawAds = await srcCol.find({}).toArray();
+  const chunks = [];
+  for (let i = 0; i < rawAds.length; i += 1000) {
+    chunks.push(rawAds.slice(i, i + 1000));
+  }
+
+  let processedCount = 0;
+  for (const batch of chunks) {
+    await processAndSave(batch, destAdsCol, destProdCol);
+    processedCount += batch.length;
+    console.log(`⏩ Tiến độ: Đã phân tích & lưu thành công ${processedCount.toLocaleString()} / ${totalRecords.toLocaleString()} bản ghi.`);
+  }
+
+  console.log('🎉 QUÁ TRÌNH MIGRATION TRỰC TIẾP HOÀN THÀNH ĐẸP ĐẼ!');
+  await client.close();
+}
+
 runDirectMigration().catch(console.error);

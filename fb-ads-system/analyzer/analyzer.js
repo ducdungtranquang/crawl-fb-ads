@@ -1,5 +1,4 @@
 const { MongoClient } = require('mongodb');
-const { Kafka } = require('kafkajs');
 const { Client } = require('@elastic/elasticsearch');
 const { initSearchServer } = require('./searchApi');
 
@@ -18,18 +17,17 @@ global.setTimeout = function (callback, delay, ...args) {
 };
 
 process.env.TZ = 'UTC';
-process.env.KAFKAJS_NO_PARTITIONER_WARNING = '1';
 
 // ===== CONFIG =====
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
-const DB_NAME = 'fb_ads_analyzer'; // Database riêng biệt phân tích
-
-const KAFKA_BROKERS = process.env.KAFKA_BROKERS ? [process.env.KAFKA_BROKERS] : ['localhost:9092'];
-const KAFKA_TOPIC = 'fb-ads-events';
-const CONSUMER_GROUP = 'analyzer-group';
+const CRAWLER_DB_NAME = 'fb_ads';          // Nguồn dữ liệu gốc từ crawler
+const ANALYZER_DB_NAME = 'fb_ads_analyzer'; // Nơi lưu trữ dữ liệu đã phân tích
 
 const ELASTICSEARCH_URL = process.env.ELASTICSEARCH_URL || 'http://localhost:9200';
 const ELASTIC_INDEX = 'fb_ads_analyzer';
+
+// Mức thời gian nghỉ giữa các vòng lặp phân tích (Millisecond)
+const POLLING_INTERVAL = 60 * 1000; // 1 phút
 
 // ===== UTILS =====
 function normalize(text) {
@@ -83,74 +81,144 @@ function detectFunnel(ad) {
 }
 
 /**
- * Ước tính mức độ chi tiêu cho quảng cáo dựa trên các chỉ số gián tiếp.
- * @param {object} ad Đối tượng quảng cáo.
- * @returns {{level: 'LOW'|'MEDIUM'|'HIGH'|'VERY HIGH', score: number}}
+ * 🎯 ƯỚC TÍNH CHI PHÍ (SPEND) VÀ SỐ LƯỢT TIẾP CẬN (REACH)
+ * Áp dụng mô hình toán học Ads Spy tối ưu
  */
-function estimateSpendLevel(ad) {
-  let spendScore = 0;
-  if (ad.seen_count > 5) spendScore += 1;
-  if (ad.seen_count > 10) spendScore += 2;
-  if (ad.platforms?.length > 1) spendScore += 1;
-  if (ad.is_active) spendScore += 1;
+function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1) {
+  const T = Math.max(1, Math.round(durationDays));
+  const D = Math.max(1, Math.round(duplicatesCount || ad.seen_count || 1));
 
-  if (spendScore >= 4) return { level: 'VERY HIGH', score: 4 };
-  if (spendScore >= 3) return { level: 'HIGH', score: 3 };
-  if (spendScore >= 2) return { level: 'MEDIUM', score: 2 };
-  return { level: 'LOW', score: 1 };
+  // 1. Xác định CPM theo khu vực Địa lý
+  const countries = Array.isArray(ad.country_mentions) && ad.country_mentions.length > 0
+    ? ad.country_mentions
+    : [ad.last_country || 'US'];
+
+  const geoCpmMap = {
+    US: 18.0, CA: 16.0,
+    UK: 10.0, DE: 9.5, FR: 9.0, SG: 11.0, EU: 9.0,
+    RO: 5.0, BR: 4.5, MX: 4.0, TH: 3.5,
+    VN: 2.0, PH: 1.8, ID: 1.5
+  };
+
+  let sumCpm = 0;
+  countries.forEach(c => {
+    sumCpm += geoCpmMap[c?.toUpperCase()] || 8.0;
+  });
+  const cpm = sumCpm / countries.length;
+
+  // 2. Định nghĩa Hệ số Ngành hàng
+  const fullText = normalize((ad.text || '') + ' ' + (ad.headline || ''));
+  let mInd = 1.0;
+  if (fullText.match(/mỹ phẩm|skincare|trị mụn|kem|serum|dược|thuốc|vitamin|beauty|health/i)) {
+    mInd = 1.2;
+  } else if (fullText.match(/thời trang|quần áo|giày|túi|đồng hồ|fashion|wear/i)) {
+    mInd = 0.9;
+  } else if (fullText.match(/bất động sản|tài chính|đầu tư|crypto|forex|bank/i)) {
+    mInd = 2.0;
+  }
+
+  // 3. Phân tầng Ngân sách Cơ sở (Tier Dynamic Allocation)
+  let bBase = 35.0; // Phân khúc Scale
+  if (T > 30 && D <= 2) {
+    bBase = 1.5;  // Phân khúc duy trì/nuôi page
+  } else if (T > 10 && D <= 3) {
+    bBase = 8.0;  // Phân khúc Standard Budget
+  }
+
+  const fT = 1.0 + 0.12 * Math.log(T);
+
+  // 4. Tính toán Ngân sách Chi tiêu
+  let estimatedSpend = D * T * bBase * mInd * fT;
+  estimatedSpend = Math.max(estimatedSpend, 1.0 * T); // Tối thiểu $1/ngày
+
+  // 5. Tính toán Số lượt tiếp cận
+  const frequency = 1.15;
+  const estimatedReach = Math.round((estimatedSpend / (cpm * frequency)) * 1000);
+
+  let spendLevel = 'LOW';
+  if (estimatedSpend >= 1000) spendLevel = 'VERY HIGH';
+  else if (estimatedSpend >= 300) spendLevel = 'HIGH';
+  else if (estimatedSpend >= 50) spendLevel = 'MEDIUM';
+
+  return {
+    estimated_spend_usd: Number(estimatedSpend.toFixed(1)),
+    estimated_reach: estimatedReach,
+    estimated_spend: spendLevel,
+    cpm_used: cpm
+  };
+}
+
+function summarizeDetailHistory(ad) {
+  const history = Array.isArray(ad.detail_history) ? ad.detail_history : [];
+  const latest = history[history.length - 1] || {};
+  const firstSeen = ad.first_seen || Date.now();
+  const totalDays = Math.max(1, ((Date.now() - firstSeen) / (1000 * 3600 * 24)));
+
+  return {
+    ad_lifecycle_days: Number(totalDays.toFixed(2)),
+    text_change_count: ad.text_change_count || history.filter(item => item.text && item.text !== latest.text).length,
+    headline_change_count: ad.headline_change_count || history.filter(item => item.headline && item.headline !== latest.headline).length,
+    domain_change_count: ad.domain_change_count || (Array.isArray(ad.domain_history) ? ad.domain_history.length - 1 : 0),
+    cta_change_count: ad.cta_change_count || (Array.isArray(ad.cta_history) ? ad.cta_history.length - 1 : 0),
+    creative_change_count: ad.creative_change_count || (Array.isArray(ad.media_change_history) ? ad.media_change_history.length : 0),
+    keyword_count: Array.isArray(ad.keyword_mentions) ? ad.keyword_mentions.length : 0,
+    country_count: Array.isArray(ad.country_mentions) ? ad.country_mentions.length : 0,
+    unique_keywords: Array.isArray(ad.keyword_mentions) ? [...new Set(ad.keyword_mentions)].length : 0,
+    unique_countries: Array.isArray(ad.country_mentions) ? [...new Set(ad.country_mentions)].length : 0,
+    detail_history_length: history.length,
+    longest_creative_streak_days: history.length > 0 ? Math.max(1, history.length) : 1,
+    latest_detail_country: latest.country || ad.last_country || 'ALL'
+  };
 }
 
 // ===== CORE ANALYZE PROCESS =====
-function analyzeAdsBatch(ads) {
+function analyzeAllAdsGlobally(ads) {
   const now = Date.now();
   const pageMap = {};
   const textMap = {};
   const domainMap = {};
 
-  // Xây dựng ngữ cảnh tần suất xuất hiện theo cả cụm dữ liệu nhận về
   for (const ad of ads) {
     const text = ad.normalized_text || normalize(ad.text || '');
     const domain = extractDomain(ad.link);
+    const pageName = ad.page_name || 'unknown';
 
-    pageMap[ad.page_name] = (pageMap[ad.page_name] || 0) + 1;
+    pageMap[pageName] = (pageMap[pageName] || 0) + 1;
     textMap[text] = (textMap[text] || 0) + 1;
     if (domain) domainMap[domain] = (domainMap[domain] || 0) + 1;
   }
 
   return ads.map(ad => {
-    let score = 0;
     const text = ad.normalized_text || normalize(ad.text || '');
     const domain = extractDomain(ad.link);
+    const detailSummary = summarizeDetailHistory(ad);
 
-    // 1. Ước tính mức chi tiêu
-    const spend = estimateSpendLevel(ad);
+    const startDateMs = (ad.start_date ? ad.start_date * 1000 : ad.first_seen) || now;
+    const durationDays = Math.max(1, (now - startDateMs) / (1000 * 3600 * 24));
+    const duplicatesCount = textMap[text] || ad.seen_count || 1;
 
-    const days = (now - (ad.start_date || now) * 1000) / (1000 * 3600 * 24);
-    if (days > 3) score += 2;
-    if (days > 7) score += 4;
-    if (days > 14) score += 6;
+    const spendReachData = estimateSpendAndReach(ad, durationDays, duplicatesCount);
 
+    let score = 0;
     const pageAds = pageMap[ad.page_name] || 0;
+    const clones = textMap[text] || 0;
+    const domainAds = domainMap[domain] || 0;
+
+    if (durationDays > 3) score += 2;
+    if (durationDays > 7) score += 4;
+    if (durationDays > 14) score += 6;
+    if (durationDays > 30) score += 8;
     if (pageAds > 5) score += 2;
     if (pageAds > 10) score += 4;
-
-    const clones = textMap[text] || 0;
     if (clones > 3) score += 3;
     if (clones > 5) score += 5;
-
-    const domainAds = domainMap[domain] || 0;
     if (domainAds > 5) score += 2;
 
     if (ad.platforms?.length > 1) score += 2;
-    if (ad.videos?.length > 0) score += 2;
+    if (ad.videos?.length > 0) score += 3;
     if (ad.cta === 'Shop Now') score += 2;
     if (ad.cta === 'Learn more') score += 1;
 
-    const like = ad.snapshot?.page_like_count || 0;
-    if (like > 10000) score += 2;
-    if (like > 50000) score += 3;
-
-    // 2. Tính toán các chỉ số tăng trưởng
     const delta = calcDelta(ad.growth_history);
     const smooth = calcSmoothDelta(ad.growth_history);
     const burst = calcBurst(ad.growth_history);
@@ -160,48 +228,54 @@ function analyzeAdsBatch(ads) {
     if (delta >= 1) scalingScore += 2;
     if (delta >= 2) scalingScore += 4;
     if (delta >= 3) scalingScore += 6;
-
     if (smooth >= 1) scalingScore += 3;
     if (smooth >= 2) scalingScore += 5;
-
     if (burst >= 2) scalingScore += 4;
     if (burst >= 4) scalingScore += 7;
     if (burst >= 6) scalingScore += 10;
-
     if (fallback > 1) scalingScore += 2;
     if (fallback > 3) scalingScore += 4;
-
     if (ad.seen_count > 3) scalingScore += 2;
     if (ad.seen_count > 6) scalingScore += 4;
 
-    const recentMinutes = (Date.now() - ad.last_seen) / (1000 * 60);
+    const recentMinutes = (Date.now() - (ad.last_seen || now)) / (1000 * 60);
     if (recentMinutes < 60) scalingScore += 3;
     if (recentMinutes < 15) scalingScore += 5;
 
-    // 3. Tính điểm Trending dựa trên sự đột biến
     let trendingScore = 0;
     if (burst > 2) trendingScore += 5;
     if (burst > 4) trendingScore += 10;
     if (delta > 1) trendingScore += 5;
+    if (spendReachData.estimated_spend_usd > 200 && durationDays <= 7) trendingScore += 8;
 
-    // 4. TÍNH ĐIỂM TỔNG HỢP CUỐI CÙNG
-    // Trọng số: Tăng trưởng > Điểm cơ bản > Mức chi tiêu > Trending
-    score = scalingScore * 1.5 + score + spend.score + trendingScore * 0.5;
+    const spendWeight = Math.min(25, (spendReachData.estimated_spend_usd / 100) * 2);
+    const reachWeight = Math.min(15, Math.log10(spendReachData.estimated_reach + 1) * 3);
+
+    score = scalingScore * 1.2 + score + spendWeight + reachWeight + trendingScore * 0.5 + (detailSummary.detail_history_length * 0.5);
+    score = Number(score.toFixed(1));
 
     return {
       ...ad,
       domain,
       score,
-      level: score >= 40 ? '🏆 LEGEND' : score >= 25 ? '🔥 WINNER' : score >= 15 ? '⚡ POTENTIAL' : 'REGULAR',
+      duration_days: Math.round(durationDays),
+      duplicates_count: duplicatesCount,
+      level: score >= 50 ? '🏆 LEGEND' : score >= 30 ? '🔥 WINNER' : score >= 15 ? '⚡ POTENTIAL' : 'REGULAR',
       scaling_score: scalingScore,
       trending_score: trendingScore,
-      estimated_spend: spend.level,
+      estimated_spend_usd: spendReachData.estimated_spend_usd,
+      estimated_reach: spendReachData.estimated_reach,
+      estimated_spend: spendReachData.estimated_spend,
+      cpm_used: spendReachData.cpm_used,
       scaling_level: scalingScore >= 12 ? '🚀 SCALING HARD' : scalingScore >= 6 ? '⚡ SCALING' : 'NORMAL',
       delta,
       smooth_delta: smooth,
       burst,
       fallback_growth: fallback,
-      funnel: detectFunnel(ad)
+      funnel: detectFunnel(ad),
+      ...detailSummary,
+      keyword_frequency: (Array.isArray(ad.keyword_mentions) ? ad.keyword_mentions : []).length,
+      country_frequency: (Array.isArray(ad.country_mentions) ? ad.country_mentions : []).length
     };
   });
 }
@@ -223,7 +297,7 @@ async function updateAdsCollection(col, analyzedAds) {
 
   if (bulk.length) {
     await col.bulkWrite(bulk);
-    console.log(`💾 [DB Ads] Đã Bulk Write ${bulk.length} bản ghi.`);
+    console.log(`💾 [DB Ads] Đã cập nhật (Bulk Write) ${bulk.length} bản ghi.`);
   }
 }
 
@@ -233,7 +307,6 @@ async function updateProductsCollection(db, analyzedAds) {
 
   for (const ad of analyzedAds) {
     if (!ad.domain) continue;
-
     if (!map[ad.domain]) {
       map[ad.domain] = { domain: ad.domain, ads: [], pages: new Set() };
     }
@@ -246,9 +319,9 @@ async function updateProductsCollection(db, analyzedAds) {
     const pages = p.pages.size;
     const totalScore = p.ads.reduce((sum, ad) => sum + (ad.score || 0), 0);
     const winningAdsCount = p.ads.filter(ad => ad.level === '🔥 WINNER' || ad.level === '🏆 LEGEND').length;
+    const totalSpendUsd = p.ads.reduce((sum, ad) => sum + (ad.estimated_spend_usd || 0), 0);
 
-    // Điểm sản phẩm = Tổng điểm ads + (số page * 2) + (số ads winning * 5)
-    const productScore = totalScore + pages * 2 + winningAdsCount * 5;
+    const productScore = Number((totalScore + pages * 2 + winningAdsCount * 5).toFixed(1));
 
     return {
       updateOne: {
@@ -256,6 +329,7 @@ async function updateProductsCollection(db, analyzedAds) {
         update: {
           $set: {
             updated_at: Date.now(),
+            total_spend_usd: Number(totalSpendUsd.toFixed(1))
           },
           $inc: {
             total_ads: totalAds,
@@ -272,124 +346,55 @@ async function updateProductsCollection(db, analyzedAds) {
 
   if (bulk.length) {
     await col.bulkWrite(bulk);
-    console.log(`🔥 [DB Products] Đã cập nhật ${bulk.length} sản phẩm/domain.`);
+    console.log(`🔥 [DB Products] Đã tổng hợp ${bulk.length} sản phẩm/domain.`);
   }
 }
 
-/**
- * Đồng bộ dữ liệu đã phân tích sang Elasticsearch để tìm kiếm.
- * @param {import('@elastic/elasticsearch').Client} esClient 
- * @param {Array<object>} analyzedAds 
- */
+// ===== ELASTICSEARCH SYNC =====
 async function syncToElasticsearch(esClient, analyzedAds) {
-  if (!analyzedAds || analyzedAds.length === 0) {
-    return;
-  }
+  if (!analyzedAds || analyzedAds.length === 0) return;
 
   const operations = analyzedAds.flatMap(ad => {
     const adId = String(ad.ad_archive_id);
-
     const document = {
       ad_archive_id: adId,
-
-      // Nội dung tìm kiếm
       text: ad.text || '',
       headline: ad.headline || '',
       description: ad.description || '',
       page_name: ad.page_name || '',
-
-      // Thông tin cơ bản
       domain: ad.domain || '',
       start_date: ad.start_date,
-
-      // Các field phân tích
       score: ad.score ?? 0,
       level: ad.level || '',
+      estimated_spend_usd: ad.estimated_spend_usd || 0,
+      estimated_reach: ad.estimated_reach || 0,
       estimated_spend: ad.estimated_spend || '',
       funnel: ad.funnel || '',
       scaling_level: ad.scaling_level || ''
     };
 
     return [
-      {
-        index: {
-          _index: ELASTIC_INDEX,
-          _id: adId
-        }
-      },
+      { index: { _index: ELASTIC_INDEX, _id: adId } },
       document
     ];
   });
 
   try {
-    const response = await esClient.bulk({
-      refresh: false,
-      operations
-    });
-
-    // Elasticsearch client 8.x trả response trực tiếp
+    const response = await esClient.bulk({ refresh: false, operations });
     if (response.errors) {
-      const errors = [];
-
-      for (let i = 0; i < response.items.length; i++) {
-        const item = response.items[i];
-        const operation = item.index || item.create || item.update;
-
-        if (operation?.error) {
-          errors.push({
-            index: i,
-            id: operation._id,
-            status: operation.status,
-            error: operation.error
-          });
-        }
-      }
-
-      console.error(
-        `⚠️ [Elasticsearch Sync] Có ${errors.length}/${analyzedAds.length} document lỗi.`
-      );
-
-      console.error(
-        JSON.stringify(errors.slice(0, 10), null, 2)
-      );
-
+      console.error(`⚠️ [Elasticsearch Sync] Có lỗi xảy ra ở một số document khi đồng bộ.`);
       return false;
     }
-
     return true;
-
   } catch (error) {
-    console.error(
-      '❌ [Elasticsearch Sync] Lỗi nghiêm trọng khi đồng bộ dữ liệu:',
-      error?.meta?.body || error?.message || error
-    );
-
+    console.error('❌ [Elasticsearch Sync] Lỗi nghiêm trọng:', error?.message || error);
     return false;
   }
 }
 
-
-/**
- * Đảm bảo index tồn tại trên Elasticsearch với mapping chính xác.
- * Nếu index chưa có, nó sẽ được tạo tự động.
- * @param {import('@elastic/elasticsearch').Client} esClient
- */
 async function ensureIndexExists(esClient) {
-  const exists = await esClient.indices.exists({
-    index: ELASTIC_INDEX
-  });
-
-  if (exists) {
-    console.log(
-      `ℹ️ [Elasticsearch] Index '${ELASTIC_INDEX}' đã tồn tại. Bỏ qua reindex.`
-    );
-
-    return false;
-  }
-
-  console.log(
-    `🆕 [Elasticsearch] Index '${ELASTIC_INDEX}' chưa tồn tại. Đang tạo...`
-  );
+  const exists = await esClient.indices.exists({ index: ELASTIC_INDEX });
+  if (exists) return false;
 
   await esClient.indices.create({
     index: ELASTIC_INDEX,
@@ -399,304 +404,124 @@ async function ensureIndexExists(esClient) {
           vietnamese_analyzer: {
             type: 'custom',
             tokenizer: 'standard',
-            filter: [
-              'lowercase',
-              'asciifolding'
-            ]
+            filter: ['lowercase', 'asciifolding']
           }
         }
       }
     },
     mappings: {
       properties: {
-        ad_archive_id: {
-          type: 'keyword'
-        },
-        text: {
-          type: 'text',
-          analyzer: 'vietnamese_analyzer',
-          copy_to: 'full_text_search'
-        },
-        headline: {
-          type: 'text',
-          analyzer: 'vietnamese_analyzer',
-          copy_to: 'full_text_search'
-        },
-        description: {
-          type: 'text',
-          analyzer: 'vietnamese_analyzer',
-          copy_to: 'full_text_search'
-        },
-        page_name: {
-          type: 'text',
-          analyzer: 'vietnamese_analyzer',
-          copy_to: 'full_text_search'
-        },
-        domain: {
-          type: 'keyword'
-        },
-        score: {
-          type: 'double'
-        },
-        level: {
-          type: 'keyword'
-        },
-        estimated_spend: {
-          type: 'keyword'
-        },
-        funnel: {
-          type: 'keyword'
-        },
-        scaling_level: {
-          type: 'keyword'
-        },
-        start_date: {
-          type: 'date',
-          format: 'epoch_second'
-        },
-        full_text_search: {
-          type: 'text',
-          analyzer: 'vietnamese_analyzer'
-        }
+        ad_archive_id: { type: 'keyword' },
+        text: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search' },
+        headline: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search' },
+        description: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search' },
+        page_name: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search' },
+        domain: { type: 'keyword' },
+        score: { type: 'double' },
+        level: { type: 'keyword' },
+        estimated_spend_usd: { type: 'double' },
+        estimated_reach: { type: 'long' },
+        estimated_spend: { type: 'keyword' },
+        funnel: { type: 'keyword' },
+        scaling_level: { type: 'keyword' },
+        start_date: { type: 'date', format: 'epoch_second' },
+        full_text_search: { type: 'text', analyzer: 'vietnamese_analyzer' }
       }
     }
   });
-
-  console.log(
-    `✅ [Elasticsearch] Đã tạo index '${ELASTIC_INDEX}'.`
-  );
-
   return true;
 }
 
-async function reindexAllAds(adsCol, esClient) {
-  const BATCH_SIZE = 1000;
-
-  const total = await adsCol.countDocuments();
-
-  console.log(
-    `🔄 [Reindex] Bắt đầu index ${total.toLocaleString()} ads...`
-  );
-
-  const cursor = adsCol.find(
-    {},
-    {
-      batchSize: BATCH_SIZE
-    }
-  );
-
-  let batch = [];
-  let processed = 0;
-
-  try {
-    for await (const ad of cursor) {
-      batch.push(ad);
-
-      if (batch.length >= BATCH_SIZE) {
-        await syncToElasticsearch(esClient, batch);
-
-        processed += batch.length;
-
-        console.log(
-          `📊 [Reindex] ${processed.toLocaleString()} / ${total.toLocaleString()}`
-        );
-
-        batch = [];
-      }
-    }
-
-    if (batch.length > 0) {
-      await syncToElasticsearch(esClient, batch);
-
-      processed += batch.length;
-
-      console.log(
-        `📊 [Reindex] ${processed.toLocaleString()} / ${total.toLocaleString()}`
-      );
-    }
-
-    console.log(
-      `✅ [Reindex] Hoàn tất ${processed.toLocaleString()} ads.`
-    );
-  } finally {
-    await cursor.close();
-  }
-}
-
-const logger = require('./logger');
-
-// ===== MAIN CONSUMER PROCESS =====
+// ===== MAIN POLLING PROCESS (THAY THẾ KAFKA) =====
 async function main() {
-  console.log("[System] Bắt đầu khởi chạy tiến trình Analyzer tổng hợp...");
+  console.log("[System] Khởi chạy tiến trình Analyzer (Chế độ Database Polling)...");
 
-  // 1. Khởi tạo thực thể Kafka tổng trước
-  const kafka = new Kafka({ clientId: 'fb-analyzer-service', brokers: KAFKA_BROKERS });
-
-  // 2. Kết nối MongoDB độc lập
   const client = new MongoClient(MONGO_URI);
 
   try {
     await client.connect();
     console.log("💾 [DB] Kết nối thành công tới MongoDB Cluster.");
   } catch (dbErr) {
-    console.error("❌ [DB Error] Không thể kết nối MongoDB. Dừng tiến trình!", dbErr.message);
-    process.exit(1); // Dừng nếu không có DB
+    console.error("❌ [DB Error] Không thể kết nối MongoDB.", dbErr.message);
+    process.exit(1);
   }
 
-  const db = client.db(DB_NAME);
+  // Kết nối 2 DB (Nguồn crawler & Đích analyzer)
+  const crawlerDb = client.db(CRAWLER_DB_NAME);
+  const analyzerDb = client.db(ANALYZER_DB_NAME);
 
-  // Khởi tạo Elasticsearch Client
   const esClient = new Client({ node: ELASTICSEARCH_URL });
+  await ensureIndexExists(esClient);
 
-  // // Đảm bảo index và mapping đã tồn tại trước khi làm bất cứ điều gì khác
-  // await ensureIndexExists(esClient);
-  const isNewIndex = await ensureIndexExists(esClient);
-
-  if (isNewIndex) {
-    const adsCol = db.collection('analyzed_ads');
-
-    await reindexAllAds(adsCol, esClient);
-  }
-
-  // 3. 🔥 KÍCH HOẠT API SERVER NGAY (Bọc try-catch riêng để nếu lỗi Kafka cũ không làm sập cổng 5002)
+  // Kích hoạt API Server (Nếu có dùng, loại bỏ param kafka)
   try {
-    initSearchServer(db, kafka);
+    initSearchServer(analyzerDb);
   } catch (apiErr) {
-    console.error("❌ [API Error] Thất bại khi dựng cổng 5002:", apiErr.message);
+    console.error("⚠️ [API Error] Lỗi khi dựng API Server (Nếu không dùng có thể bỏ qua):", apiErr.message);
   }
 
-  // 4. KHỞI TẠO LOGGER & KAFKA CONSUMER
+  const rawAdsCol = crawlerDb.collection('ads');
+  const analyzedAdsCol = analyzerDb.collection('analyzed_ads');
+  const productsCol = analyzerDb.collection('products');
+
+  // Khởi tạo các Index phân tích
   try {
-    await logger.initLogger('analyzer-service');
-    logger.info('Dịch vụ phân tích điểm số đã Online và đang chờ Batch...');
+    await analyzedAdsCol.createIndexes([
+      { key: { ad_archive_id: 1 }, name: "ad_archive_id_unique", unique: true },
+      { key: { score: -1, analyzed_at: -1 }, name: "score_analyzed_sort" },
+      { key: { estimated_spend_usd: -1 }, name: "spend_usd_sort" },
+      { key: { estimated_reach: -1 }, name: "reach_sort" },
+      { key: { domain: 1 }, name: "domain_filter" },
+      { key: { level: 1 }, name: "level_filter" },
+      { key: { trending_score: -1 }, name: "trending_sort" }
+    ]);
 
-    // Đảm bảo bóc tách chuỗi Broker chính xác tuyệt đối
-    const brokers = process.env.KAFKA_BROKERS
-      ? process.env.KAFKA_BROKERS.split(',')
-      : ['kafka:9092'];
-
-    const kafkaInstance = new Kafka({ clientId: 'fb-analyzer-service', brokers });
-
-    const consumer = kafkaInstance.consumer({
-      groupId: CONSUMER_GROUP,
-      maxWaitTimeInMs: 75 * 1000,
-      maxPollInterval: 120 * 1000,
-      sessionTimeout: 30000,
-      heartbeatInterval: 10000
-    });
-
-    let isConnected = false;
-    let retryCount = 10;
-
-    while (!isConnected && retryCount > 0) {
-      try {
-        console.log(`🔄 [Kafka Consumer] Đang kết nối tới Broker: ${brokers} (Nhóm: ${CONSUMER_GROUP})...`);
-        await consumer.connect();
-
-        // Trước khi subscribe, kiểm tra hoặc đăng ký để ép Broker tạo Topic nếu chưa có
-        const admin = kafkaInstance.admin();
-        await admin.connect();
-        const existingTopics = await admin.listTopics();
-
-        if (!existingTopics.includes(KAFKA_TOPIC)) {
-          console.log(`📣 [Kafka] Topic ${KAFKA_TOPIC} chưa tồn tại, đang tiến hành khởi tạo tự động...`);
-          await admin.createTopics({
-            topics: [{ topic: KAFKA_TOPIC, numPartitions: 1, replicationFactor: 1 }]
-          });
-        }
-        await admin.disconnect();
-
-        // Tiến hành đăng ký lắng nghe
-        await consumer.subscribe({ topic: KAFKA_TOPIC, fromBeginning: false });
-        isConnected = true;
-        logger.info('⚡ [Kafka Consumer] Đã kết nối và đăng ký Topic thành công!');
-      } catch (connErr) {
-        retryCount--;
-        console.warn(`⚠️ [Kafka Consumer Warning] Lỗi kết nối hoặc bầu Leader (${connErr.message}). Thử lại sau 5s...`);
-        await new Promise(resolve => setTimeout(resolve, 5000));
-      }
-    }
-
-    if (!isConnected) {
-      throw new Error("Không thể kết nối tới Kafka Broker sau nhiều lần thử lại.");
-    }
-
-    const adsCol = db.collection('analyzed_ads');
-
-    // TỐI ƯU HÓA: Đảm bảo các index quan trọng cho việc tìm kiếm đã được tạo
-    console.log("🚀 [DB Index] Đang kiểm tra và khởi tạo các chỉ mục tối ưu hóa truy vấn...");
-    try {
-      await adsCol.createIndexes([
-        { key: { ad_archive_id: 1 }, name: "ad_archive_id_unique", unique: true },
-        { key: { score: -1, analyzed_at: -1 }, name: "score_analyzed_sort" },
-        { key: { text: "text" }, name: "text_search" },
-        { key: { domain: 1 }, name: "domain_filter" },
-        { key: { level: 1 }, name: "level_filter" },
-        { key: { estimated_spend: 1 }, name: "spend_filter" },
-        { key: { trending_score: -1 }, name: "trending_sort" },
-        { key: { funnel: 1 }, name: "funnel_filter" },
-        { key: { start_date: -1 }, name: "date_sort" }
-      ]);
-      console.log("✅ [DB Index] Hoàn tất việc đảm bảo các chỉ mục 'analyzed_ads' đã sẵn sàng.");
-    } catch (indexError) {
-      // Bắt lỗi "Index already exists with a different name" và cho qua
-      if (indexError.codeName === 'IndexOptionsConflict' || indexError.code === 85) {
-        console.warn(`⚠️ [DB Index Warning] Bỏ qua lỗi tạo index đã tồn tại với tên khác. Hệ thống sẽ tiếp tục hoạt động với index cũ. Lỗi: ${indexError.message}`);
-      } else {
-        throw indexError; // Ném lại các lỗi nghiêm trọng khác
-      }
-    }
-
-    // TỐI ƯU HÓA: Tạo index cho collection 'products'
-    const productsCol = db.collection('products');
     await productsCol.createIndexes([
       { key: { domain: 1 }, name: "domain_unique", unique: true },
-      { key: { product_score: -1 }, name: "product_score_sort" },
-      { key: { winning_ads: -1 }, name: "winning_ads_sort" }
+      { key: { product_score: -1 }, name: "product_score_sort" }
     ]);
-    console.log("✅ [DB Index] Hoàn tất việc đảm bảo các chỉ mục 'products' đã sẵn sàng.");
-
-    await consumer.run({
-      eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning, isStale }) => {
-        const rawAdsList = [];
-
-        logger.info(`Kafka vừa gom được ${batch.messages.length} ads. Kích hoạt analyze...`);
-
-        for (const message of batch.messages) {
-          if (!isRunning() || isStale()) break;
-
-          try {
-            const event = JSON.parse(message.value.toString());
-            rawAdsList.push(event.data);
-          } catch (e) {
-            logger.error('❌ Thất bại khi phân rã Message dữ liệu:', e.message);
-          }
-        }
-
-        if (rawAdsList.length > 0) {
-          logger.info(`🚀 Bắt đầu chấm điểm tập trung cho ${rawAdsList.length} Ads cùng lúc...`);
-          const processedAds = analyzeAdsBatch(rawAdsList);
-
-          // Lưu đồng bộ trực tiếp xuống DB Analyzer
-          await updateAdsCollection(adsCol, processedAds);
-          await updateProductsCollection(db, processedAds);
-
-          // ĐỒNG BỘ SANG ELASTICSEARCH
-          await syncToElasticsearch(esClient, processedAds);
-        }
-
-        // Xác nhận hoàn tất việc xử lý cả cụm để đẩy Offset của Kafka lên
-        for (const message of batch.messages) {
-          resolveOffset(message.offset);
-        }
-        await heartbeat();
-      }
-    });
-
-  } catch (servicesErr) {
-    console.error("❌ [Critical Error] Luồng khởi tạo Consumer sập hoàn toàn:", servicesErr.message);
+  } catch (indexErr) {
+    console.warn("⚠️ [DB Index] Lỗi tạo index, hệ thống vẫn tiếp tục hoạt động:", indexErr.message);
   }
+
+  console.log("⚡ [Analyzer] Hệ thống đã sẵn sàng. Bắt đầu vòng lặp quét dữ liệu...");
+
+  // Hàm quét định kỳ thay thế Consumer
+  async function runAnalyzeLoop() {
+    while (true) {
+      try {
+        console.log(`\n🔍 [Scanner] Đang kiểm tra dữ liệu từ collection 'ads' trong db '${CRAWLER_DB_NAME}'...`);
+
+        // Lấy toàn bộ ads hoặc có thể tuỳ chỉnh query lọc ads mới nhất dựa theo last_seen/updated_at
+        const rawAds = await rawAdsCol.find({}).toArray();
+
+        if (rawAds.length > 0) {
+          console.log(`📊 [Analyzer] Đã nạp ${rawAds.length} quảng cáo gốc. Bắt đầu tính điểm...`);
+
+          // Chạy thuật toán chấm điểm
+          const processedAds = analyzeAllAdsGlobally(rawAds);
+
+          // Cập nhật DB & Elasticsearch
+          await updateAdsCollection(analyzedAdsCol, processedAds);
+          await updateProductsCollection(analyzerDb, processedAds);
+          await syncToElasticsearch(esClient, processedAds);
+
+          console.log(`✅ [Analyzer] Hoàn thành phân tích vòng này!`);
+        } else {
+          console.log(`💤 [Scanner] Chưa có dữ liệu quảng cáo nào từ Crawler.`);
+        }
+      } catch (err) {
+        console.error("❌ [Loop Error] Có lỗi xảy ra trong quá trình phân tích vòng lặp:", err.message);
+      }
+
+      // Nghỉ chờ POLLING_INTERVAL rồi chạy tiếp
+      console.log(`⏳ Tạm dừng hệ thống ${POLLING_INTERVAL / 1000} giây trước khi quét vòng tiếp theo...`);
+      await new Promise(resolve => setTimeout(resolve, POLLING_INTERVAL));
+    }
+  }
+
+  // Chạy vòng lặp vô tận
+  runAnalyzeLoop();
 }
 
-// Chạy tiến trình duy nhất
 main().catch(console.error);

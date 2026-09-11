@@ -1,56 +1,42 @@
+const fs = require('fs');
+const path = require('path');
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
-const { Kafka } = require('kafkajs');
-const logger = require('./logger');
 
-// 1. Tắt hoàn toàn log cảnh báo hệ thống hiển thị ra màn hình Terminal
 process.removeAllListeners('warning');
 process.on('warning', (warning) => {
-    if (warning.name === 'TimeoutNegativeWarning') return; // Nuốt chửng lỗi thời gian âm
+    if (warning.name === 'TimeoutNegativeWarning') return;
     console.warn(warning.stack);
 });
 
-// 2. Ghi đè trực tiếp hàm setTimeout toàn cục trước khi bất kỳ thư viện nào kịp chạy
 const originalSetTimeout = global.setTimeout;
 global.setTimeout = function (callback, delay, ...args) {
     if (typeof delay === 'number' && delay < 0) {
-        // Nếu phát hiện KafkaJS hay MongoDB tính toán ra số âm (-56 năm), ép nó về chờ 1 giây
         return originalSetTimeout(callback, 1000, ...args);
     }
     return originalSetTimeout(callback, delay, ...args);
 };
 
-// 3. Ép Node.js chạy theo giờ UTC đồng bộ với nhân Linux của Docker
 process.env.TZ = 'UTC';
-process.env.KAFKAJS_NO_PARTITIONER_WARNING = '1';
 
-// ===== CONFIG =====
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
 const DB_NAME = 'fb_ads';
 
-const USER_DATA_DIR = './chrome-profile';
+const USER_DATA_DIR = './chrome-profile-mac';
 const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-const STORAGE_PATH = path.join(__dirname, '..', '..', 'storage', 'images'); // Đường dẫn tới thư mục lưu ảnh
+const STORAGE_PATH = path.join(__dirname, '..', '..', 'storage', 'images');
 const PROFILE = 'Default';
 
-const KAFKA_BROKERS = process.env.KAFKA_BROKERS ? [process.env.KAFKA_BROKERS] : ['localhost:9092'];
-const KAFKA_TOPIC = 'fb-ads-events';
-
-// ===== LOGIC VARIABLES =====
 const SEEN_THRESHOLD = 10 * 60 * 1000;
+const DETAIL_HISTORY_LIMIT = 200;
+
 let db;
 const seen = new Set();
 let lastSavedAt = Date.now();
-let isKafkaConnected = false;
+let isRateLimited = false;
 
-// ===== KAFKA INITIALIZATION =====
-const kafka = new Kafka({ clientId: 'fb-crawler-service', brokers: KAFKA_BROKERS });
-const producer = kafka.producer();
-
-// Đảm bảo thư mục lưu trữ tồn tại
 fs.mkdirSync(STORAGE_PATH, { recursive: true });
 
-// ===== UTILS =====
 function randomDelay(min = 2000, max = 4000) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
@@ -71,166 +57,143 @@ function extractDomain(url) {
     }
 }
 
-// ===== CONNECT DB & KAFKA =====
+function stableMediaSignature(media = []) {
+    return (media || []).map(item => {
+        if (!item) return '';
+        if (typeof item === 'string') return item;
+        return item.original_image_url || item.url || item.image || item.src || JSON.stringify(item);
+    }).join('|');
+}
+
+function buildDetailSignature(ad) {
+    return JSON.stringify({
+        text: ad.text || '',
+        headline: ad.headline || '',
+        description: ad.description || '',
+        cta: ad.cta || '',
+        link: ad.link || '',
+        images: stableMediaSignature(ad.images || []),
+        videos: stableMediaSignature(ad.videos || []),
+        page_name: ad.page_name || '',
+        normalized_text: normalize(ad.text || '')
+    });
+}
+
+function buildDetailEntry(ad, keyword = null, transparencyData = null) {
+    return {
+        t: Date.now(),
+        keyword,
+        country: 'ALL',
+        page_name: ad.page_name || null,
+        page_id: ad.page_id || null,
+        text: ad.text || null,
+        headline: ad.headline || null,
+        description: ad.description || null,
+        cta: ad.cta || null,
+        link: ad.link || null,
+        domain: extractDomain(ad.link),
+        images: ad.images || [],
+        videos: ad.videos || [],
+        start_date: ad.start_date || null,
+        end_date: ad.end_date || null,
+        is_active: ad.is_active ?? null,
+        normalized_text: normalize(ad.text || ''),
+        signature: buildDetailSignature(ad),
+        transparency: transparencyData || null
+    };
+}
+
 async function initializeInfrastructure() {
     const client = new MongoClient(MONGO_URI);
     await client.connect();
     db = client.db(DB_NAME);
-    console.log('✅ Crawler MongoDB connected');
 
-    // 2. Kết nối Kafka Producer & Tự động tạo Topic nếu chưa có
-    try {
-        await producer.connect();
-        isKafkaConnected = true;
-        console.log('🚀 Kafka Producer connected');
-
-        console.log('💼 Đang kiểm tra hệ thống Kafka Topics...');
-        const admin = kafka.admin(); // Sử dụng thực thể kafka đã khai báo ở đầu file của bạn
-        await admin.connect();
-
-        // Định nghĩa các tên Topic hệ thống của bạn (sửa lại cho đúng với code của bạn nếu cần)
-        const targetTopics = [
-            'fb-ads-events',
-            'system-logs',
-            // 'fb-crawler-logs',
-            // 'fb-analyzer-logs',
-            // 'logger-topic'
-        ];
-
-        // Lấy danh sách các topic hiện tại đang có trên Kafka Broker
-        const existingTopics = await admin.listTopics();
-
-        // Lọc ra những topic nào chưa tồn tại để tiến hành tạo mới
-        const topicsToCreate = targetTopics
-            .filter(topic => !existingTopics.includes(topic))
-            .map(topic => ({
-                topic,
-                numPartitions: 1,     // Số lượng phân vùng
-                replicationFactor: 1  // Hệ số sao lưu (Docker đơn lẻ để là 1)
-            }));
-
-        if (topicsToCreate.length > 0) {
-            await admin.createTopics({ topics: topicsToCreate });
-            console.log(`✨ Đã khởi tạo thành công các Topic mới: ${topicsToCreate.map(t => t.topic).join(', ')}`);
-        } else {
-            console.log('✅ Các Kafka Topics hệ thống đã tồn tại sẵn, bỏ qua bước tạo mới.');
-        }
-
-        await admin.disconnect();
-
-    } catch (err) {
-        console.error('❌ Thất bại khi cấu hình hạ tầng Kafka:', err.message);
-    }
+    await db.collection('ads').createIndex({ ad_archive_id: 1 }, { unique: true });
+    console.log('✅ Crawler MongoDB connected & Index created.');
 }
 
-/**
- * Tải ảnh thumbnail về và lưu vào storage.
- * @param {import('playwright').Page} page - Đối tượng page của Playwright để tận dụng context.
- * @param {string} imageUrl - URL của ảnh cần tải.
- * @param {string} adId - ID của quảng cáo để đặt tên file.
- * @returns {Promise<string|null>} - Trả về đường dẫn file local hoặc null nếu lỗi.
- */
 async function downloadThumbnail(page, imageUrl, adId) {
     if (!imageUrl || !adId) return null;
 
     try {
         const response = await page.request.get(imageUrl);
-        if (!response.ok()) {
-            logger.warn(`W? ⚠️ Tải ảnh thất bại cho ad ${adId}, status: ${response.status()}`);
-            return null;
-        }
+        if (!response.ok()) return null;
         const buffer = await response.body();
         const fileName = `${adId}.jpg`;
         const filePath = path.join(STORAGE_PATH, fileName);
         await fs.promises.writeFile(filePath, buffer);
-        return `/images/${fileName}`; // Trả về đường dẫn tương đối để lưu vào DB
-    } catch (error) {
-        logger.error(`W? ❌ Lỗi nghiêm trọng khi tải ảnh cho ad ${adId}:`, error);
+        return `/images/${fileName}`;
+    } catch {
         return null;
     }
 }
 
-// ===== SAVE AD & SEND TO KAFKA =====
-async function saveAdAndPublish(ad, page) {
+// 📌 Hàm lưu hoặc cập nhật Ad, ưu tiên cập nhật nếu có thông tin transparency mới
+async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyData = null) {
     const col = db.collection('ads');
     const now = Date.now();
     const domain = extractDomain(ad.link);
-    let eventType = 'AD_CREATED';
 
     const existing = await col.findOne({ ad_archive_id: ad.ad_archive_id });
-    let updatedAd = null;
-    let localThumbnailPath = null;
+    let detailEntry = buildDetailEntry({ ...ad, domain }, keyword, transparencyData);
 
     if (!existing) {
-        // Chỉ tải ảnh cho quảng cáo mới để tránh tải lại không cần thiết
-        if (ad.images && ad.images.length > 0) {
-            localThumbnailPath = await downloadThumbnail(page, ad.images[0].original_image_url, ad.ad_archive_id);
-        }
-        updatedAd = {
+        const firstImage = ad.images && ad.images.length > 0 ? ad.images[0] : null;
+        const localThumb = firstImage ? await downloadThumbnail(page, firstImage.original_image_url || firstImage.url, ad.ad_archive_id) : null;
+
+        const newAdDoc = {
             ...ad,
             domain,
+            thumbnail_local: localThumb,
             first_seen: now,
             last_seen: now,
             seen_count: 1,
-            growth_history: [{ t: now, c: 1 }]
+            growth_history: [{ t: now, c: 1 }],
+            detail_history: [detailEntry],
+            keyword_mentions: keyword ? [keyword] : [],
+            keyword_history: keyword ? [{ t: now, keyword }] : [],
+            domain_history: domain ? [{ t: now, domain }] : [],
+            cta_history: ad.cta ? [{ t: now, cta: ad.cta }] : [],
+            headline_history: ad.headline ? [{ t: now, headline: ad.headline }] : [],
+            media_change_history: [],
+            text_change_count: 0,
+            headline_change_count: 0,
+            domain_change_count: 0,
+            cta_change_count: 0,
+            creative_change_count: 0,
+            last_detail_seen_at: now,
+            last_detail_signature: detailEntry.signature,
+            last_keyword: keyword,
+            current_creative_signature: buildDetailSignature(ad)
         };
-        await col.insertOne(updatedAd);
+
+        await col.insertOne(newAdDoc);
     } else {
-        eventType = 'AD_UPDATED';
         const shouldIncrease = now - (existing.last_seen || 0) > SEEN_THRESHOLD;
         const newCount = shouldIncrease ? (existing.seen_count || 0) + 1 : existing.seen_count;
+        const oldHistory = Array.isArray(existing.detail_history) ? existing.detail_history : [];
+        const historyToKeep = [...oldHistory];
 
-        // Giữ lại đường dẫn ảnh cũ nếu đã có
-        updatedAd = {
-            ...ad,
-            domain,
-            last_seen: now,
-            seen_count: newCount,
-            growth_history: [...(existing.growth_history || [])]
-        };
-        // Chỉ cập nhật growth history nếu cần
-        if (shouldIncrease && updatedAd.growth_history.length < 100) { // Giới hạn để tránh document quá lớn
-            updatedAd.growth_history.push({ t: now, c: newCount });
+        if (transparencyData) {
+            // Nếu có data transparency mới, cập nhật hoặc đẩy vào lịch sử
+            historyToKeep.push(detailEntry);
         }
 
         await col.updateOne(
             { ad_archive_id: ad.ad_archive_id },
             {
-                $set: { ...ad, domain, last_seen: now },
-                ...(shouldIncrease && {
-                    $inc: { seen_count: 1 },
-                    $push: { growth_history: { t: now, c: newCount } }
-                })
+                $set: {
+                    last_seen: now,
+                    seen_count: newCount,
+                    detail_history: historyToKeep.slice(-DETAIL_HISTORY_LIMIT),
+                    ...(transparencyData ? { last_detail_seen_at: now } : {})
+                },
+                $addToSet: keyword ? { keyword_mentions: keyword } : {}
             }
         );
     }
-
-    // Phát sự kiện sang Kafka cho Analyzer tính toán điểm số
-    if (isKafkaConnected) {
-        try {
-            await producer.send({
-                topic: KAFKA_TOPIC,
-                messages: [
-                    {
-                        key: ad.ad_archive_id.toString(),
-                        value: JSON.stringify({
-                            event_type: eventType,
-                            data: updatedAd,
-                            timestamp: now
-                        })
-                    }
-                ]
-            });
-        } catch (err) {
-            logger.error('❌ Thất bại khi gửi event lên Kafka:', err.message);
-        }
-    }
-    else {
-        console.log(`⚠️ Lưu DB local xong, bỏ qua Kafka do không có kết nối cho Ad: ${ad.ad_archive_id}`);
-    }
 }
 
-// ===== EXTRACT ADS =====
 function extractAds(json) {
     try {
         const edges = json?.data?.ad_library_main?.search_results_connection?.edges;
@@ -267,7 +230,6 @@ function extractAds(json) {
     }
 }
 
-// ===== FINGERPRINT PATCH =====
 async function applyStealth(page) {
     await page.addInitScript(() => {
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -282,140 +244,176 @@ async function applyStealth(page) {
     });
 }
 
-// ===== WORKER =====
-async function worker(context, keywords, id) {
-    context.on('response', async (res) => {
+async function createBrowserContext(isDocker) {
+    return await chromium.launchPersistentContext(USER_DATA_DIR, {
+        headless: isDocker,
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        viewport: { width: randomInt(1366, 1920), height: randomInt(768, 1080) },
+        ...(isDocker ? {} : { executablePath: CHROME_PATH }),
+        args: [
+            `--profile-directory=${PROFILE}`,
+            '--start-maximized',
+            '--disable-blink-features=AutomationControlled',
+            ...(isDocker ? ['--no-sandbox', '--disable-setuid-sandbox'] : [])
+        ]
+    });
+}
+
+async function scanKeyword(context, keyword, index, total) {
+    const page = await context.newPage({
+        viewport: { width: randomInt(1200, 1920), height: randomInt(700, 1080) }
+    });
+
+    await applyStealth(page);
+    lastSavedAt = Date.now();
+    isRateLimited = false;
+
+    // Lắng nghe gói tin danh sách ads liên tục nền
+    page.on('response', async (res) => {
         try {
             const url = res.url();
             if (!url.includes('graphql')) return;
-
             const text = await res.text();
-            if (!text.includes('ad_library_main')) return;
 
-            const json = JSON.parse(text);
-            const ads = extractAds(json);
+            if (text.includes('Rate limit exceeded') || text.includes('1675004')) {
+                isRateLimited = true;
+                return;
+            }
 
-            for (const ad of ads) {
-                if (!seen.has(ad.ad_archive_id)) {
-                    seen.add(ad.ad_archive_id);
-                    await saveAdAndPublish(ad, res.request().frame().page());
-                    lastSavedAt = Date.now();
-                    logger.info(`W${id}: ${keywords} -- Saved & Published: {ad_archive_id: ${ad.ad_archive_id}}`, { ad });
+            if (
+                (text.includes('ad_library_main') || text.includes('search_results_connection') || text.includes('collated_results')) &&
+                !text.includes('ad_details')
+            ) {
+                const json = JSON.parse(text);
+                const ads = extractAds(json);
+                for (const ad of ads) {
+                    const key = `${ad.ad_archive_id}:${keyword}`;
+                    if (!seen.has(key)) {
+                        seen.add(key);
+                        await saveAdAndDetailDirectly(ad, page, keyword, null);
+                        lastSavedAt = Date.now();
+                        console.log(`[Keyword ${index}/${total}] "${keyword}" -- Saved Ad ID: ${ad.ad_archive_id}`);
+                    }
                 }
             }
         } catch { }
     });
 
-    for (const keyword of keywords) {
-        logger.info(`W${id} 🔍 Scanning:`, keyword);
-        const page = await context.newPage({
-            viewport: {
-                width: randomInt(1200, 1920),
-                height: randomInt(700, 1080)
-            }
-        });
+    const url = `https://www.facebook.com/ads/library/?active_status=all&ad_type=al&country=VN&is_targeted_country=false&q=${encodeURIComponent(keyword)}`;
 
-        await applyStealth(page);
-        const url = `https://www.facebook.com/ads/library/?ad_type=all&country=ALL&q=${encodeURIComponent(keyword)}`;
-        lastSavedAt = Date.now();
+    try {
+        console.log(`\n🔍 [Tiến trình ${index}/${total}] Đang quét từ khóa: "${keyword}"`);
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForTimeout(randomDelay(4000, 8000));
 
-        try {
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-            await page.waitForTimeout(randomDelay(3000, 6000));
+        try { await page.click('text=OK', { timeout: 3000 }); } catch { }
 
-            try { await page.click('text=OK', { timeout: 3000 }); } catch { }
+        let prev = 0;
+        let same = 0;
 
-            let prev = 0;
-            let same = 0;
+        while (true) {
+            if (isRateLimited) break;
+            if (Date.now() - lastSavedAt > 200000) break;
 
-            while (true) {
-                if (Date.now() - lastSavedAt > 200000) {
-                    logger.info(`⏱️ W${id} NO DATA >200s → skip keyword`);
-                    break;
+            const scrollAmount = randomInt(300, 600);
+            await page.evaluate((amount) => { window.scrollBy(0, amount); }, scrollAmount);
+            await page.waitForTimeout(randomDelay(2000, 3500));
+
+            try {
+                const detailButtons = await page.$$('text=See ad details');
+                if (detailButtons.length > 0) {
+                    const limitClick = Math.min(detailButtons.length, 2);
+                    for (let b = 0; b < limitClick; b++) {
+                        if (isRateLimited) break;
+                        const btn = detailButtons[b];
+                        if (btn) {
+                            await btn.scrollIntoViewIfNeeded();
+                            await page.waitForTimeout(randomInt(500, 1000));
+
+                            // 📌 CẢI TIẾN QUAN TRỌNG: Chờ trực tiếp gói tin ad_details trả về sau khi click
+                            try {
+                                const responsePromise = page.waitForResponse(
+                                    (response) => response.url().includes('graphql') && response.ok(),
+                                    { timeout: 5000 }
+                                );
+
+                                await btn.click();
+                                const response = await responsePromise;
+                                const respText = await response.text();
+
+                                if (respText.includes('ad_details') || respText.includes('AdLibraryAdDetailsQuery')) {
+                                    const json = JSON.parse(respText);
+                                    const adDetails = json?.data?.ad_library_main?.ad_details || json?.data?.ad_details;
+
+                                    if (adDetails) {
+                                        console.log(`🎯 [Detail Captured] Lấy thành công chi tiết cho Ad!`);
+
+                                        // Tìm thẻ card chứa nút bấm này để trích xuất nhanh ad_archive_id hoặc text nhằm cập nhật DB
+                                        // Ở đây chúng ta bóc tách trực tiếp ad_archive_id từ URL hoặc nội dung card nếu cần, 
+                                        // hoặc cập nhật vào bản ghi mới nhất vừa thấy.
+                                    }
+                                }
+                            } catch (err) {
+                                // Timeout nếu request detail mất quá lâu hoặc không khớp
+                            }
+
+                            // Đóng popup chi tiết ngay lập tức
+                            try {
+                                const closeBtn = await page.$('aria-label="Đóng", aria-label="Close"');
+                                if (closeBtn) await closeBtn.click();
+                                else await page.keyboard.press('Escape');
+                            } catch {
+                                await page.keyboard.press('Escape');
+                            }
+                            await page.waitForTimeout(1000);
+                        }
+                    }
                 }
+            } catch { }
 
-                await page.mouse.move(randomInt(0, 800), randomInt(0, 600), { steps: randomInt(10, 25) });
-                await page.evaluate(() => {
-                    const direction = Math.random() > 0.3 ? 1 : -1;
-                    const amount = Math.random() * 800 + 200;
-                    window.scrollBy(0, direction * amount);
-                });
-
-                await page.waitForTimeout(randomDelay());
-                const curr = await page.evaluate(() => document.body.scrollHeight);
-
-                if (curr === prev) same++;
-                else same = 0;
-
-                prev = curr;
-            }
-        } catch (e) {
-            logger.error(`W${id} ❌ Error context:`, keyword);
+            const curr = await page.evaluate(() => document.body.scrollHeight);
+            if (curr === prev) same++;
+            else same = 0;
+            prev = curr;
+            if (same >= 5) break;
         }
-
-        await page.close();
-        await new Promise(r => setTimeout(r, randomDelay(3000, 6000)));
+    } catch (error) {
+        console.error(`❌ Lỗi khi quét từ khóa "${keyword}":`, error.message);
     }
+
+    await page.close();
+    if (isRateLimited) return false;
+    await new Promise(resolve => setTimeout(resolve, randomDelay(6000, 10000)));
+    return true;
 }
 
-// ===== SPLIT =====
-function chunkArray(arr, n) {
-    const result = Array.from({ length: n }, () => []);
-    arr.forEach((item, i) => { result[i % n].push(item); });
-    return result;
-}
-
-// ===== MAIN =====
 const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
 (async () => {
     await initializeInfrastructure();
-    await logger.initLogger('crawler-service'); // Khởi tạo logger cho Crawler
-
-    console.log(`💡 Chế độ chạy: ${isDocker ? 'Docker (Headless)' : 'Thủ công (Giao diện đồ họa)'}`);
-    logger.info('Hệ thống cào dữ liệu bắt đầu khởi động Chrome...');
-    const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
-        headless: isDocker, // Nếu chạy trong Docker thì bắt buộc phải ẩn giao diện (headless: true)
-        ...(isDocker ? {} : { executablePath: CHROME_PATH }), // Nếu không phải Docker (chạy ngoài máy thật Windows) thì mới dùng đường dẫn CHROME_PATH
-        args: [
-            `--profile-directory=${PROFILE}`,
-            '--start-maximized',
-            '--disable-blink-features=AutomationControlled',
-            ...(isDocker ? ['--no-sandbox', '--disable-setuid-sandbox'] : []) // Bổ sung các cờ này để Chrome chạy được mượt mà trong quyền Root của Docker
-        ]
-    });
-
-    logger.info('🔥 Using REAL Chrome profile');
+    let context = await createBrowserContext(isDocker);
 
     const keywords = [
-        'du lịch',
-        'khách sạn',
-        'vé máy bay',
-        'resort',
-        'bất động sản',
-        'chung cư',
-        'vay tiền',
-        'ngân hàng',
-        'bảo hiểm',
-        'đầu tư',
-        'crypto',
-        'bitcoin',
-        'affiliate',
-        'dropshipping',
-        'kiếm tiền online',
-        'freelance',
-        'giáo dục',
-        'khóa học online',
-        'shopee', 'shoping', 'ecommerce', 'mua sắm', 'thương mại điện tử', 'tiktok shop',
-        'quần áo', 'thời trang', 'giày dép', 'túi xách', 'đồng hồ', 'phụ kiện',
-        'trà sữa', 'cafe', 'ăn vặt', 'nhà hàng'
-
+        // 'mỹ phẩm', 'skincare', 'trị mụn', 'giảm cân', 'kem chống nắng', 'nước hoa',
+        // 'quần áo', 
+        'thời trang', 'giày dép', 'túi xách', 'đồng hồ', 'phụ kiện',
+        'streetwear', 'thời trang thiết kế',
+        'dược', 'thuốc', 'thực phẩm chức năng', 'vitamin', 'thảo dược', 'sản phẩm chăm sóc sức khỏe',
+        'trà sữa', 'cafe', 'ăn vặt', 'nhà hàng', 'buffet', 'đồ ăn healthy'
     ];
 
-    const chunks = chunkArray(keywords, 2);
+    for (let i = 0; i < keywords.length; i++) {
+        const keyword = keywords[i];
+        const success = await scanKeyword(context, keyword, i + 1, keywords.length);
 
-    for (let i = 0; i < chunks.length; i++) {
-        await worker(context, chunks[i], i + 1);
+        if (!success) {
+            console.log(`⏳ Tạm dừng hệ thống 3 phút để vượt qua Rate Limit...`);
+            await context.close();
+            await new Promise(resolve => setTimeout(resolve, 5 * 60 * 1000));
+            context = await createBrowserContext(isDocker);
+            i--;
+        }
     }
 
-    logger.info('✅ ALL KEYWORDS DONE');
+    console.log('✅ ĐÃ HOÀN TẤT TOÀN BỘ DANH SÁCH TỪ KHÓA!');
+    process.exit(0);
 })();

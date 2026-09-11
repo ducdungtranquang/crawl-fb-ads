@@ -1,3 +1,6 @@
 /node_modules
 /chrome-profile
 .env
+/storage
+/fb-ads-system/crawler/chrome-profile
+/fb-ads-system/crawler/chrome-profile-mac
