@@ -20,7 +20,7 @@ global.setTimeout = function (callback, delay, ...args) {
 process.env.TZ = 'UTC';
 
 // Đã cập nhật IP của máy Core
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.100.13:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.100.12:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
 const DB_NAME = 'fb_ads';
 
 const USER_DATA_DIR = './chrome-profile-mac';
