@@ -383,19 +383,20 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
     await initializeInfrastructure();
     let context = await createBrowserContext(isDocker);
 
-    // Tập từ khóa Tiếng Việt (Hot trend xếp đầu)
+    // Tập từ khóa Tiếng Anh (Hot trend xếp đầu)
     const keywords = [
-        'thời trang', 'mỹ phẩm', 'thực phẩm chức năng', 'giảm cân', 'kem chống nắng',
-        'trị mụn', 'nước hoa', 'trà sữa', 'cafe', 'bất động sản',
-        'quần áo', 'giày dép', 'túi xách', 'đồng hồ', 'phụ kiện',
-        'mua ngay', 'xem ngay', 'khuyến mãi', 'giảm giá', 'ưu đãi',
-        'thương mại điện tử', 'điện thoại', 'laptop', 'máy tính bảng', 'thiết bị gia dụng',
-        'xe máy', 'ô tô', 'du lịch', 'khách sạn', 'resort',
-        'spa', 'làm đẹp', 'nội thất', 'trang trí nhà cửa', 'đồ gia dụng',
-        'sức khỏe', 'thể thao', 'gym', 'yoga', 'chăm sóc da',
-        'streetwear', 'thời trang thiết kế', 'dược', 'thuốc', 'vitamin',
-        'thảo dược', 'sản phẩm chăm sóc sức khỏe', 'ăn vặt', 'nhà hàng',
-        'buffet', 'đồ ăn healthy'
+        'fashion', 'skincare', 'supplements', 'weight loss', 'sunscreen', 
+        'shopify', 'dropshipping', 'makeup', 'hair care', 'fitness',
+        'shopee', 'lazada', 'tiktok shop', 'lazada',
+        'tiktok', 'instagram', 'facebook', 'youtube', 'twitter',
+        'gaming', 'mobile games', 'online courses', 'digital marketing', 
+        'e-commerce', 'home decor', 'furniture', 'electronics', 
+        'gadgets', 'smartphones', 'laptops', 'tablets',
+        'acne treatment', 'perfume', 'coffee', 'real estate', 
+        'clothing', 'shoes', 'bags', 'watches', 'accessories', 
+        'streetwear', 'designer clothing', 'pharmacy', 'medicine', 'vitamins', 
+        'herbal', 'health care products', 'snacks', 'restaurant', 
+        'buffet', 'healthy food'
     ];
 
     for (let i = 0; i < keywords.length; i++) {
