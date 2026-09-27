@@ -19,7 +19,8 @@ global.setTimeout = function (callback, delay, ...args) {
 
 process.env.TZ = 'UTC';
 
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
+// Đã cập nhật IP của máy Core
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.100.13:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
 const DB_NAME = 'fb_ads';
 
 const USER_DATA_DIR = './chrome-profile-mac';
@@ -128,7 +129,6 @@ async function downloadThumbnail(page, imageUrl, adId) {
     }
 }
 
-// 📌 Hàm lưu hoặc cập nhật Ad, ưu tiên cập nhật nếu có thông tin transparency mới
 async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyData = null) {
     const col = db.collection('ads');
     const now = Date.now();
@@ -175,7 +175,6 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
         const historyToKeep = [...oldHistory];
 
         if (transparencyData) {
-            // Nếu có data transparency mới, cập nhật hoặc đẩy vào lịch sử
             historyToKeep.push(detailEntry);
         }
 
@@ -268,7 +267,6 @@ async function scanKeyword(context, keyword, index, total) {
     lastSavedAt = Date.now();
     isRateLimited = false;
 
-    // Lắng nghe gói tin danh sách ads liên tục nền
     page.on('response', async (res) => {
         try {
             const url = res.url();
@@ -330,7 +328,6 @@ async function scanKeyword(context, keyword, index, total) {
                             await btn.scrollIntoViewIfNeeded();
                             await page.waitForTimeout(randomInt(500, 1000));
 
-                            // 📌 CẢI TIẾN QUAN TRỌNG: Chờ trực tiếp gói tin ad_details trả về sau khi click
                             try {
                                 const responsePromise = page.waitForResponse(
                                     (response) => response.url().includes('graphql') && response.ok(),
@@ -347,17 +344,11 @@ async function scanKeyword(context, keyword, index, total) {
 
                                     if (adDetails) {
                                         console.log(`🎯 [Detail Captured] Lấy thành công chi tiết cho Ad!`);
-
-                                        // Tìm thẻ card chứa nút bấm này để trích xuất nhanh ad_archive_id hoặc text nhằm cập nhật DB
-                                        // Ở đây chúng ta bóc tách trực tiếp ad_archive_id từ URL hoặc nội dung card nếu cần, 
-                                        // hoặc cập nhật vào bản ghi mới nhất vừa thấy.
                                     }
                                 }
                             } catch (err) {
-                                // Timeout nếu request detail mất quá lâu hoặc không khớp
                             }
 
-                            // Đóng popup chi tiết ngay lập tức
                             try {
                                 const closeBtn = await page.$('aria-label="Đóng", aria-label="Close"');
                                 if (closeBtn) await closeBtn.click();
@@ -392,13 +383,19 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
     await initializeInfrastructure();
     let context = await createBrowserContext(isDocker);
 
+    // Tập từ khóa Tiếng Việt (Hot trend xếp đầu)
     const keywords = [
-        // 'mỹ phẩm', 'skincare', 'trị mụn', 'giảm cân', 'kem chống nắng', 'nước hoa',
-        // 'quần áo', 
-        'thời trang', 'giày dép', 'túi xách', 'đồng hồ', 'phụ kiện',
-        'streetwear', 'thời trang thiết kế',
-        'dược', 'thuốc', 'thực phẩm chức năng', 'vitamin', 'thảo dược', 'sản phẩm chăm sóc sức khỏe',
-        'trà sữa', 'cafe', 'ăn vặt', 'nhà hàng', 'buffet', 'đồ ăn healthy'
+        'thời trang', 'mỹ phẩm', 'thực phẩm chức năng', 'giảm cân', 'kem chống nắng',
+        'trị mụn', 'nước hoa', 'trà sữa', 'cafe', 'bất động sản',
+        'quần áo', 'giày dép', 'túi xách', 'đồng hồ', 'phụ kiện',
+        'mua ngay', 'xem ngay', 'khuyến mãi', 'giảm giá', 'ưu đãi',
+        'thương mại điện tử', 'điện thoại', 'laptop', 'máy tính bảng', 'thiết bị gia dụng',
+        'xe máy', 'ô tô', 'du lịch', 'khách sạn', 'resort',
+        'spa', 'làm đẹp', 'nội thất', 'trang trí nhà cửa', 'đồ gia dụng',
+        'sức khỏe', 'thể thao', 'gym', 'yoga', 'chăm sóc da',
+        'streetwear', 'thời trang thiết kế', 'dược', 'thuốc', 'vitamin',
+        'thảo dược', 'sản phẩm chăm sóc sức khỏe', 'ăn vặt', 'nhà hàng',
+        'buffet', 'đồ ăn healthy'
     ];
 
     for (let i = 0; i < keywords.length; i++) {
