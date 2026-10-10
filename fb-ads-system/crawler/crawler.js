@@ -1,7 +1,11 @@
 const fs = require('fs');
 const path = require('path');
-const { chromium } = require('playwright');
+const { chromium } = require('playwright-extra');
+const stealth = require('puppeteer-extra-plugin-stealth')();
 const { MongoClient } = require('mongodb');
+
+// Kích hoạt plugin stealth để ẩn danh bot
+chromium.use(stealth);
 
 process.removeAllListeners('warning');
 process.on('warning', (warning) => {
@@ -19,24 +23,36 @@ global.setTimeout = function (callback, delay, ...args) {
 
 process.env.TZ = 'UTC';
 
-// Đã cập nhật IP của máy Core
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.100.12:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.0.125:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
 const DB_NAME = 'fb_ads';
 
 const USER_DATA_DIR = './chrome-profile-mac';
-const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const STORAGE_PATH = path.join(__dirname, '..', '..', 'storage', 'images');
-const PROFILE = 'Default';
 
 const SEEN_THRESHOLD = 10 * 60 * 1000;
 const DETAIL_HISTORY_LIMIT = 200;
+const MAX_ADS_PER_KEYWORD = parseInt(process.env.MAX_ADS_PER_KEYWORD || '300', 10);
+const MAX_SCROLLS_PER_KEYWORD = parseInt(process.env.MAX_SCROLLS_PER_KEYWORD || '60', 10);
+const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10);
+const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10);
+const MAX_RETRIES_PER_KEYWORD = 2;
 
 let db;
 const seen = new Set();
 let lastSavedAt = Date.now();
 let isRateLimited = false;
 
+// Tạo thư mục lưu ảnh cục bộ
 fs.mkdirSync(STORAGE_PATH, { recursive: true });
+
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0'
+];
 
 function randomDelay(min = 2000, max = 4000) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -44,6 +60,10 @@ function randomDelay(min = 2000, max = 4000) {
 
 function randomInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function getRandomUserAgent() {
+    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
 function normalize(text) {
@@ -113,17 +133,17 @@ async function initializeInfrastructure() {
     console.log('✅ Crawler MongoDB connected & Index created.');
 }
 
+// Hàm tải ảnh về lưu ở máy tính cục bộ
 async function downloadThumbnail(page, imageUrl, adId) {
     if (!imageUrl || !adId) return null;
-
     try {
-        const response = await page.request.get(imageUrl);
+        const response = await page.request.get(imageUrl, { timeout: 5000 });
         if (!response.ok()) return null;
         const buffer = await response.body();
         const fileName = `${adId}.jpg`;
         const filePath = path.join(STORAGE_PATH, fileName);
         await fs.promises.writeFile(filePath, buffer);
-        return `/images/${fileName}`;
+        return `/images/${fileName}`; // Path để lưu vào database
     } catch {
         return null;
     }
@@ -138,6 +158,7 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
     let detailEntry = buildDetailEntry({ ...ad, domain }, keyword, transparencyData);
 
     if (!existing) {
+        // Lấy ảnh đầu tiên lưu làm thumbnail
         const firstImage = ad.images && ad.images.length > 0 ? ad.images[0] : null;
         const localThumb = firstImage ? await downloadThumbnail(page, firstImage.original_image_url || firstImage.url, ad.ad_archive_id) : null;
 
@@ -167,7 +188,13 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
             current_creative_signature: buildDetailSignature(ad)
         };
 
-        await col.insertOne(newAdDoc);
+        try {
+            await col.insertOne(newAdDoc);
+        } catch (err) {
+            if (err.code !== 11000) {
+                console.error(`Lỗi khi insert ad ${ad.ad_archive_id}:`, err.message);
+            }
+        }
     } else {
         const shouldIncrease = now - (existing.last_seen || 0) > SEEN_THRESHOLD;
         const newCount = shouldIncrease ? (existing.seen_count || 0) + 1 : existing.seen_count;
@@ -229,33 +256,38 @@ function extractAds(json) {
     }
 }
 
-async function applyStealth(page) {
-    await page.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        window.chrome = { runtime: {} };
-        const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function (param) {
-            if (param === 37445) return 'Intel Inc.';
-            if (param === 37446) return 'Intel Iris OpenGL Engine';
-            return getParameter.call(this, param);
-        };
-    });
-}
-
 async function createBrowserContext(isDocker) {
     return await chromium.launchPersistentContext(USER_DATA_DIR, {
-        headless: isDocker,
-        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        headless: true,
+        userAgent: getRandomUserAgent(),
         viewport: { width: randomInt(1366, 1920), height: randomInt(768, 1080) },
-        ...(isDocker ? {} : { executablePath: CHROME_PATH }),
         args: [
-            `--profile-directory=${PROFILE}`,
             '--start-maximized',
             '--disable-blink-features=AutomationControlled',
+            '--disable-web-security',
+            '--disable-features=IsolateOrigins,site-per-process',
             ...(isDocker ? ['--no-sandbox', '--disable-setuid-sandbox'] : [])
         ]
     });
+}
+
+async function dismissOverlays(page) {
+    try {
+        const selectors = [
+            'button:has-text("OK")',
+            'button:has-text("Allow all cookies")',
+            'button:has-text("Accept All")',
+            'button:has-text("Close")',
+            '[aria-label="Close"]',
+            '[aria-label="close"]'
+        ];
+        for (const selector of selectors) {
+            const btn = await page.$(selector);
+            if (btn && await btn.isVisible()) {
+                await btn.click({ timeout: 1500 }).catch(() => { });
+            }
+        }
+    } catch { }
 }
 
 async function scanKeyword(context, keyword, index, total) {
@@ -263,17 +295,24 @@ async function scanKeyword(context, keyword, index, total) {
         viewport: { width: randomInt(1200, 1920), height: randomInt(700, 1080) }
     });
 
-    await applyStealth(page);
     lastSavedAt = Date.now();
     isRateLimited = false;
+    let keywordAdsCount = 0;
+    let pendingSaves = 0;
 
     page.on('response', async (res) => {
         try {
             const url = res.url();
             if (!url.includes('graphql')) return;
+
+            if (res.status() === 429) {
+                isRateLimited = true;
+                return;
+            }
+
             const text = await res.text();
 
-            if (text.includes('Rate limit exceeded') || text.includes('1675004')) {
+            if (text.includes('Rate limit exceeded') || text.includes('1675004') || text.includes('temporarily blocked')) {
                 isRateLimited = true;
                 return;
             }
@@ -288,93 +327,89 @@ async function scanKeyword(context, keyword, index, total) {
                     const key = `${ad.ad_archive_id}:${keyword}`;
                     if (!seen.has(key)) {
                         seen.add(key);
-                        await saveAdAndDetailDirectly(ad, page, keyword, null);
-                        lastSavedAt = Date.now();
-                        console.log(`[Keyword ${index}/${total}] "${keyword}" -- Saved Ad ID: ${ad.ad_archive_id}`);
+                        pendingSaves++;
+                        try {
+                            await saveAdAndDetailDirectly(ad, page, keyword, null);
+                            keywordAdsCount++;
+                            lastSavedAt = Date.now();
+                            console.log(`[Keyword ${index}/${total}] "${keyword}" (#${keywordAdsCount}) -- Saved Ad ID: ${ad.ad_archive_id}`);
+                        } finally {
+                            pendingSaves--;
+                        }
                     }
                 }
             }
         } catch { }
     });
 
-    const url = `https://www.facebook.com/ads/library/?active_status=all&ad_type=al&country=VN&is_targeted_country=false&q=${encodeURIComponent(keyword)}`;
+    const url = `https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=US&media_type=all&search_type=keyword_unordered&q=${encodeURIComponent(keyword)}`;
 
     try {
         console.log(`\n🔍 [Tiến trình ${index}/${total}] Đang quét từ khóa: "${keyword}"`);
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(randomDelay(4000, 8000));
+        await page.waitForTimeout(randomDelay(4000, 7000));
 
-        try { await page.click('text=OK', { timeout: 3000 }); } catch { }
+        await dismissOverlays(page);
 
         let prev = 0;
         let same = 0;
+        let scrollCount = 0;
+        const startTime = Date.now();
 
         while (true) {
-            if (isRateLimited) break;
-            if (Date.now() - lastSavedAt > 200000) break;
+            if (isRateLimited) {
+                console.log(`⚠️ Phát hiện Rate Limit khi đang quét từ khóa "${keyword}".`);
+                break;
+            }
+            if (keywordAdsCount >= MAX_ADS_PER_KEYWORD) {
+                console.log(`🎯 [${keyword}] Đã đạt giới hạn ${keywordAdsCount}/${MAX_ADS_PER_KEYWORD} ads.`);
+                break;
+            }
+            if (scrollCount >= MAX_SCROLLS_PER_KEYWORD) {
+                console.log(`⏹️ [${keyword}] Đã đạt tối đa ${scrollCount} lượt cuộn.`);
+                break;
+            }
+            if (Date.now() - startTime > KEYWORD_TIMEOUT) {
+                console.log(`⏱️ [${keyword}] Hết thời gian tối đa cho phép (${KEYWORD_TIMEOUT / 1000}s).`);
+                break;
+            }
+            if (Date.now() - lastSavedAt > IDLE_TIMEOUT) {
+                console.log(`⌛ [${keyword}] Không nhận được thêm quảng cáo mới trong ${IDLE_TIMEOUT / 1000}s.`);
+                break;
+            }
 
-            const scrollAmount = randomInt(300, 600);
+            scrollCount++;
+            const scrollAmount = randomInt(500, 900);
             await page.evaluate((amount) => { window.scrollBy(0, amount); }, scrollAmount);
-            await page.waitForTimeout(randomDelay(2000, 3500));
+            await page.waitForTimeout(randomDelay(1500, 3000));
 
-            try {
-                const detailButtons = await page.$$('text=See ad details');
-                if (detailButtons.length > 0) {
-                    const limitClick = Math.min(detailButtons.length, 2);
-                    for (let b = 0; b < limitClick; b++) {
-                        if (isRateLimited) break;
-                        const btn = detailButtons[b];
-                        if (btn) {
-                            await btn.scrollIntoViewIfNeeded();
-                            await page.waitForTimeout(randomInt(500, 1000));
-
-                            try {
-                                const responsePromise = page.waitForResponse(
-                                    (response) => response.url().includes('graphql') && response.ok(),
-                                    { timeout: 5000 }
-                                );
-
-                                await btn.click();
-                                const response = await responsePromise;
-                                const respText = await response.text();
-
-                                if (respText.includes('ad_details') || respText.includes('AdLibraryAdDetailsQuery')) {
-                                    const json = JSON.parse(respText);
-                                    const adDetails = json?.data?.ad_library_main?.ad_details || json?.data?.ad_details;
-
-                                    if (adDetails) {
-                                        console.log(`🎯 [Detail Captured] Lấy thành công chi tiết cho Ad!`);
-                                    }
-                                }
-                            } catch (err) {
-                            }
-
-                            try {
-                                const closeBtn = await page.$('aria-label="Đóng", aria-label="Close"');
-                                if (closeBtn) await closeBtn.click();
-                                else await page.keyboard.press('Escape');
-                            } catch {
-                                await page.keyboard.press('Escape');
-                            }
-                            await page.waitForTimeout(1000);
-                        }
-                    }
-                }
-            } catch { }
+            await dismissOverlays(page);
 
             const curr = await page.evaluate(() => document.body.scrollHeight);
-            if (curr === prev) same++;
-            else same = 0;
+            if (curr === prev) {
+                same++;
+            } else {
+                same = 0;
+            }
             prev = curr;
-            if (same >= 5) break;
+            if (same >= 5) {
+                console.log(`🏁 [${keyword}] Đã cuộn đến cuối kết quả tìm kiếm.`);
+                break;
+            }
         }
     } catch (error) {
         console.error(`❌ Lỗi khi quét từ khóa "${keyword}":`, error.message);
     }
 
-    await page.close();
+    const waitPendingStart = Date.now();
+    while (pendingSaves > 0 && Date.now() - waitPendingStart < 5000) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+    }
+
+    try { await page.close(); } catch { }
+
     if (isRateLimited) return false;
-    await new Promise(resolve => setTimeout(resolve, randomDelay(6000, 10000)));
+    await new Promise(resolve => setTimeout(resolve, randomDelay(5000, 8000)));
     return true;
 }
 
@@ -383,32 +418,51 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
     await initializeInfrastructure();
     let context = await createBrowserContext(isDocker);
 
-    // Tập từ khóa Tiếng Anh (Hot trend xếp đầu)
     const keywords = [
-        'fashion', 'skincare', 'supplements', 'weight loss', 'sunscreen', 
-        'shopify', 'dropshipping', 'makeup', 'hair care', 'fitness',
-        'shopee', 'lazada', 'tiktok shop', 'lazada',
-        'tiktok', 'instagram', 'facebook', 'youtube', 'twitter',
-        'gaming', 'mobile games', 'online courses', 'digital marketing', 
-        'e-commerce', 'home decor', 'furniture', 'electronics', 
-        'gadgets', 'smartphones', 'laptops', 'tablets',
-        'acne treatment', 'perfume', 'coffee', 'real estate', 
-        'clothing', 'shoes', 'bags', 'watches', 'accessories', 
-        'streetwear', 'designer clothing', 'pharmacy', 'medicine', 'vitamins', 
-        'herbal', 'health care products', 'snacks', 'restaurant', 
-        'buffet', 'healthy food'
+        "dietary supplements", "weight loss", "sunscreen", "acne treatment", "perfume", 
+        "milk tea", "coffee", "real estate", "clothing", "shoes", 
+        "handbags", "watches", "accessories", "buy now", "watch now", 
+        "promotion", "discount", "special offer", "e-commerce", "smartphones", 
+        "laptops", "tablets", "home appliances", "motorcycles", "cars", 
+        "travel", "hotel", "resort", "spa", "beauty salon", 
+        "furniture", "home decor", "household items", "health", "sports", 
+        "gym", "yoga", "skincare", "streetwear", "designer fashion", 
+        "pharmacy", "medicine", "vitamins", "herbal tea", "healthcare products", 
+        "snacks", "restaurant", "buffet", "healthy food", "digital marketing", 
+        "software", "saas", "cryptocurrency", "finance", "insurance", 
+        "personal loans", "credit cards", "investing", "online courses", "masterclass", 
+        "webinar", "b2b services", "plumbing services", "roofing", "dental clinic", 
+        "lawyer", "attorney", "gifts", "pet supplies", "dog food", 
+        "cat litter", "toys", "baby clothes", "maternity wear", "landscaping", 
+        "solar panels", "hvac services", "pest control", "cleaning services", "massage therapy", 
+        "chiropractor", "auto repair", "car wash", "delivery service", "food delivery", 
+        "meal prep", "fitness equipment", "protein powder", "vegan diet", "keto diet", 
+        "gluten-free", "organic food", "sustainable", "eco-friendly", "handmade", 
+        "jewelry", "sunglasses", "cosmetics", "makeup", "hair care"
     ];
+
+    let keywordRetries = 0;
 
     for (let i = 0; i < keywords.length; i++) {
         const keyword = keywords[i];
         const success = await scanKeyword(context, keyword, i + 1, keywords.length);
 
         if (!success) {
-            console.log(`⏳ Tạm dừng hệ thống 3 phút để vượt qua Rate Limit...`);
-            await context.close();
-            await new Promise(resolve => setTimeout(resolve, 5 * 60 * 1000));
-            context = await createBrowserContext(isDocker);
-            i--;
+            keywordRetries++;
+            if (keywordRetries <= MAX_RETRIES_PER_KEYWORD) {
+                console.log(`⏳ [${keyword}] Gặp lỗi / Rate Limit (thử lại lần ${keywordRetries}/${MAX_RETRIES_PER_KEYWORD}). Tạm dừng hệ thống 3 phút rồi thử lại...`);
+                try { await context.close(); } catch { }
+                await new Promise(resolve => setTimeout(resolve, 3 * 60 * 1000));
+                
+                context = await createBrowserContext(isDocker);
+                i--; 
+            } else {
+                console.warn(`⚠️ [${keyword}] Đã thử lại ${MAX_RETRIES_PER_KEYWORD} lần thất bại. Bỏ qua từ khóa này để tiếp tục!`);
+                keywordRetries = 0;
+                await new Promise(resolve => setTimeout(resolve, 15000));
+            }
+        } else {
+            keywordRetries = 0;
         }
     }
 
