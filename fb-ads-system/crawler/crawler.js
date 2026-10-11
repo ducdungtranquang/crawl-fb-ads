@@ -1,11 +1,7 @@
 const fs = require('fs');
 const path = require('path');
-const { chromium } = require('playwright-extra');
-const stealth = require('puppeteer-extra-plugin-stealth')();
+const { chromium } = require('playwright'); // Dùng playwright gốc, không dùng extra nữa
 const { MongoClient } = require('mongodb');
-
-// Kích hoạt plugin stealth để ẩn danh bot
-chromium.use(stealth);
 
 process.removeAllListeners('warning');
 process.on('warning', (warning) => {
@@ -45,13 +41,13 @@ let isRateLimited = false;
 // Tạo thư mục lưu ảnh cục bộ
 fs.mkdirSync(STORAGE_PATH, { recursive: true });
 
+// Danh sách User-Agents để đổi thông tin thiết bị
 const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0'
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
 ];
 
 function randomDelay(min = 2000, max = 4000) {
@@ -133,7 +129,6 @@ async function initializeInfrastructure() {
     console.log('✅ Crawler MongoDB connected & Index created.');
 }
 
-// Hàm tải ảnh về lưu ở máy tính cục bộ
 async function downloadThumbnail(page, imageUrl, adId) {
     if (!imageUrl || !adId) return null;
     try {
@@ -143,7 +138,7 @@ async function downloadThumbnail(page, imageUrl, adId) {
         const fileName = `${adId}.jpg`;
         const filePath = path.join(STORAGE_PATH, fileName);
         await fs.promises.writeFile(filePath, buffer);
-        return `/images/${fileName}`; // Path để lưu vào database
+        return `/images/${fileName}`; 
     } catch {
         return null;
     }
@@ -158,7 +153,6 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
     let detailEntry = buildDetailEntry({ ...ad, domain }, keyword, transparencyData);
 
     if (!existing) {
-        // Lấy ảnh đầu tiên lưu làm thumbnail
         const firstImage = ad.images && ad.images.length > 0 ? ad.images[0] : null;
         const localThumb = firstImage ? await downloadThumbnail(page, firstImage.original_image_url || firstImage.url, ad.ad_archive_id) : null;
 
@@ -256,14 +250,42 @@ function extractAds(json) {
     }
 }
 
+// ----------------------------------------------------
+// HÀM TỰ CẤU HÌNH FINGERPRINT (THAY THẾ STEALTH PLUGIN)
+// ----------------------------------------------------
+async function applyStealth(page) {
+    await page.addInitScript(() => {
+        // Xóa cờ webdriver
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        
+        // Khai báo ngôn ngữ ưu tiên tiếng Anh
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        
+        // Giả lập đối tượng chrome
+        window.chrome = { runtime: {} };
+        
+        // Đổi thông số Card đồ họa (WebGL)
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function (param) {
+            if (param === 37445) return 'Intel Inc.';
+            if (param === 37446) return 'Intel Iris OpenGL Engine';
+            return getParameter.call(this, param);
+        };
+    });
+}
+
 async function createBrowserContext(isDocker) {
     return await chromium.launchPersistentContext(USER_DATA_DIR, {
         headless: true,
+        channel: 'chrome', // Yêu cầu Playwright chạy Chrome của máy chủ (không tải bản riêng)
+        executablePath: fs.existsSync('/usr/bin/google-chrome') ? '/usr/bin/google-chrome' : undefined,
         userAgent: getRandomUserAgent(),
         viewport: { width: randomInt(1366, 1920), height: randomInt(768, 1080) },
+        locale: 'en-US',
+        timezoneId: 'America/New_York',
         args: [
             '--start-maximized',
-            '--disable-blink-features=AutomationControlled',
+            '--disable-blink-features=AutomationControlled', // Chặn phát hiện Automation
             '--disable-web-security',
             '--disable-features=IsolateOrigins,site-per-process',
             ...(isDocker ? ['--no-sandbox', '--disable-setuid-sandbox'] : [])
@@ -291,9 +313,10 @@ async function dismissOverlays(page) {
 }
 
 async function scanKeyword(context, keyword, index, total) {
-    const page = await context.newPage({
-        viewport: { width: randomInt(1200, 1920), height: randomInt(700, 1080) }
-    });
+    const page = await context.newPage();
+    
+    // Áp dụng Fingerprint giả lập vào trang web
+    await applyStealth(page);
 
     lastSavedAt = Date.now();
     isRateLimited = false;
