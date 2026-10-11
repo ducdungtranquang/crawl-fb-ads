@@ -19,7 +19,6 @@ global.setTimeout = function (callback, delay, ...args) {
 
 process.env.TZ = 'UTC';
 
-// Đã cập nhật IP của máy Core
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.0.125:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
 const DB_NAME = 'fb_ads';
 
@@ -32,14 +31,27 @@ const SEEN_THRESHOLD = 10 * 60 * 1000;
 const DETAIL_HISTORY_LIMIT = 200;
 const MAX_ADS_PER_KEYWORD = parseInt(process.env.MAX_ADS_PER_KEYWORD || '300', 10);
 const MAX_SCROLLS_PER_KEYWORD = parseInt(process.env.MAX_SCROLLS_PER_KEYWORD || '60', 10);
-const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10); // 3 phút tối đa / từ khóa
-const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10); // 40s nếu không có ad mới
+const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10); // 3 phút
+const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10); // 40s
 const MAX_RETRIES_PER_KEYWORD = 2;
 
 let db;
 const seen = new Set();
 let lastSavedAt = Date.now();
 let isRateLimited = false;
+
+// Tập hợp User-Agents phổ biến, mới nhất
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0'
+];
+
+function getRandomUA() {
+    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
 
 fs.mkdirSync(STORAGE_PATH, { recursive: true });
 
@@ -120,7 +132,6 @@ async function initializeInfrastructure() {
 
 async function downloadThumbnail(page, imageUrl, adId) {
     if (!imageUrl || !adId) return null;
-
     try {
         const response = await page.request.get(imageUrl, { timeout: 5000 });
         if (!response.ok()) return null;
@@ -138,7 +149,6 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
     const col = db.collection('ads');
     const now = Date.now();
     const domain = extractDomain(ad.link);
-
     const existing = await col.findOne({ ad_archive_id: ad.ad_archive_id });
     let detailEntry = buildDetailEntry({ ...ad, domain }, keyword, transparencyData);
 
@@ -240,30 +250,64 @@ function extractAds(json) {
     }
 }
 
+// Cải thiện phần vượt detection (stealth)
 async function applyStealth(page) {
     await page.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        window.chrome = { runtime: {} };
+        const isMac = navigator.userAgent.includes('Mac');
+        
+        // 1. Pass WebDriver
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        
+        // 2. Fake OS properties
+        Object.defineProperty(navigator, 'platform', { get: () => isMac ? 'MacIntel' : 'Win32' });
+        Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
+        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => randomInt(4, 12) });
+        
+        // 3. Fake Plugins
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4] });
+        
+        // 4. Fake Chrome Window attributes
+        window.chrome = {
+            runtime: {},
+            app: {},
+            csi: () => {}
+        };
+
+        // 5. Fake WebGL Fingerprint
         const getParameter = WebGLRenderingContext.prototype.getParameter;
         WebGLRenderingContext.prototype.getParameter = function (param) {
             if (param === 37445) return 'Intel Inc.';
-            if (param === 37446) return 'Intel Iris OpenGL Engine';
+            if (param === 37446) return isMac ? 'Intel Iris OpenGL Engine' : 'Intel(R) UHD Graphics 620';
             return getParameter.call(this, param);
         };
+
+        // 6. Fix Permissions API detection
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
+        
+        function randomInt(min, max) {
+            return Math.floor(Math.random() * (max - min + 1)) + min;
+        }
     });
 }
 
 async function createBrowserContext(isDocker) {
     return await chromium.launchPersistentContext(USER_DATA_DIR, {
         headless: true,
-        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        userAgent: getRandomUA(), // Lấy UA ngẫu nhiên thay vì fix cứng
         viewport: { width: randomInt(1366, 1920), height: randomInt(768, 1080) },
         //...(isDocker ? {} : { executablePath: CHROME_PATH }),
         args: [
             `--profile-directory=${PROFILE}`,
             '--start-maximized',
             '--disable-blink-features=AutomationControlled',
+            '--disable-infobars', 
+            '--ignore-certificate-errors',
             ...(isDocker ? ['--no-sandbox', '--disable-setuid-sandbox'] : [])
         ]
     });
@@ -385,7 +429,6 @@ async function scanKeyword(context, keyword, index, total) {
             await page.evaluate((amount) => { window.scrollBy(0, amount); }, scrollAmount);
             await page.waitForTimeout(randomDelay(1500, 3000));
 
-            // Đóng popup nếu xuất hiện trong quá trình cuộn
             await dismissOverlays(page);
 
             const curr = await page.evaluate(() => document.body.scrollHeight);
@@ -395,16 +438,27 @@ async function scanKeyword(context, keyword, index, total) {
                 same = 0;
             }
             prev = curr;
+
+            // Xử lý timeout chờ khi nghi ngờ đến cuối trang
             if (same >= 5) {
-                console.log(`🏁 [${keyword}] Đã cuộn đến cuối kết quả tìm kiếm.`);
-                break;
+                console.log(`⏳ [${keyword}] Không thấy cuộn thêm được. Đang đợi 5 giây kiểm tra lazy load...`);
+                await page.waitForTimeout(5000); // Timeout đợi thêm mạng
+                
+                const checkFinal = await page.evaluate(() => document.body.scrollHeight);
+                if (checkFinal === curr) {
+                    console.log(`🏁 [${keyword}] Đã cuộn đến cuối kết quả tìm kiếm thực sự.`);
+                    break;
+                } else {
+                    console.log(`▶️ [${keyword}] Có dữ liệu mới load thêm, tiếp tục quét...`);
+                    same = 0; // Reset và cuộn tiếp
+                    prev = checkFinal;
+                }
             }
         }
     } catch (error) {
         console.error(`❌ Lỗi khi quét từ khóa "${keyword}":`, error.message);
     }
 
-    // Đợi các tác vụ lưu ảnh/DB nền hoàn tất trước khi đóng page
     const waitPendingStart = Date.now();
     while (pendingSaves > 0 && Date.now() - waitPendingStart < 5000) {
         await new Promise(resolve => setTimeout(resolve, 200));
@@ -422,11 +476,8 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
     await initializeInfrastructure();
     let context = await createBrowserContext(isDocker);
 
-    // Tập từ khóa Tiếng Việt (Hot trend xếp đầu)
     const keywords = [
-        // 'thời trang', 'mỹ phẩm', 
         'thực phẩm chức năng', 'giảm cân', 'kem chống nắng',
-        // 'trị mụn', 'nước hoa', 
         'trà sữa', 'cafe', 'bất động sản',
         'quần áo', 'giày dép', 'túi xách', 'đồng hồ', 'phụ kiện',
         'mua ngay', 'xem ngay', 'khuyến mãi', 'giảm giá', 'ưu đãi',
@@ -452,7 +503,7 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
                 try { await context.close(); } catch { }
                 await new Promise(resolve => setTimeout(resolve, 3 * 60 * 1000));
                 context = await createBrowserContext(isDocker);
-                i--; // Thử lại chính từ khóa này
+                i--; 
             } else {
                 console.warn(`⚠️ [${keyword}] Đã thử lại ${MAX_RETRIES_PER_KEYWORD} lần thất bại. Bỏ qua từ khóa này để tiếp tục từ khóa kế tiếp!`);
                 keywordRetries = 0;
