@@ -100,7 +100,7 @@ function buildDetailEntry(ad, keyword = null, transparencyData = null) {
     return {
         t: Date.now(),
         keyword,
-        country: 'ALL',
+        country: 'VN',
         page_name: ad.page_name || null,
         page_id: ad.page_id || null,
         text: ad.text || null,
@@ -114,7 +114,7 @@ function buildDetailEntry(ad, keyword = null, transparencyData = null) {
         start_date: ad.start_date || null,
         end_date: ad.end_date || null,
         is_active: ad.is_active ?? null,
-        collation_count: ad.collation_count || 1, // Bổ sung số lượng duplicate
+        collation_count: ad.collation_count || 1, 
         normalized_text: normalize(ad.text || ''),
         signature: buildDetailSignature(ad),
         transparency: transparencyData || null
@@ -205,7 +205,7 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
                 $set: {
                     last_seen: now,
                     seen_count: newCount,
-                    collation_count: ad.collation_count || 1, // Cập nhật số lượng duplicate
+                    collation_count: ad.collation_count || 1,
                     detail_history: historyToKeep.slice(-DETAIL_HISTORY_LIMIT),
                     ...(transparencyData ? { last_detail_seen_at: now } : {})
                 },
@@ -227,7 +227,7 @@ function extractAds(json) {
                 const snap = ad.snapshot || {};
                 output.push({
                     ad_archive_id: ad.ad_archive_id,
-                    collation_count: ad.collation_count || 1, // Lấy số lượng duplicate từ payload
+                    collation_count: ad.collation_count || 1,
                     page_id: ad.page_id,
                     page_name: ad.page_name,
                     snapshot: snap,
@@ -469,20 +469,20 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
     let context = await createBrowserContext(isDocker);
 
     const keywords = [
-        // --- TỪ KHÓA CŨ (Tiếng Anh) ---
-        'friday', 'nano', 'step', 'holiday', 'hold', 'oh', 'fa', 'leg', 'feet', 'game', 'tool', 'ad', 'spy', 'run', 'talk', 'speak', 're', 'peak', 'black', 'red', 'white', 'blue', 'orange', 'ju','yi', 'don', 'sport', 'eu', 'us',"supplements", "weight loss", "sunscreen", "acne treatment", "perfume", "milk tea", "coffee", "real estate",'pe','motor', 'bike', 'xe', "clothing", "shoes", 'add', 'pretty', 'anime', 'cartoon', 'run', 'test', 'failed', 'usually', 'always', 'often ', 'improve', 'down', 'hi', 'country', 'great', 'full', 'emotion', 'email', 'scare', 'fear', 'oxy', 'provide', 'sick', 'toys', 'hand', 'hair', 'lips', 'eyes', 'play', 'jwery', 'royal', 'loyal', 'one', 'two', 'second', 'first', 'the', 'super', 'char', 'agile','water', 'soft', 'sea', 'beach', 'update', 'tele', 'ads', 'tools', 'team', 'good', 'bad', 'study', 'template', 'like', 'love', 'perfume', 'sweet', 'spicy', 'sour', 'bitter', 'meat', 'chicken', 'cat', 'dog', 'thanks', 'grateful', 'friends', 'enemy', 'group', 'game', 'attack', 'defend', 'record', 'report', 'fight', 'ai', 'image', 'video', 'clip', 'bonus', 'plus', 'all', 'hate','versatile', 'performance', 'quality', 'ensure', 'commit', 'forget', 'miss', 'take', 'endow', 'window', 'lamp', 'pen', 'eraser', 'delete', 'insert', 'sandal','camera', 'follow', "handbags", "watches", "accessories", "buy now", "watch now", "promotion", "discount", "special offer", "e-commerce", "smartphones", "laptops", "tablets", "home appliances", "motorcycles", "cars", "travel", "hotel", "resort", "spa", "beauty salon", "furniture", "home decor", "household items", "health", "sports", "gym", "yoga", "skincare", "streetwear", "designer fashion", "pharmacy", "medicine", "vitamins", "herbal tea", "healthcare products", "snacks", "restaurant", "buffet", "healthy food", "digital marketing", "software", "saas", "cryptocurrency", "finance", "insurance", "personal loans", "credit cards", "investing", "online courses", "masterclass", "webinar", "b2b services", "plumbing services", "roofing", "dental clinic", "lawyer", "attorney", "gifts", "pet supplies", "dog food", "cat litter", "toys", "baby clothes", "maternity wear", "landscaping", "solar panels", "hvac services", "pest control", "cleaning services", "massage therapy", "chiropractor", "auto repair", "car wash", "delivery service", "food delivery", "meal prep", "fitness equipment", "protein powder", "vegan diet", "keto diet", "gluten-free", "organic food", "sustainable", "eco-friendly", "handmade", "jewelry", "sunglasses", "cosmetics", "makeup", "hair care", "free shipping", "freeship", "50% off", "limited time", "grab yours", "shop now", "order today", "best seller", "top rated", "trending", "viral", "must have", "giveaway", "exclusive deal", "flash sale", "clearance", "last chance", "new arrival", "premium quality", "affordable", "money back guarantee", "smart watch", "wireless earbuds", "power bank", "phone case", "gadget", "smart home", "led lights", "projector", "dash cam", "car accessories", "backpack", "sneakers", "activewear", "leggings", "yoga mat", "dumbbells", "massage gun", "posture corrector", "orthopedic shoes", "anti-aging", "whitening", "hair loss", "beard grooming", "fragrance", "essential oils", "kitchen gadgets", "air fryer", "blender", "coffee maker", "water bottle", "camping gear", "hiking boots", "fishing rod", "survival kit", "marketing agency", "seo services", "lead generation", "web design", "app development", "b2b", "startup", "scale your business", "passive income", "trading", "forex", "stock market", "investment", "real estate agent", "business coaching", "discover", "secret", "hack", "tips and tricks", "how to", "tutorial", "lifestyle", "luxury", "cheap", "save money", "glow up", "transformation",
-
-        // --- TỪ KHÓA CŨ (Tiếng Việt) ---
-        'thực phẩm chức năng', 'giảm cân', 'kem chống nắng', 'trà sữa', 'cafe', 'bất động sản', 'quần áo', 'giày dép', 'túi xách', 'đồng hồ', 'phụ kiện', 'mua ngay', 'xem ngay', 'khuyến mãi', 'giảm giá', 'ưu đãi', 'thương mại điện tử', 'điện thoại', 'laptop', 'máy tính bảng', 'thiết bị gia dụng', 'xe máy', 'ô tô', 'du lịch', 'khách sạn', 'resort', 'spa', 'làm đẹp', 'nội thất', 'trang trí nhà cửa', 'đồ gia dụng', 'sức khỏe', 'thể thao', 'gym', 'yoga', 'chăm sóc da', 'streetwear', 'thời trang thiết kế', 'dược', 'thuốc', 'vitamin', 'thảo dược', 'sản phẩm chăm sóc sức khỏe', 'ăn vặt', 'nhà hàng', 'buffet', 'đồ ăn healthy',
-
-        // --- TỪ KHÓA MỚI BỔ SUNG (Tiếng Việt thị trường ngách & chuyển đổi cao) ---
-        'miễn phí vận chuyển', 'xả kho', 'thanh lý', 'giá sốc', 'chính hãng', 'bảo hành', 
-        'trị mụn', 'nám', 'tàn nhang', 'rụng tóc', 'mẹ và bé', 'sữa bột', 'đồ chơi trẻ em', 'bỉm', 
-        'phong thủy', 'vòng tay phong thủy', 'sim số đẹp', 'vay tiền', 'tín dụng', 'chứng khoán', 'đầu tư', 
-        'việc làm', 'tuyển dụng', 'tiếng anh giao tiếp', 'ielts', 'gia sư', 'nha khoa', 'niềng răng', 'bọc răng sứ', 
-        'thẩm mỹ viện', 'nâng mũi', 'cắt mí', 'phun xăm', 'camera hành trình', 'đồ chơi ô tô', 'phụ tùng', 
-        'nông sản', 'hạt điều', 'trái cây sấy', 'đặc sản', 'bảo hiểm nhân thọ', 'xuất khẩu lao động', 'định cư', 'visa', 
-        'thiết kế nội thất', 'xây nhà trọn gói', 'sửa nhà', 'xưởng sỉ', 'nguồn hàng'
+        // Các cụm từ ngách cũ (Tiếng Việt)
+        'thực phẩm chức năng', 'giảm cân', 'kem chống nắng', 'trà sữa', 'cafe', 'bất động sản', 'quần áo', 'giày dép', 'túi xách', 'đồng hồ', 'phụ kiện', 'mua ngay', 'xem ngay', 'khuyến mãi', 'giảm giá', 'ưu đãi', 'thương mại điện tử', 'điện thoại', 'laptop', 'máy tính bảng', 'thiết bị gia dụng', 'xe máy', 'ô tô', 'du lịch', 'khách sạn', 'resort', 'spa', 'làm đẹp', 'nội thất', 'trang trí nhà cửa', 'đồ gia dụng', 'sức khỏe', 'thể thao', 'gym', 'yoga', 'chăm sóc da', 'thời trang thiết kế', 'dược', 'thuốc', 'vitamin', 'thảo dược', 'sản phẩm chăm sóc sức khỏe', 'ăn vặt', 'nhà hàng', 'buffet', 'đồ ăn healthy', 'miễn phí vận chuyển', 'xả kho', 'thanh lý', 'giá sốc', 'chính hãng', 'bảo hành', 'trị mụn', 'nám', 'tàn nhang', 'rụng tóc', 'mẹ và bé', 'sữa bột', 'đồ chơi trẻ em', 'bỉm', 'phong thủy', 'vòng tay phong thủy', 'sim số đẹp', 'vay tiền', 'tín dụng', 'chứng khoán', 'đầu tư', 'việc làm', 'tuyển dụng', 'tiếng anh giao tiếp', 'gia sư', 'nha khoa', 'niềng răng', 'bọc răng sứ', 'thẩm mỹ viện', 'nâng mũi', 'cắt mí', 'phun xăm', 'camera hành trình', 'đồ chơi ô tô', 'phụ tùng', 'nông sản', 'hạt điều', 'trái cây sấy', 'đặc sản', 'bảo hiểm nhân thọ', 'xuất khẩu lao động', 'định cư', 'visa', 'thiết kế nội thất', 'xây nhà trọn gói', 'sửa nhà', 'xưởng sỉ', 'nguồn hàng',
+        
+        // Bổ sung cụm 1 từ (Đồ vật, thời trang, mỹ phẩm)
+        'áo', 'quần', 'váy', 'đầm', 'giày', 'dép', 'túi', 'ví', 'mũ', 'nón', 'kính', 'nhẫn', 'vòng', 'khuyên', 'dây', 'son', 'phấn', 'kem', 'serum', 'mụn', 'thâm', 'sẹo', 'nám', 'trắng', 'tóc', 'da', 'móng', 'hương', 'hoa', 'sách', 'bút', 'vở',
+        
+        // Bổ sung cụm 1 từ (Nội thất, gia dụng, ẩm thực)
+        'bàn', 'ghế', 'giường', 'tủ', 'kệ', 'đèn', 'quạt', 'bếp', 'nồi', 'chảo', 'dao', 'kéo', 'chén', 'bát', 'đũa', 'cốc', 'ly', 'rượu', 'bia', 'thịt', 'cá', 'rau', 'gạo', 'sữa', 'bánh', 'kẹo', 'kem', 'trà', 'thuốc',
+        
+        // Bổ sung cụm 1 từ (Dịch vụ, tài sản, thú cưng, nông nghiệp, xây dựng)
+        'tiền', 'vàng', 'bạc', 'đất', 'nhà', 'xe', 'phòng', 'vé', 'tour', 'app', 'web', 'game', 'thẻ', 'sim', 'mạng', 'gói', 'chó', 'mèo', 'chim', 'cá', 'cây', 'hoa', 'lan', 'phân', 'giống', 'bơm', 'máy', 'sửa', 'thợ', 'kéo', 'nhựa', 'sắt', 'thép', 'gỗ', 'kính', 'rèm', 'thảm', 'nệm', 'chăn', 'ga', 'gối',
+        
+        // Bổ sung cụm 1 từ (Từ khóa giật tít, hành động, tính từ mạnh)
+        'rẻ', 'tặng', 'sale', 'hot', 'mới', 'đẹp', 'bền', 'chắc', 'nhanh', 'gấp', 'vay', 'lãi', 'chuẩn', 'xịn', 'vip', 'sỉ', 'lẻ', 'kho'
     ];
 
     let keywordRetries = 0;
