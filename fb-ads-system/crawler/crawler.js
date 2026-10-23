@@ -31,8 +31,8 @@ const SEEN_THRESHOLD = 10 * 60 * 1000;
 const DETAIL_HISTORY_LIMIT = 200;
 const MAX_ADS_PER_KEYWORD = parseInt(process.env.MAX_ADS_PER_KEYWORD || '300', 10);
 const MAX_SCROLLS_PER_KEYWORD = parseInt(process.env.MAX_SCROLLS_PER_KEYWORD || '60', 10);
-const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10); // 3 phút
-const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10); // 40s
+const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10); 
+const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10); 
 const MAX_RETRIES_PER_KEYWORD = 2;
 
 let db;
@@ -40,7 +40,6 @@ const seen = new Set();
 let lastSavedAt = Date.now();
 let isRateLimited = false;
 
-// Tập hợp User-Agents phổ biến, mới nhất
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -115,6 +114,7 @@ function buildDetailEntry(ad, keyword = null, transparencyData = null) {
         start_date: ad.start_date || null,
         end_date: ad.end_date || null,
         is_active: ad.is_active ?? null,
+        collation_count: ad.collation_count || 1, // Bổ sung số lượng duplicate
         normalized_text: normalize(ad.text || ''),
         signature: buildDetailSignature(ad),
         transparency: transparencyData || null
@@ -205,6 +205,7 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
                 $set: {
                     last_seen: now,
                     seen_count: newCount,
+                    collation_count: ad.collation_count || 1, // Cập nhật số lượng duplicate
                     detail_history: historyToKeep.slice(-DETAIL_HISTORY_LIMIT),
                     ...(transparencyData ? { last_detail_seen_at: now } : {})
                 },
@@ -226,6 +227,7 @@ function extractAds(json) {
                 const snap = ad.snapshot || {};
                 output.push({
                     ad_archive_id: ad.ad_archive_id,
+                    collation_count: ad.collation_count || 1, // Lấy số lượng duplicate từ payload
                     page_id: ad.page_id,
                     page_name: ad.page_name,
                     snapshot: snap,
@@ -250,31 +252,24 @@ function extractAds(json) {
     }
 }
 
-// Cải thiện phần vượt detection (stealth)
 async function applyStealth(page) {
     await page.addInitScript(() => {
         const isMac = navigator.userAgent.includes('Mac');
         
-        // 1. Pass WebDriver
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        
-        // 2. Fake OS properties
         Object.defineProperty(navigator, 'platform', { get: () => isMac ? 'MacIntel' : 'Win32' });
         Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
         Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
         Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => randomInt(4, 12) });
         
-        // 3. Fake Plugins
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4] });
         
-        // 4. Fake Chrome Window attributes
         window.chrome = {
             runtime: {},
             app: {},
             csi: () => {}
         };
 
-        // 5. Fake WebGL Fingerprint
         const getParameter = WebGLRenderingContext.prototype.getParameter;
         WebGLRenderingContext.prototype.getParameter = function (param) {
             if (param === 37445) return 'Intel Inc.';
@@ -282,7 +277,6 @@ async function applyStealth(page) {
             return getParameter.call(this, param);
         };
 
-        // 6. Fix Permissions API detection
         const originalQuery = window.navigator.permissions.query;
         window.navigator.permissions.query = (parameters) => (
             parameters.name === 'notifications' ?
@@ -299,9 +293,8 @@ async function applyStealth(page) {
 async function createBrowserContext(isDocker) {
     return await chromium.launchPersistentContext(USER_DATA_DIR, {
         headless: true,
-        userAgent: getRandomUA(), // Lấy UA ngẫu nhiên thay vì fix cứng
+        userAgent: getRandomUA(), 
         viewport: { width: randomInt(1366, 1920), height: randomInt(768, 1080) },
-        //...(isDocker ? {} : { executablePath: CHROME_PATH }),
         args: [
             `--profile-directory=${PROFILE}`,
             '--start-maximized',
@@ -439,10 +432,9 @@ async function scanKeyword(context, keyword, index, total) {
             }
             prev = curr;
 
-            // Xử lý timeout chờ khi nghi ngờ đến cuối trang
             if (same >= 5) {
                 console.log(`⏳ [${keyword}] Không thấy cuộn thêm được. Đang đợi 5 giây kiểm tra lazy load...`);
-                await page.waitForTimeout(5000); // Timeout đợi thêm mạng
+                await page.waitForTimeout(5000); 
                 
                 const checkFinal = await page.evaluate(() => document.body.scrollHeight);
                 if (checkFinal === curr) {
@@ -450,7 +442,7 @@ async function scanKeyword(context, keyword, index, total) {
                     break;
                 } else {
                     console.log(`▶️ [${keyword}] Có dữ liệu mới load thêm, tiếp tục quét...`);
-                    same = 0; // Reset và cuộn tiếp
+                    same = 0; 
                     prev = checkFinal;
                 }
             }
@@ -477,17 +469,20 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
     let context = await createBrowserContext(isDocker);
 
     const keywords = [
-        'thực phẩm chức năng', 'giảm cân', 'kem chống nắng',
-        'trà sữa', 'cafe', 'bất động sản',
-        'quần áo', 'giày dép', 'túi xách', 'đồng hồ', 'phụ kiện',
-        'mua ngay', 'xem ngay', 'khuyến mãi', 'giảm giá', 'ưu đãi',
-        'thương mại điện tử', 'điện thoại', 'laptop', 'máy tính bảng', 'thiết bị gia dụng',
-        'xe máy', 'ô tô', 'du lịch', 'khách sạn', 'resort',
-        'spa', 'làm đẹp', 'nội thất', 'trang trí nhà cửa', 'đồ gia dụng',
-        'sức khỏe', 'thể thao', 'gym', 'yoga', 'chăm sóc da',
-        'streetwear', 'thời trang thiết kế', 'dược', 'thuốc', 'vitamin',
-        'thảo dược', 'sản phẩm chăm sóc sức khỏe', 'ăn vặt', 'nhà hàng',
-        'buffet', 'đồ ăn healthy'
+        // --- TỪ KHÓA CŨ (Tiếng Anh) ---
+        'friday', 'nano', 'step', 'holiday', 'hold', 'oh', 'fa', 'leg', 'feet', 'game', 'tool', 'ad', 'spy', 'run', 'talk', 'speak', 're', 'peak', 'black', 'red', 'white', 'blue', 'orange', 'ju','yi', 'don', 'sport', 'eu', 'us',"supplements", "weight loss", "sunscreen", "acne treatment", "perfume", "milk tea", "coffee", "real estate",'pe','motor', 'bike', 'xe', "clothing", "shoes", 'add', 'pretty', 'anime', 'cartoon', 'run', 'test', 'failed', 'usually', 'always', 'often ', 'improve', 'down', 'hi', 'country', 'great', 'full', 'emotion', 'email', 'scare', 'fear', 'oxy', 'provide', 'sick', 'toys', 'hand', 'hair', 'lips', 'eyes', 'play', 'jwery', 'royal', 'loyal', 'one', 'two', 'second', 'first', 'the', 'super', 'char', 'agile','water', 'soft', 'sea', 'beach', 'update', 'tele', 'ads', 'tools', 'team', 'good', 'bad', 'study', 'template', 'like', 'love', 'perfume', 'sweet', 'spicy', 'sour', 'bitter', 'meat', 'chicken', 'cat', 'dog', 'thanks', 'grateful', 'friends', 'enemy', 'group', 'game', 'attack', 'defend', 'record', 'report', 'fight', 'ai', 'image', 'video', 'clip', 'bonus', 'plus', 'all', 'hate','versatile', 'performance', 'quality', 'ensure', 'commit', 'forget', 'miss', 'take', 'endow', 'window', 'lamp', 'pen', 'eraser', 'delete', 'insert', 'sandal','camera', 'follow', "handbags", "watches", "accessories", "buy now", "watch now", "promotion", "discount", "special offer", "e-commerce", "smartphones", "laptops", "tablets", "home appliances", "motorcycles", "cars", "travel", "hotel", "resort", "spa", "beauty salon", "furniture", "home decor", "household items", "health", "sports", "gym", "yoga", "skincare", "streetwear", "designer fashion", "pharmacy", "medicine", "vitamins", "herbal tea", "healthcare products", "snacks", "restaurant", "buffet", "healthy food", "digital marketing", "software", "saas", "cryptocurrency", "finance", "insurance", "personal loans", "credit cards", "investing", "online courses", "masterclass", "webinar", "b2b services", "plumbing services", "roofing", "dental clinic", "lawyer", "attorney", "gifts", "pet supplies", "dog food", "cat litter", "toys", "baby clothes", "maternity wear", "landscaping", "solar panels", "hvac services", "pest control", "cleaning services", "massage therapy", "chiropractor", "auto repair", "car wash", "delivery service", "food delivery", "meal prep", "fitness equipment", "protein powder", "vegan diet", "keto diet", "gluten-free", "organic food", "sustainable", "eco-friendly", "handmade", "jewelry", "sunglasses", "cosmetics", "makeup", "hair care", "free shipping", "freeship", "50% off", "limited time", "grab yours", "shop now", "order today", "best seller", "top rated", "trending", "viral", "must have", "giveaway", "exclusive deal", "flash sale", "clearance", "last chance", "new arrival", "premium quality", "affordable", "money back guarantee", "smart watch", "wireless earbuds", "power bank", "phone case", "gadget", "smart home", "led lights", "projector", "dash cam", "car accessories", "backpack", "sneakers", "activewear", "leggings", "yoga mat", "dumbbells", "massage gun", "posture corrector", "orthopedic shoes", "anti-aging", "whitening", "hair loss", "beard grooming", "fragrance", "essential oils", "kitchen gadgets", "air fryer", "blender", "coffee maker", "water bottle", "camping gear", "hiking boots", "fishing rod", "survival kit", "marketing agency", "seo services", "lead generation", "web design", "app development", "b2b", "startup", "scale your business", "passive income", "trading", "forex", "stock market", "investment", "real estate agent", "business coaching", "discover", "secret", "hack", "tips and tricks", "how to", "tutorial", "lifestyle", "luxury", "cheap", "save money", "glow up", "transformation",
+
+        // --- TỪ KHÓA CŨ (Tiếng Việt) ---
+        'thực phẩm chức năng', 'giảm cân', 'kem chống nắng', 'trà sữa', 'cafe', 'bất động sản', 'quần áo', 'giày dép', 'túi xách', 'đồng hồ', 'phụ kiện', 'mua ngay', 'xem ngay', 'khuyến mãi', 'giảm giá', 'ưu đãi', 'thương mại điện tử', 'điện thoại', 'laptop', 'máy tính bảng', 'thiết bị gia dụng', 'xe máy', 'ô tô', 'du lịch', 'khách sạn', 'resort', 'spa', 'làm đẹp', 'nội thất', 'trang trí nhà cửa', 'đồ gia dụng', 'sức khỏe', 'thể thao', 'gym', 'yoga', 'chăm sóc da', 'streetwear', 'thời trang thiết kế', 'dược', 'thuốc', 'vitamin', 'thảo dược', 'sản phẩm chăm sóc sức khỏe', 'ăn vặt', 'nhà hàng', 'buffet', 'đồ ăn healthy',
+
+        // --- TỪ KHÓA MỚI BỔ SUNG (Tiếng Việt thị trường ngách & chuyển đổi cao) ---
+        'miễn phí vận chuyển', 'xả kho', 'thanh lý', 'giá sốc', 'chính hãng', 'bảo hành', 
+        'trị mụn', 'nám', 'tàn nhang', 'rụng tóc', 'mẹ và bé', 'sữa bột', 'đồ chơi trẻ em', 'bỉm', 
+        'phong thủy', 'vòng tay phong thủy', 'sim số đẹp', 'vay tiền', 'tín dụng', 'chứng khoán', 'đầu tư', 
+        'việc làm', 'tuyển dụng', 'tiếng anh giao tiếp', 'ielts', 'gia sư', 'nha khoa', 'niềng răng', 'bọc răng sứ', 
+        'thẩm mỹ viện', 'nâng mũi', 'cắt mí', 'phun xăm', 'camera hành trình', 'đồ chơi ô tô', 'phụ tùng', 
+        'nông sản', 'hạt điều', 'trái cây sấy', 'đặc sản', 'bảo hiểm nhân thọ', 'xuất khẩu lao động', 'định cư', 'visa', 
+        'thiết kế nội thất', 'xây nhà trọn gói', 'sửa nhà', 'xưởng sỉ', 'nguồn hàng'
     ];
 
     let keywordRetries = 0;
