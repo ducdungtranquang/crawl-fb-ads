@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { chromium } = require('playwright'); // Dùng playwright gốc, không dùng extra nữa
+const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
 
 process.removeAllListeners('warning');
@@ -19,7 +19,7 @@ global.setTimeout = function (callback, delay, ...args) {
 
 process.env.TZ = 'UTC';
 
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.0.125:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.100.7:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
 const DB_NAME = 'fb_ads';
 
 const USER_DATA_DIR = './chrome-profile-mac';
@@ -27,7 +27,7 @@ const STORAGE_PATH = path.join(__dirname, '..', '..', 'storage', 'images');
 
 const SEEN_THRESHOLD = 10 * 60 * 1000;
 const DETAIL_HISTORY_LIMIT = 200;
-const MAX_ADS_PER_KEYWORD = parseInt(process.env.MAX_ADS_PER_KEYWORD || '300', 10);
+const MAX_ADS_PER_KEYWORD = parseInt(process.env.MAX_ADS_PER_KEYWORD || '1400', 10);
 const MAX_SCROLLS_PER_KEYWORD = parseInt(process.env.MAX_SCROLLS_PER_KEYWORD || '60', 10);
 const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10);
 const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10);
@@ -38,10 +38,8 @@ const seen = new Set();
 let lastSavedAt = Date.now();
 let isRateLimited = false;
 
-// Tạo thư mục lưu ảnh cục bộ
 fs.mkdirSync(STORAGE_PATH, { recursive: true });
 
-// Danh sách User-Agents để đổi thông tin thiết bị
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
@@ -114,6 +112,7 @@ function buildDetailEntry(ad, keyword = null, transparencyData = null) {
         start_date: ad.start_date || null,
         end_date: ad.end_date || null,
         is_active: ad.is_active ?? null,
+        collation_count: ad.collation_count || 1,
         normalized_text: normalize(ad.text || ''),
         signature: buildDetailSignature(ad),
         transparency: transparencyData || null
@@ -205,6 +204,7 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
                 $set: {
                     last_seen: now,
                     seen_count: newCount,
+                    collation_count: ad.collation_count || 1,
                     detail_history: historyToKeep.slice(-DETAIL_HISTORY_LIMIT),
                     ...(transparencyData ? { last_detail_seen_at: now } : {})
                 },
@@ -226,6 +226,7 @@ function extractAds(json) {
                 const snap = ad.snapshot || {};
                 output.push({
                     ad_archive_id: ad.ad_archive_id,
+                    collation_count: ad.collation_count || 1,
                     page_id: ad.page_id,
                     page_name: ad.page_name,
                     snapshot: snap,
@@ -250,21 +251,11 @@ function extractAds(json) {
     }
 }
 
-// ----------------------------------------------------
-// HÀM TỰ CẤU HÌNH FINGERPRINT (THAY THẾ STEALTH PLUGIN)
-// ----------------------------------------------------
 async function applyStealth(page) {
     await page.addInitScript(() => {
-        // Xóa cờ webdriver
         Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        
-        // Khai báo ngôn ngữ ưu tiên tiếng Anh
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        
-        // Giả lập đối tượng chrome
         window.chrome = { runtime: {} };
-        
-        // Đổi thông số Card đồ họa (WebGL)
         const getParameter = WebGLRenderingContext.prototype.getParameter;
         WebGLRenderingContext.prototype.getParameter = function (param) {
             if (param === 37445) return 'Intel Inc.';
@@ -276,8 +267,8 @@ async function applyStealth(page) {
 
 async function createBrowserContext(isDocker) {
     return await chromium.launchPersistentContext(USER_DATA_DIR, {
-        headless: true,
-        channel: 'chrome', // Yêu cầu Playwright chạy Chrome của máy chủ (không tải bản riêng)
+        headless: false,
+        channel: 'chrome',
         executablePath: fs.existsSync('/usr/bin/google-chrome') ? '/usr/bin/google-chrome' : undefined,
         userAgent: getRandomUserAgent(),
         viewport: { width: randomInt(1366, 1920), height: randomInt(768, 1080) },
@@ -285,7 +276,7 @@ async function createBrowserContext(isDocker) {
         timezoneId: 'America/New_York',
         args: [
             '--start-maximized',
-            '--disable-blink-features=AutomationControlled', // Chặn phát hiện Automation
+            '--disable-blink-features=AutomationControlled',
             '--disable-web-security',
             '--disable-features=IsolateOrigins,site-per-process',
             ...(isDocker ? ['--no-sandbox', '--disable-setuid-sandbox'] : [])
@@ -315,7 +306,6 @@ async function dismissOverlays(page) {
 async function scanKeyword(context, keyword, index, total) {
     const page = await context.newPage();
     
-    // Áp dụng Fingerprint giả lập vào trang web
     await applyStealth(page);
 
     lastSavedAt = Date.now();
@@ -365,6 +355,7 @@ async function scanKeyword(context, keyword, index, total) {
         } catch { }
     });
 
+    // LƯU Ý: Đang quét US, bạn có thể đổi 'country=US' thành 'country=VN' nếu muốn tập trung thị trường Việt Nam
     const url = `https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=US&media_type=all&search_type=keyword_unordered&q=${encodeURIComponent(keyword)}`;
 
     try {
@@ -442,8 +433,29 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
     let context = await createBrowserContext(isDocker);
 
     const keywords = [
-        "dietary supplements", "weight loss", "sunscreen", "acne treatment", "perfume", 
-        "milk tea", "coffee", "real estate", "clothing", "shoes", 
+        // --- TỪ KHÓA CŨ ---
+        'friday', 'nano', 'step', 'holiday', 'hold', 'oh',
+        'fa', 'leg', 'feet', 'game', 'tool', 'ad', 'spy', 'run', 'talk', 'speak', 're', 'peak',
+        'black', 'red', 'white', 'blue', 'orange', 'ju','yi', 'don',        
+        'sport', 'eu', 'us',"supplements", "weight loss", "sunscreen", "acne treatment", "perfume", 
+        "milk tea", "coffee", "real estate",'pe','motor', 'bike', 'xe', 
+        "clothing", "shoes", 'add', 'pretty', 'anime', 'cartoon',
+        'run', 'test', 'failed', 'usually', 'always', 'often ', 'improve',
+        'down', 'hi', 'country', 'great', 'full', 'emotion',
+        'email', 'scare', 'fear', 'oxy', 'provide', 'sick',
+        'toys', 'hand', 'hair', 'lips', 'eyes', 'play',
+        'jwery', 'royal', 'loyal', 'one', 'two', 'second', 'first', 'the',
+        'super', 'char', 'agile','water', 'soft', 'sea', 'beach',
+        'update', 'tele', 'ads', 'tools', 'team',
+        'good', 'bad', 'study', 'template', 'like', 'love', 'perfume', 'sweet'
+        ,'spicy', 'sour', 'bitter', 'meat', 'chicken',
+        'cat', 'dog', 'thanks', 'grateful', 'friends', 'enemy',
+        'group', 'game', 'attack', 'defend',
+        'record', 'report', 'fight',
+        'ai', 'image', 'video', 'clip', 'bonus', 'plus', 'all',
+        'hate','versatile', 'performance', 'quality', 'ensure', 'commit',
+        'forget', 'miss', 'take', 'endow', 'window', 'lamp',
+        'pen', 'eraser', 'delete', 'insert', 'sandal','camera', 'follow', 
         "handbags", "watches", "accessories", "buy now", "watch now", 
         "promotion", "discount", "special offer", "e-commerce", "smartphones", 
         "laptops", "tablets", "home appliances", "motorcycles", "cars", 
@@ -461,7 +473,32 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
         "chiropractor", "auto repair", "car wash", "delivery service", "food delivery", 
         "meal prep", "fitness equipment", "protein powder", "vegan diet", "keto diet", 
         "gluten-free", "organic food", "sustainable", "eco-friendly", "handmade", 
-        "jewelry", "sunglasses", "cosmetics", "makeup", "hair care"
+        "jewelry", "sunglasses", "cosmetics", "makeup", "hair care",
+
+        // --- TỪ KHÓA MỚI (Bổ sung thêm) ---
+        // Các "hook" quảng cáo / Khuyến mãi
+        "free shipping", "freeship", "50% off", "limited time", "grab yours", "shop now", 
+        "order today", "best seller", "top rated", "trending", "viral", "must have", 
+        "giveaway", "exclusive deal", "flash sale", "clearance", "last chance",
+        "new arrival", "premium quality", "affordable", "money back guarantee",
+
+        // Sản phẩm / Niche thị trường
+        "smart watch", "wireless earbuds", "power bank", "phone case", "gadget", 
+        "smart home", "led lights", "projector", "dash cam", "car accessories",
+        "backpack", "sneakers", "activewear", "leggings", "yoga mat", "dumbbells",
+        "massage gun", "posture corrector", "orthopedic shoes", "anti-aging",
+        "whitening", "hair loss", "beard grooming", "fragrance", "essential oils",
+        "kitchen gadgets", "air fryer", "blender", "coffee maker", "water bottle",
+        "camping gear", "hiking boots", "fishing rod", "survival kit",
+        
+        // Dịch vụ / Kinh doanh / B2B
+        "marketing agency", "seo services", "lead generation", "web design", "app development",
+        "b2b", "startup", "scale your business", "passive income", "trading", 
+        "forex", "stock market", "investment", "real estate agent", "business coaching",
+
+        // Từ khóa chung chung (dễ quét trúng nhiều camp rộng)
+        "discover", "secret", "hack", "tips and tricks", "how to", "tutorial", 
+        "lifestyle", "luxury", "cheap", "save money", "glow up", "transformation"
     ];
 
     let keywordRetries = 0;
