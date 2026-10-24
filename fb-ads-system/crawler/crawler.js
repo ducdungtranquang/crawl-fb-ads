@@ -19,20 +19,18 @@ global.setTimeout = function (callback, delay, ...args) {
 
 process.env.TZ = 'UTC';
 
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.0.125:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.100.7:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
 const DB_NAME = 'fb_ads';
 
 const USER_DATA_DIR = './chrome-profile-mac';
-const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const STORAGE_PATH = path.join(__dirname, '..', '..', 'storage', 'images');
-const PROFILE = 'Default';
 
 const SEEN_THRESHOLD = 10 * 60 * 1000;
 const DETAIL_HISTORY_LIMIT = 200;
-const MAX_ADS_PER_KEYWORD = parseInt(process.env.MAX_ADS_PER_KEYWORD || '300', 10);
+const MAX_ADS_PER_KEYWORD = parseInt(process.env.MAX_ADS_PER_KEYWORD || '1400', 10);
 const MAX_SCROLLS_PER_KEYWORD = parseInt(process.env.MAX_SCROLLS_PER_KEYWORD || '60', 10);
-const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10); 
-const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10); 
+const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10);
+const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10);
 const MAX_RETRIES_PER_KEYWORD = 2;
 
 let db;
@@ -40,19 +38,15 @@ const seen = new Set();
 let lastSavedAt = Date.now();
 let isRateLimited = false;
 
-const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0'
-];
-
-function getRandomUA() {
-    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
-
 fs.mkdirSync(STORAGE_PATH, { recursive: true });
+
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+];
 
 function randomDelay(min = 2000, max = 4000) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -60,6 +54,10 @@ function randomDelay(min = 2000, max = 4000) {
 
 function randomInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function getRandomUserAgent() {
+    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
 function normalize(text) {
@@ -114,7 +112,7 @@ function buildDetailEntry(ad, keyword = null, transparencyData = null) {
         start_date: ad.start_date || null,
         end_date: ad.end_date || null,
         is_active: ad.is_active ?? null,
-        collation_count: ad.collation_count || 1, 
+        collation_count: ad.collation_count || 1,
         normalized_text: normalize(ad.text || ''),
         signature: buildDetailSignature(ad),
         transparency: transparencyData || null
@@ -139,7 +137,7 @@ async function downloadThumbnail(page, imageUrl, adId) {
         const fileName = `${adId}.jpg`;
         const filePath = path.join(STORAGE_PATH, fileName);
         await fs.promises.writeFile(filePath, buffer);
-        return `/images/${fileName}`;
+        return `/images/${fileName}`; 
     } catch {
         return null;
     }
@@ -149,6 +147,7 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
     const col = db.collection('ads');
     const now = Date.now();
     const domain = extractDomain(ad.link);
+
     const existing = await col.findOne({ ad_archive_id: ad.ad_archive_id });
     let detailEntry = buildDetailEntry({ ...ad, domain }, keyword, transparencyData);
 
@@ -254,53 +253,32 @@ function extractAds(json) {
 
 async function applyStealth(page) {
     await page.addInitScript(() => {
-        const isMac = navigator.userAgent.includes('Mac');
-        
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'platform', { get: () => isMac ? 'MacIntel' : 'Win32' });
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
         Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
-        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => randomInt(4, 12) });
-        
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4] });
-        
-        window.chrome = {
-            runtime: {},
-            app: {},
-            csi: () => {}
-        };
-
+        window.chrome = { runtime: {} };
         const getParameter = WebGLRenderingContext.prototype.getParameter;
         WebGLRenderingContext.prototype.getParameter = function (param) {
             if (param === 37445) return 'Intel Inc.';
-            if (param === 37446) return isMac ? 'Intel Iris OpenGL Engine' : 'Intel(R) UHD Graphics 620';
+            if (param === 37446) return 'Intel Iris OpenGL Engine';
             return getParameter.call(this, param);
         };
-
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-        );
-        
-        function randomInt(min, max) {
-            return Math.floor(Math.random() * (max - min + 1)) + min;
-        }
     });
 }
 
 async function createBrowserContext(isDocker) {
     return await chromium.launchPersistentContext(USER_DATA_DIR, {
-        headless: true,
-        userAgent: getRandomUA(), 
+        headless: false,
+        channel: 'chrome',
+        executablePath: fs.existsSync('/usr/bin/google-chrome') ? '/usr/bin/google-chrome' : undefined,
+        userAgent: getRandomUserAgent(),
         viewport: { width: randomInt(1366, 1920), height: randomInt(768, 1080) },
+        locale: 'vi-VN',
+        timezoneId: 'Asia/Ho_Chi_Minh',
         args: [
-            `--profile-directory=${PROFILE}`,
             '--start-maximized',
             '--disable-blink-features=AutomationControlled',
-            '--disable-infobars', 
-            '--ignore-certificate-errors',
+            '--disable-web-security',
+            '--disable-features=IsolateOrigins,site-per-process',
             ...(isDocker ? ['--no-sandbox', '--disable-setuid-sandbox'] : [])
         ]
     });
@@ -329,11 +307,10 @@ async function dismissOverlays(page) {
 }
 
 async function scanKeyword(context, keyword, index, total) {
-    const page = await context.newPage({
-        viewport: { width: randomInt(1200, 1920), height: randomInt(700, 1080) }
-    });
-
+    const page = await context.newPage();
+    
     await applyStealth(page);
+
     lastSavedAt = Date.now();
     isRateLimited = false;
     let keywordAdsCount = 0;
@@ -431,20 +408,9 @@ async function scanKeyword(context, keyword, index, total) {
                 same = 0;
             }
             prev = curr;
-
             if (same >= 5) {
-                console.log(`⏳ [${keyword}] Không thấy cuộn thêm được. Đang đợi 5 giây kiểm tra lazy load...`);
-                await page.waitForTimeout(5000); 
-                
-                const checkFinal = await page.evaluate(() => document.body.scrollHeight);
-                if (checkFinal === curr) {
-                    console.log(`🏁 [${keyword}] Đã cuộn đến cuối kết quả tìm kiếm thực sự.`);
-                    break;
-                } else {
-                    console.log(`▶️ [${keyword}] Có dữ liệu mới load thêm, tiếp tục quét...`);
-                    same = 0; 
-                    prev = checkFinal;
-                }
+                console.log(`🏁 [${keyword}] Đã cuộn đến cuối kết quả tìm kiếm.`);
+                break;
             }
         }
     } catch (error) {
@@ -469,20 +435,49 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
     let context = await createBrowserContext(isDocker);
 
     const keywords = [
-        // Các cụm từ ngách cũ (Tiếng Việt)
-        'thực phẩm chức năng', 'giảm cân', 'kem chống nắng', 'trà sữa', 'cafe', 'bất động sản', 'quần áo', 'giày dép', 'túi xách', 'đồng hồ', 'phụ kiện', 'mua ngay', 'xem ngay', 'khuyến mãi', 'giảm giá', 'ưu đãi', 'thương mại điện tử', 'điện thoại', 'laptop', 'máy tính bảng', 'thiết bị gia dụng', 'xe máy', 'ô tô', 'du lịch', 'khách sạn', 'resort', 'spa', 'làm đẹp', 'nội thất', 'trang trí nhà cửa', 'đồ gia dụng', 'sức khỏe', 'thể thao', 'gym', 'yoga', 'chăm sóc da', 'thời trang thiết kế', 'dược', 'thuốc', 'vitamin', 'thảo dược', 'sản phẩm chăm sóc sức khỏe', 'ăn vặt', 'nhà hàng', 'buffet', 'đồ ăn healthy', 'miễn phí vận chuyển', 'xả kho', 'thanh lý', 'giá sốc', 'chính hãng', 'bảo hành', 'trị mụn', 'nám', 'tàn nhang', 'rụng tóc', 'mẹ và bé', 'sữa bột', 'đồ chơi trẻ em', 'bỉm', 'phong thủy', 'vòng tay phong thủy', 'sim số đẹp', 'vay tiền', 'tín dụng', 'chứng khoán', 'đầu tư', 'việc làm', 'tuyển dụng', 'tiếng anh giao tiếp', 'gia sư', 'nha khoa', 'niềng răng', 'bọc răng sứ', 'thẩm mỹ viện', 'nâng mũi', 'cắt mí', 'phun xăm', 'camera hành trình', 'đồ chơi ô tô', 'phụ tùng', 'nông sản', 'hạt điều', 'trái cây sấy', 'đặc sản', 'bảo hiểm nhân thọ', 'xuất khẩu lao động', 'định cư', 'visa', 'thiết kế nội thất', 'xây nhà trọn gói', 'sửa nhà', 'xưởng sỉ', 'nguồn hàng',
-        
-        // Bổ sung cụm 1 từ (Đồ vật, thời trang, mỹ phẩm)
-        'áo', 'quần', 'váy', 'đầm', 'giày', 'dép', 'túi', 'ví', 'mũ', 'nón', 'kính', 'nhẫn', 'vòng', 'khuyên', 'dây', 'son', 'phấn', 'kem', 'serum', 'mụn', 'thâm', 'sẹo', 'nám', 'trắng', 'tóc', 'da', 'móng', 'hương', 'hoa', 'sách', 'bút', 'vở',
-        
-        // Bổ sung cụm 1 từ (Nội thất, gia dụng, ẩm thực)
-        'bàn', 'ghế', 'giường', 'tủ', 'kệ', 'đèn', 'quạt', 'bếp', 'nồi', 'chảo', 'dao', 'kéo', 'chén', 'bát', 'đũa', 'cốc', 'ly', 'rượu', 'bia', 'thịt', 'cá', 'rau', 'gạo', 'sữa', 'bánh', 'kẹo', 'kem', 'trà', 'thuốc',
-        
-        // Bổ sung cụm 1 từ (Dịch vụ, tài sản, thú cưng, nông nghiệp, xây dựng)
-        'tiền', 'vàng', 'bạc', 'đất', 'nhà', 'xe', 'phòng', 'vé', 'tour', 'app', 'web', 'game', 'thẻ', 'sim', 'mạng', 'gói', 'chó', 'mèo', 'chim', 'cá', 'cây', 'hoa', 'lan', 'phân', 'giống', 'bơm', 'máy', 'sửa', 'thợ', 'kéo', 'nhựa', 'sắt', 'thép', 'gỗ', 'kính', 'rèm', 'thảm', 'nệm', 'chăn', 'ga', 'gối',
-        
-        // Bổ sung cụm 1 từ (Từ khóa giật tít, hành động, tính từ mạnh)
-        'rẻ', 'tặng', 'sale', 'hot', 'mới', 'đẹp', 'bền', 'chắc', 'nhanh', 'gấp', 'vay', 'lãi', 'chuẩn', 'xịn', 'vip', 'sỉ', 'lẻ', 'kho'
+        // Khoảng 150 CỤM 1 TỪ
+        'áo', 'quần', 'váy', 'đầm', 'giày', 'dép', 'mũ', 'nón', 'ví', 'túi', 
+        'balo', 'son', 'phấn', 'kem', 'da', 'mụn', 'nám', 'sẹo', 'tóc', 'môi', 
+        'mắt', 'mũi', 'trà', 'sữa', 'nước', 'bia', 'rượu', 'thịt', 'cá', 'rau', 
+        'cơm', 'bún', 'phở', 'bánh', 'kẹo', 'cam', 'táo', 'bàn', 'ghế', 'giường', 
+        'tủ', 'kệ', 'nệm', 'chăn', 'ga', 'gối', 'rèm', 'thảm', 'nồi', 'chảo', 
+        'bát', 'đũa', 'cốc', 'ly', 'dao', 'kéo', 'quạt', 'đèn', 'bếp', 'máy', 
+        'khoan', 'búa', 'vít', 'đinh', 'thép', 'sắt', 'nhôm', 'kính', 'gỗ', 'nhựa', 
+        'đá', 'gạch', 'xe', 'phanh', 'lốp', 'dầu', 'nhớt', 'gương', 'còi', 'khóa', 
+        'bạt', 'đất', 'nền', 'nhà', 'phố', 'xưởng', 'kho', 'vườn', 'hồ', 'sông', 
+        'biển', 'cát', 'sỏi', 'chó', 'mèo', 'gà', 'lợn', 'bò', 'chim', 'tôm', 
+        'cua', 'ốc', 'vàng', 'bạc', 'đồng', 'len', 'lụa', 'bông', 'vải', 'sợi', 
+        'chỉ', 'xốp', 'giấy', 'bìa', 'mực', 'rẻ', 'đẹp', 'bền', 'tốt', 'xịn', 
+        'mới', 'cũ', 'sang', 'hot', 'hit', 'trend', 'sale', 'sốc', 'giảm', 'giá', 
+        'free', 'ship', 'sỉ', 'lẻ', 'vay', 'app', 'web', 'game', 'sim', 'thẻ', 
+        'thuốc', 'lan', 'chậu', 'phân', 'giống', 'hoa', 'sách', 'bút',
+
+        // Khoảng 125 CỤM NHIỀU TỪ
+        'miễn phí vận chuyển', 'giảm giá sốc', 'xả kho', 'thanh lý', 'mua một tặng một', 
+        'nhận hàng thanh toán', 'kiểm tra hàng', 'freeship toàn quốc', 'bảo hành chính hãng', 
+        'hoàn tiền', 'cam kết chất lượng', 'siêu sale', 'giờ vàng', 'thực phẩm chức năng', 
+        'kem chống nắng', 'sữa rửa mặt', 'trị mụn tận gốc', 'trắng da tự nhiên', 'rụng tóc', 
+        'hói đầu', 'giảm cân an toàn', 'trà thảo mộc', 'đông y', 'thuốc nam', 'collagen', 
+        'tẩy tế bào chết', 'serum dưỡng da', 'bất động sản', 'nhà đất', 'chung cư', 'biệt thự', 
+        'liền kề', 'đất nền', 'cho thuê phòng', 'mặt bằng kinh doanh', 'thiết kế nội thất', 
+        'thi công trọn gói', 'sửa chữa nhà', 'chống thấm', 'trần thạch cao', 'sơn nước', 
+        'thời trang nữ', 'thời trang nam', 'đồ trẻ em', 'mẹ và bé', 'quần áo sơ sinh', 
+        'bỉm sữa', 'đồ chơi thông minh', 'xe đẩy trẻ em', 'thời trang công sở', 'đầm dự tiệc', 
+        'áo thun nam', 'quần jean', 'đồ lót', 'đồ ngủ', 'đồ gia dụng', 'thiết bị thông minh', 
+        'robot lau nhà', 'nồi chiên không dầu', 'máy lọc nước', 'máy lạnh', 'tủ lạnh', 'tivi', 
+        'máy giặt', 'bếp từ', 'máy xay sinh tố', 'chảo chống dính', 'đèn năng lượng mặt trời', 
+        'xuất khẩu lao động', 'du học', 'định cư', 'visa', 'tour du lịch', 'vé máy bay', 
+        'phòng khách sạn', 'homestay', 'resort', 'nhà hàng', 'tiệc cưới', 'sinh nhật', 
+        'hội nghị', 'team building', 'hải sản tươi sống', 'vay tiền nhanh', 'tín dụng', 
+        'mở thẻ', 'chứng khoán', 'đầu tư', 'học tiếng anh', 'giao tiếp', 'luyện thi ielts', 
+        'gia sư', 'khóa học online', 'marketing', 'lập trình', 'thiết kế đồ họa', 'content', 
+        'chạy ads', 'nha khoa', 'niềng răng', 'bọc răng sứ', 'nhổ răng khôn', 'tẩy trắng răng', 
+        'thẩm mỹ viện', 'cắt mí', 'nâng mũi', 'phun xăm', 'trị sẹo', 'gội đầu dưỡng sinh', 
+        'massage', 'spa làm đẹp', 'tiêm filler', 'botox', 'camera hành trình', 'phụ kiện ô tô', 
+        'đồ chơi xe hơi', 'màn hình android', 'dán phim cách nhiệt', 'bọc ghế da', 'phủ ceramic', 
+        'rửa xe', 'sửa chữa ô tô', 'bảo dưỡng xe', 'cứu hộ giao thông', 'phong thủy', 
+        'vòng trầm hương', 'tỳ hưu', 'sim số đẹp', 'sim phong thủy', 'tài lộc', 'may mắn', 
+        'bình an', 'tử vi', 'bói toán', 'xem ngày tốt', 'quà tặng doanh nghiệp', 'kỷ niệm chương'
     ];
 
     let keywordRetries = 0;
@@ -497,10 +492,11 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
                 console.log(`⏳ [${keyword}] Gặp lỗi / Rate Limit (thử lại lần ${keywordRetries}/${MAX_RETRIES_PER_KEYWORD}). Tạm dừng hệ thống 3 phút rồi thử lại...`);
                 try { await context.close(); } catch { }
                 await new Promise(resolve => setTimeout(resolve, 3 * 60 * 1000));
+                
                 context = await createBrowserContext(isDocker);
                 i--; 
             } else {
-                console.warn(`⚠️ [${keyword}] Đã thử lại ${MAX_RETRIES_PER_KEYWORD} lần thất bại. Bỏ qua từ khóa này để tiếp tục từ khóa kế tiếp!`);
+                console.warn(`⚠️ [${keyword}] Đã thử lại ${MAX_RETRIES_PER_KEYWORD} lần thất bại. Bỏ qua từ khóa này để tiếp tục!`);
                 keywordRetries = 0;
                 await new Promise(resolve => setTimeout(resolve, 15000));
             }
