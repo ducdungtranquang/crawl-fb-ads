@@ -118,22 +118,31 @@ function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1) {
   }
 
   // 3. Phân tầng Ngân sách Cơ sở (Tier Dynamic Allocation)
-  let bBase = 35.0; // Phân khúc Scale
+  const TIERS = [1.5, 8.0, 35.0]; // duy trì/nuôi page, Standard, Scale
+  let bBase = 35.0;
   if (T > 30 && D <= 2) {
-    bBase = 1.5;  // Phân khúc duy trì/nuôi page
+    bBase = 1.5;
   } else if (T > 10 && D <= 3) {
-    bBase = 8.0;  // Phân khúc Standard Budget
+    bBase = 8.0;
   }
 
   const fT = 1.0 + 0.12 * Math.log(T);
 
-  // 4. Tính toán Ngân sách Chi tiêu
-  let estimatedSpend = D * T * bBase * mInd * fT;
-  estimatedSpend = Math.max(estimatedSpend, 1.0 * T); // Tối thiểu $1/ngày
+  // 4. Tính toán Ngân sách Chi tiêu — trả về KHOẢNG (min–max) thay vì 1 số điểm.
+  // Khoảng phản ánh độ bất định lớn nhất của mô hình: việc xếp tier (bBase).
+  // min = tier dưới, max = tier trên; ở tier biên thì nhân 0.5 / 1.5.
+  const spendFor = (b) => Math.max(D * T * b * mInd * fT, 1.0 * T); // Tối thiểu $1/ngày
+  const estimatedSpend = spendFor(bBase);
+  const tierIdx = TIERS.indexOf(bBase);
+  const bLow = tierIdx > 0 ? TIERS[tierIdx - 1] : bBase * 0.5;
+  const bHigh = tierIdx < TIERS.length - 1 ? TIERS[tierIdx + 1] : bBase * 1.5;
+  const spendMin = Math.min(estimatedSpend, spendFor(bLow));
+  const spendMax = Math.max(estimatedSpend, spendFor(bHigh));
 
-  // 5. Tính toán Số lượt tiếp cận
+  // 5. Tính toán Số lượt tiếp cận (kéo theo khoảng của spend)
   const frequency = 1.15;
-  const estimatedReach = Math.round((estimatedSpend / (cpm * frequency)) * 1000);
+  const reachFor = (s) => Math.round((s / (cpm * frequency)) * 1000);
+  const estimatedReach = reachFor(estimatedSpend);
 
   let spendLevel = 'LOW';
   if (estimatedSpend >= 1000) spendLevel = 'VERY HIGH';
@@ -142,7 +151,11 @@ function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1) {
 
   return {
     estimated_spend_usd: Number(estimatedSpend.toFixed(1)),
+    estimated_spend_min_usd: Number(spendMin.toFixed(1)),
+    estimated_spend_max_usd: Number(spendMax.toFixed(1)),
     estimated_reach: estimatedReach,
+    estimated_reach_min: reachFor(spendMin),
+    estimated_reach_max: reachFor(spendMax),
     estimated_spend: spendLevel,
     cpm_used: cpm
   };
@@ -184,7 +197,7 @@ function analyzeAllAdsGlobally(ads) {
     const pageName = ad.page_name || 'unknown';
 
     pageMap[pageName] = (pageMap[pageName] || 0) + 1;
-    textMap[text] = (textMap[text] || 0) + 1;
+    if (text) textMap[text] = (textMap[text] || 0) + 1; // text rỗng không đếm (tránh phình D)
     if (domain) domainMap[domain] = (domainMap[domain] || 0) + 1;
   }
 
@@ -195,13 +208,19 @@ function analyzeAllAdsGlobally(ads) {
 
     const startDateMs = (ad.start_date ? ad.start_date * 1000 : ad.first_seen) || now;
     const durationDays = Math.max(1, (now - startDateMs) / (1000 * 3600 * 24));
-    const duplicatesCount = textMap[text] || ad.seen_count || 1;
+    // Duplicates: ưu tiên collation_count của Meta (nhóm creative do Meta gom),
+    // fallback về đếm trùng text tuyệt đối, rồi seen_count.
+    // GIẢ ĐỊNH: collation_count là kích thước nhóm TÍNH CẢ ad này.
+    // Nếu crawler của bạn đếm collation_count chỉ tính sibling (không tính chính nó)
+    // thì đổi thành (ad.collation_count + 1).
+    const dupFromText = text ? (textMap[text] || 0) : 0;
+    const duplicatesCount = Math.max(1, Math.round(ad.collation_count || dupFromText || ad.seen_count || 1));
 
     const spendReachData = estimateSpendAndReach(ad, durationDays, duplicatesCount);
 
     let score = 0;
     const pageAds = pageMap[ad.page_name] || 0;
-    const clones = textMap[text] || 0;
+    const clones = duplicatesCount; // nhất quán với D dùng trong mô hình spend
     const domainAds = domainMap[domain] || 0;
 
     if (durationDays > 3) score += 2;
@@ -257,16 +276,43 @@ function analyzeAllAdsGlobally(ads) {
     return {
       ...ad,
       domain,
+      ad_library_url: ad.ad_archive_id ? `https://www.facebook.com/ads/library/?id=${ad.ad_archive_id}` : null,
       score,
       duration_days: Math.round(durationDays),
       duplicates_count: duplicatesCount,
+      page_ads_count: pageAds,
+      domain_ads_count: domainAds,
+      clones_count: clones,
       level: score >= 50 ? '🏆 LEGEND' : score >= 30 ? '🔥 WINNER' : score >= 15 ? '⚡ POTENTIAL' : 'REGULAR',
       scaling_score: scalingScore,
       trending_score: trendingScore,
       estimated_spend_usd: spendReachData.estimated_spend_usd,
+      estimated_spend_min_usd: spendReachData.estimated_spend_min_usd,
+      estimated_spend_max_usd: spendReachData.estimated_spend_max_usd,
       estimated_reach: spendReachData.estimated_reach,
+      estimated_reach_min: spendReachData.estimated_reach_min,
+      estimated_reach_max: spendReachData.estimated_reach_max,
       estimated_spend: spendReachData.estimated_spend,
       cpm_used: spendReachData.cpm_used,
+      // Tín hiệu thô để sau này build bộ lọc "Quảng cáo mới lên",
+      // "Ready to Scale", "Đang chạy mạnh". Ngưỡng chỉ là gợi ý,
+      // chỉnh khi build filter thật.
+      filter_signals: {
+        age_days: Math.round(durationDays),
+        is_new: durationDays <= 7,
+        recent_minutes: Math.round(recentMinutes),
+        is_recently_seen: recentMinutes < 60,
+        duplicates_count: duplicatesCount,
+        page_ads_count: pageAds,
+        domain_ads_count: domainAds,
+        scaling_score: scalingScore,
+        trending_score: trendingScore,
+        burst,
+        delta,
+        smooth_delta: smooth,
+        spend_min_usd: spendReachData.estimated_spend_min_usd,
+        spend_max_usd: spendReachData.estimated_spend_max_usd
+      },
       scaling_level: scalingScore >= 12 ? '🚀 SCALING HARD' : scalingScore >= 6 ? '⚡ SCALING' : 'NORMAL',
       delta,
       smooth_delta: smooth,
@@ -282,22 +328,30 @@ function analyzeAllAdsGlobally(ads) {
 
 // ===== DATABASE BULK WRITES =====
 async function updateAdsCollection(col, analyzedAds) {
-  const bulk = analyzedAds.map(ad => ({
-    updateOne: {
-      filter: { ad_archive_id: ad.ad_archive_id },
-      update: {
-        $set: {
-          ...ad,
-          analyzed_at: Date.now()
-        }
-      },
-      upsert: true
-    }
-  }));
+  const ops = [];
+  for (const ad of analyzedAds) {
+    if (!ad.ad_archive_id) continue; // thiếu ID thì bỏ qua (tránh gom nhầm khi upsert)
+    const { _id, ...rest } = ad; // _id của DB crawler không mang sang (tránh lỗi immutable _id)
+    ops.push({
+      updateOne: {
+        filter: { ad_archive_id: ad.ad_archive_id },
+        update: {
+          $set: {
+            ...rest, // ad_archive_id vẫn nằm trong document
+            analyzed_at: Date.now()
+          }
+        },
+        upsert: true
+      }
+    });
+  }
 
-  if (bulk.length) {
-    await col.bulkWrite(bulk);
-    console.log(`💾 [DB Ads] Đã cập nhật (Bulk Write) ${bulk.length} bản ghi.`);
+  // Chia nhỏ bulk (giới hạn ~1000 op/lần) để tránh vượt message 16MB của Mongo
+  for (let i = 0; i < ops.length; i += 1000) {
+    await col.bulkWrite(ops.slice(i, i + 1000));
+  }
+  if (ops.length) {
+    console.log(`💾 [DB Ads] Đã cập nhật (Bulk Write) ${ops.length} bản ghi.`);
   }
 }
 
@@ -327,14 +381,14 @@ async function updateProductsCollection(db, analyzedAds) {
       updateOne: {
         filter: { domain: p.domain },
         update: {
+          // Dùng $set (không phải $inc): các chỉ số này được tính lại toàn bộ
+          // mỗi vòng, $inc sẽ cộng dồn vô hạn theo số vòng lặp.
           $set: {
             updated_at: Date.now(),
-            total_spend_usd: Number(totalSpendUsd.toFixed(1))
-          },
-          $inc: {
+            total_spend_usd: Number(totalSpendUsd.toFixed(1)),
             total_ads: totalAds,
             total_pages: pages,
-            total_score: totalScore,
+            total_score: Number(totalScore.toFixed(1)),
             winning_ads: winningAdsCount,
             product_score: productScore
           }
@@ -354,10 +408,11 @@ async function updateProductsCollection(db, analyzedAds) {
 async function syncToElasticsearch(esClient, analyzedAds) {
   if (!analyzedAds || analyzedAds.length === 0) return;
 
-  const operations = analyzedAds.flatMap(ad => {
-    const adId = String(ad.ad_archive_id);
-    const document = {
-      ad_archive_id: adId,
+  const docs = analyzedAds
+    .filter(ad => ad.ad_archive_id)
+    .map(ad => ({
+      ad_archive_id: String(ad.ad_archive_id),
+      ad_library_url: ad.ad_library_url || '',
       text: ad.text || '',
       headline: ad.headline || '',
       description: ad.description || '',
@@ -367,29 +422,40 @@ async function syncToElasticsearch(esClient, analyzedAds) {
       score: ad.score ?? 0,
       level: ad.level || '',
       estimated_spend_usd: ad.estimated_spend_usd || 0,
+      estimated_spend_min_usd: ad.estimated_spend_min_usd || 0,
+      estimated_spend_max_usd: ad.estimated_spend_max_usd || 0,
       estimated_reach: ad.estimated_reach || 0,
+      estimated_reach_min: ad.estimated_reach_min || 0,
+      estimated_reach_max: ad.estimated_reach_max || 0,
       estimated_spend: ad.estimated_spend || '',
+      duplicates_count: ad.duplicates_count || 1,
+      duration_days: ad.duration_days || 0,
+      scaling_score: ad.scaling_score || 0,
+      trending_score: ad.trending_score || 0,
       funnel: ad.funnel || '',
       scaling_level: ad.scaling_level || ''
-    };
+    }));
 
-    return [
-      { index: { _index: ELASTIC_INDEX, _id: adId } },
-      document
-    ];
-  });
-
-  try {
-    const response = await esClient.bulk({ refresh: false, operations });
-    if (response.errors) {
-      console.error(`⚠️ [Elasticsearch Sync] Có lỗi xảy ra ở một số document khi đồng bộ.`);
+  let allOk = true;
+  for (let i = 0; i < docs.length; i += 1000) {
+    const chunk = docs.slice(i, i + 1000);
+    const operations = chunk.flatMap(ad => [
+      { index: { _index: ELASTIC_INDEX, _id: ad.ad_archive_id } },
+      ad
+    ]);
+    try {
+      const response = await esClient.bulk({ refresh: false, operations });
+      if (response.errors) {
+        allOk = false;
+        const failed = (response.items || []).filter(it => it.index?.error).slice(0, 5);
+        console.error(`⚠️ [Elasticsearch Sync] Có document lỗi (hiện 5 đầu):`, JSON.stringify(failed).slice(0, 1000));
+      }
+    } catch (error) {
+      console.error('❌ [Elasticsearch Sync] Lỗi nghiêm trọng:', error?.message || error);
       return false;
     }
-    return true;
-  } catch (error) {
-    console.error('❌ [Elasticsearch Sync] Lỗi nghiêm trọng:', error?.message || error);
-    return false;
   }
+  return allOk;
 }
 
 async function ensureIndexExists(esClient) {
@@ -420,8 +486,17 @@ async function ensureIndexExists(esClient) {
         score: { type: 'double' },
         level: { type: 'keyword' },
         estimated_spend_usd: { type: 'double' },
+        estimated_spend_min_usd: { type: 'double' },
+        estimated_spend_max_usd: { type: 'double' },
         estimated_reach: { type: 'long' },
+        estimated_reach_min: { type: 'long' },
+        estimated_reach_max: { type: 'long' },
         estimated_spend: { type: 'keyword' },
+        duplicates_count: { type: 'long' },
+        duration_days: { type: 'double' },
+        scaling_score: { type: 'double' },
+        trending_score: { type: 'double' },
+        ad_library_url: { type: 'keyword' },
         funnel: { type: 'keyword' },
         scaling_level: { type: 'keyword' },
         start_date: { type: 'date', format: 'epoch_second' },
