@@ -184,22 +184,31 @@ function summarizeDetailHistory(ad) {
   };
 }
 
+// Cộng dồn 1 ad vào các map đếm toàn cục (dùng chung cho pass 1 và fallback)
+function countIntoMaps(maps, ad) {
+  const text = ad.normalized_text || normalize(ad.text || '');
+  const domain = extractDomain(ad.link);
+  const pageName = ad.page_name || 'unknown';
+
+  maps.pageMap[pageName] = (maps.pageMap[pageName] || 0) + 1;
+  if (text) maps.textMap[text] = (maps.textMap[text] || 0) + 1; // text rỗng không đếm (tránh phình D)
+  if (domain) maps.domainMap[domain] = (maps.domainMap[domain] || 0) + 1;
+}
+
+function emptyMaps() {
+  return { pageMap: {}, textMap: {}, domainMap: {} };
+}
+
 // ===== CORE ANALYZE PROCESS =====
-function analyzeAllAdsGlobally(ads) {
+function analyzeAllAdsGlobally(ads, globalMaps) {
   const now = Date.now();
-  const pageMap = {};
-  const textMap = {};
-  const domainMap = {};
-
-  for (const ad of ads) {
-    const text = ad.normalized_text || normalize(ad.text || '');
-    const domain = extractDomain(ad.link);
-    const pageName = ad.page_name || 'unknown';
-
-    pageMap[pageName] = (pageMap[pageName] || 0) + 1;
-    if (text) textMap[text] = (textMap[text] || 0) + 1; // text rỗng không đếm (tránh phình D)
-    if (domain) domainMap[domain] = (domainMap[domain] || 0) + 1;
+  // Có globalMaps (từ pass 1) thì dùng luôn — số liệu đúng toàn cục kể cả khi
+  // xử lý theo batch. Không có thì tự đếm trong batch (hành vi cũ).
+  const maps = globalMaps || emptyMaps();
+  if (!globalMaps) {
+    for (const ad of ads) countIntoMaps(maps, ad);
   }
+  const { pageMap, textMap, domainMap } = maps;
 
   return ads.map(ad => {
     const text = ad.normalized_text || normalize(ad.text || '');
@@ -208,7 +217,11 @@ function analyzeAllAdsGlobally(ads) {
 
     const startDateMs = (ad.start_date ? ad.start_date * 1000 : ad.first_seen) || now;
     const durationDays = Math.max(1, (now - startDateMs) / (1000 * 3600 * 24));
-    
+    // Duplicates: ưu tiên collation_count của Meta (nhóm creative do Meta gom),
+    // fallback về đếm trùng text tuyệt đối, rồi seen_count.
+    // GIẢ ĐỊNH: collation_count là kích thước nhóm TÍNH CẢ ad này.
+    // Nếu crawler của bạn đếm collation_count chỉ tính sibling (không tính chính nó)
+    // thì đổi thành (ad.collation_count + 1).
     const dupFromText = text ? (textMap[text] || 0) : 0;
     const duplicatesCount = Math.max(1, Math.round(ad.collation_count || dupFromText || ad.seen_count || 1));
 
@@ -290,6 +303,9 @@ function analyzeAllAdsGlobally(ads) {
       estimated_reach_max: spendReachData.estimated_reach_max,
       estimated_spend: spendReachData.estimated_spend,
       cpm_used: spendReachData.cpm_used,
+      // Tín hiệu thô để sau này build bộ lọc "Quảng cáo mới lên",
+      // "Ready to Scale", "Đang chạy mạnh". Ngưỡng chỉ là gợi ý,
+      // chỉnh khi build filter thật.
       filter_signals: {
         age_days: Math.round(durationDays),
         is_new: durationDays <= 7,
@@ -323,14 +339,14 @@ function analyzeAllAdsGlobally(ads) {
 async function updateAdsCollection(col, analyzedAds) {
   const ops = [];
   for (const ad of analyzedAds) {
-    if (!ad.ad_archive_id) continue;
-    const { _id, ...rest } = ad;
+    if (!ad.ad_archive_id) continue; // thiếu ID thì bỏ qua (tránh gom nhầm khi upsert)
+    const { _id, ...rest } = ad; // _id của DB crawler không mang sang (tránh lỗi immutable _id)
     ops.push({
       updateOne: {
         filter: { ad_archive_id: ad.ad_archive_id },
         update: {
           $set: {
-            ...rest,
+            ...rest, // ad_archive_id vẫn nằm trong document
             analyzed_at: Date.now()
           }
         },
@@ -339,6 +355,7 @@ async function updateAdsCollection(col, analyzedAds) {
     });
   }
 
+  // Chia nhỏ bulk (giới hạn ~1000 op/lần) để tránh vượt message 16MB của Mongo
   for (let i = 0; i < ops.length; i += 1000) {
     await col.bulkWrite(ops.slice(i, i + 1000));
   }
@@ -347,39 +364,39 @@ async function updateAdsCollection(col, analyzedAds) {
   }
 }
 
-async function updateProductsCollection(db, analyzedAds) {
-  const col = db.collection('products');
-  const map = {};
-
+// Gom số liệu products theo domain — chỉ giữ TỔNG, không giữ ad (nhẹ RAM,
+// gom xuyên suốt bao nhiêu batch cũng được, ghi 1 lần cuối vòng).
+function accumulateProductStats(map, analyzedAds) {
   for (const ad of analyzedAds) {
     if (!ad.domain) continue;
-    if (!map[ad.domain]) {
-      map[ad.domain] = { domain: ad.domain, ads: [], pages: new Set() };
-    }
-    map[ad.domain].ads.push(ad);
-    map[ad.domain].pages.add(ad.page_name);
+    let s = map[ad.domain];
+    if (!s) s = map[ad.domain] = { domain: ad.domain, totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, totalSpendUsd: 0 };
+    s.totalAds++;
+    s.pages.add(ad.page_name);
+    s.totalScore += ad.score || 0;
+    if (ad.level === '🔥 WINNER' || ad.level === '🏆 LEGEND') s.winningAdsCount++;
+    s.totalSpendUsd += ad.estimated_spend_usd || 0;
   }
+  return map;
+}
 
-  const bulk = Object.values(map).map(p => {
-    const totalAds = p.ads.length;
-    const pages = p.pages.size;
-    const totalScore = p.ads.reduce((sum, ad) => sum + (ad.score || 0), 0);
-    const winningAdsCount = p.ads.filter(ad => ad.level === '🔥 WINNER' || ad.level === '🏆 LEGEND').length;
-    const totalSpendUsd = p.ads.reduce((sum, ad) => sum + (ad.estimated_spend_usd || 0), 0);
-
-    const productScore = Number((totalScore + pages * 2 + winningAdsCount * 5).toFixed(1));
-
+// Ghi map products đã gom đủ — $set toàn bộ (không $inc).
+async function flushProductsCollection(db, map) {
+  const col = db.collection('products');
+  const bulk = Object.values(map).map(s => {
+    const pages = s.pages.size;
+    const productScore = Number((s.totalScore + pages * 2 + s.winningAdsCount * 5).toFixed(1));
     return {
       updateOne: {
-        filter: { domain: p.domain },
+        filter: { domain: s.domain },
         update: {
           $set: {
             updated_at: Date.now(),
-            total_spend_usd: Number(totalSpendUsd.toFixed(1)),
-            total_ads: totalAds,
+            total_spend_usd: Number(s.totalSpendUsd.toFixed(1)),
+            total_ads: s.totalAds,
             total_pages: pages,
-            total_score: Number(totalScore.toFixed(1)),
-            winning_ads: winningAdsCount,
+            total_score: Number(s.totalScore.toFixed(1)),
+            winning_ads: s.winningAdsCount,
             product_score: productScore
           }
         },
@@ -392,6 +409,11 @@ async function updateProductsCollection(db, analyzedAds) {
     await col.bulkWrite(bulk);
     console.log(`🔥 [DB Products] Đã tổng hợp ${bulk.length} sản phẩm/domain.`);
   }
+}
+
+async function updateProductsCollection(db, analyzedAds) {
+  // Wrapper giữ tương thích: gom rồi ghi ngay (dùng khi xử lý 1 cục, không batch).
+  await flushProductsCollection(db, accumulateProductStats({}, analyzedAds));
 }
 
 // ===== ELASTICSEARCH SYNC =====
@@ -551,53 +573,56 @@ async function main() {
 
   console.log("⚡ [Analyzer] Hệ thống đã sẵn sàng. Bắt đầu vòng lặp quét dữ liệu...");
 
-  // Hàm quét định kỳ thay thế Consumer
+  // Hàm quét định kỳ thay thế Consumer — 2 lượt, bảo vệ RAM mà số vẫn chuẩn:
+  // lượt 1 chỉ đếm toàn cục (projection nhẹ), lượt 2 xử lý theo batch.
   async function runAnalyzeLoop() {
     while (true) {
       try {
         console.log(`\n🔍 [Scanner] Đang kiểm tra dữ liệu từ collection 'ads' trong db '${CRAWLER_DB_NAME}'...`);
 
-        // SỬ DỤNG CURSOR VÀ CHIA MẺ (BATCHING) CHỐNG TRÀN RAM
-        const cursor = rawAdsCol.find({});
-        let batch = [];
-        const BATCH_SIZE = 2500; // Số lượng quảng cáo nhét vào RAM mỗi lượt (Tối ưu cho 8GB RAM)
-        let totalProcessed = 0;
+        // PASS 1: quét nhẹ 1 lượt để đếm toàn cục (chỉ 4 field, không giữ document)
+        const maps = emptyMaps();
+        const statsCursor = rawAdsCol.find({}, {
+          projection: { normalized_text: 1, text: 1, page_name: 1, link: 1 }
+        });
+        for await (const a of statsCursor) countIntoMaps(maps, a);
 
+        // PASS 2: xử lý theo batch, dùng map toàn cục của pass 1
+        const BATCH_SIZE = 2500; // hạ xuống 1000 nếu RAM vẫn căng
+        let batch = [];
+        let totalProcessed = 0;
+        const productStats = {};
+
+        const flushBatch = async () => {
+          const processedAds = analyzeAllAdsGlobally(batch, maps);
+          accumulateProductStats(productStats, processedAds);
+          await updateAdsCollection(analyzedAdsCol, processedAds);
+          await syncToElasticsearch(esClient, processedAds);
+          totalProcessed += batch.length;
+          batch = []; // giải phóng RAM cho mẻ tiếp theo
+        };
+
+        const cursor = rawAdsCol.find({});
         for await (const rawAd of cursor) {
           batch.push(rawAd);
-
-          // Khi gom đủ một mẻ 2500 bài, mang đi phân tích và lưu DB
           if (batch.length >= BATCH_SIZE) {
             console.log(`📊 [Analyzer] Đang xử lý mẻ ${BATCH_SIZE} quảng cáo... (Đã quét ${totalProcessed})`);
-            const processedAds = analyzeAllAdsGlobally(batch);
-
-            await updateAdsCollection(analyzedAdsCol, processedAds);
-            await updateProductsCollection(analyzerDb, processedAds);
-            await syncToElasticsearch(esClient, processedAds);
-
-            totalProcessed += batch.length;
-            batch = []; // QUAN TRỌNG: Giải phóng RAM để nhét mẻ tiếp theo
+            await flushBatch();
           }
         }
-
-        // Xử lý nốt phần dư cuối cùng (nếu tổng số không chia hết cho 2500)
         if (batch.length > 0) {
           console.log(`📊 [Analyzer] Đang xử lý mẻ cuối cùng gồm ${batch.length} quảng cáo...`);
-          const processedAds = analyzeAllAdsGlobally(batch);
-
-          await updateAdsCollection(analyzedAdsCol, processedAds);
-          await updateProductsCollection(analyzerDb, processedAds);
-          await syncToElasticsearch(esClient, processedAds);
-
-          totalProcessed += batch.length;
+          await flushBatch();
         }
+
+        // Products: ghi 1 lần duy nhất, đủ toàn bộ vòng
+        await flushProductsCollection(analyzerDb, productStats);
 
         if (totalProcessed > 0) {
           console.log(`✅ [Analyzer] Hoàn thành vòng này! Đã phân tích an toàn tổng cộng ${totalProcessed} quảng cáo.`);
         } else {
           console.log(`💤 [Scanner] Chưa có dữ liệu quảng cáo nào từ Crawler.`);
         }
-
       } catch (err) {
         console.error("❌ [Loop Error] Có lỗi xảy ra trong quá trình phân tích vòng lặp:", err.message);
       }
