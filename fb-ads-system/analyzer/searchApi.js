@@ -34,14 +34,16 @@ function checkSpecialHeader(req, res, next) {
 // qua query param — xem FILTER_DEFAULTS.
 const FILTER_DEFAULTS = {
     new_max_days: 3,            // Ads mới lên: chạy <= 3 ngày
-    scale_min_days: 4,          // Ready to Scale: chạy khoảng 4-5 ngày
-    scale_max_days: 5,
-    scale_min_duplicates: 2,    // ... + có duplicate (đang nhân bản)
-    scale_min_scaling_score: 6, // ... + scaling_score đạt ngưỡng SCALING
-    winner_min_score: 30,       // Weekly Winner: đạt level WINNER
-    winner_min_trending: 10,
-    winner_min_duplicates: 2,
-    winner_min_days: 3,
+    scale_min_days: 3,          // Ready to Scale: chạy 3-7 ngày (giai đoạn trước winner)
+    scale_max_days: 7,
+    scale_min_duplicates: 2,    // ... + creative đã bị duplicate (đang nhân bản)
+    scale_min_scaling_score: 0, // 0 = không ràng buộc scaling_score (chỉ sort theo nó)
+    winner_min_days: 7,         // Weekly Winner: chạy >= 7 ngày không tắt
+    winner_max_days: 0,         // 0 = không giới hạn trên (chạy càng lâu càng win)
+    winner_min_duplicates: 2,   // ... + có duplicate (duplicates_count tính cả chính ad)
+    winner_min_score: 20,       // ... + (score cao HOẶC trending cao)
+    winner_min_trending: 8,
+    winner_max_seen_age_days: 7, // ... + còn thấy trong 7 ngày qua (0 = không ràng buộc)
 };
 
 function numParam(value, fallback) {
@@ -100,21 +102,46 @@ function buildPresetConditions(presets, q) {
                 duration_days: { $lte: numParam(q.new_max_days, FILTER_DEFAULTS.new_max_days) },
             });
         } else if (p === 'ready_to_scale' || p === 'scale') {
-            conds.push({
+            // Dấu hiệu sắp scale: còn non (3-7 ngày) nhưng creative đã bị
+            // duplicate — nhà quảng cáo đang nhân bản. scaling_score chỉ dùng
+            // để sort, không ép ngưỡng vì growth_history mỏng thì điểm này
+            // hiếm khi lên cao (trừ khi truyền scale_min_scaling_score > 0).
+            const cond = {
                 duration_days: {
                     $gte: numParam(q.scale_min_days, FILTER_DEFAULTS.scale_min_days),
                     $lte: numParam(q.scale_max_days, FILTER_DEFAULTS.scale_max_days),
                 },
                 duplicates_count: { $gte: numParam(q.scale_min_duplicates, FILTER_DEFAULTS.scale_min_duplicates) },
-                scaling_score: { $gte: numParam(q.scale_min_scaling_score, FILTER_DEFAULTS.scale_min_scaling_score) },
-            });
+            };
+            const minScaling = numParam(q.scale_min_scaling_score, FILTER_DEFAULTS.scale_min_scaling_score);
+            if (minScaling > 0) cond.scaling_score = { $gte: minScaling };
+            conds.push(cond);
         } else if (p === 'weekly_winner' || p === 'winner') {
-            conds.push({
-                score: { $gte: numParam(q.winner_min_score, FILTER_DEFAULTS.winner_min_score) },
-                trending_score: { $gte: numParam(q.winner_min_trending, FILTER_DEFAULTS.winner_min_trending) },
-                duplicates_count: { $gte: numParam(q.winner_min_duplicates, FILTER_DEFAULTS.winner_min_duplicates) },
-                duration_days: { $gte: numParam(q.winner_min_days, FILTER_DEFAULTS.winner_min_days) },
-            });
+            // Winner kiểu Minea: sống lâu (>= 7 ngày không tắt) + còn chạy +
+            // bị duplicate + (điểm tổng cao HOẶC đà tăng mạnh). Dùng OR cho
+            // score/trending vì ad win theo kiểu bền hoặc kiểu bùng đều tính.
+            const durationCond = { $gte: numParam(q.winner_min_days, FILTER_DEFAULTS.winner_min_days) };
+            const maxDays = numParam(q.winner_max_days, FILTER_DEFAULTS.winner_max_days);
+            if (maxDays > 0) durationCond.$lte = maxDays;
+            const parts = [
+                { duration_days: durationCond },
+                { duplicates_count: { $gte: numParam(q.winner_min_duplicates, FILTER_DEFAULTS.winner_min_duplicates) } },
+                { $or: [
+                    { score: { $gte: numParam(q.winner_min_score, FILTER_DEFAULTS.winner_min_score) } },
+                    { trending_score: { $gte: numParam(q.winner_min_trending, FILTER_DEFAULTS.winner_min_trending) } },
+                ] },
+            ];
+            const maxSeenAge = numParam(q.winner_max_seen_age_days, FILTER_DEFAULTS.winner_max_seen_age_days);
+            if (maxSeenAge > 0) {
+                // "Còn chạy": khớp 1 trong 3 cách ghi nhận recency (last_seen
+                // tính theo ms như analyzer, filter_signals, hoặc is_active).
+                parts.push({ $or: [
+                    { last_seen: { $gte: Date.now() - maxSeenAge * 24 * 3600 * 1000 } },
+                    { 'filter_signals.is_recently_seen': true },
+                    { is_active: true },
+                ] });
+            }
+            conds.push({ $and: parts });
         }
         // preset lạ: bỏ qua trong im lặng (không vỡ request)
     }
@@ -163,7 +190,8 @@ function initSearchServer(dbInstance) {
      * (nhiều preset cách nhau bằng dấu phẩy, kết hợp AND với các filter khác).
      * Ngưỡng chỉnh qua: new_max_days, scale_min_days, scale_max_days,
      * scale_min_duplicates, scale_min_scaling_score, winner_min_score,
-     * winner_min_trending, winner_min_duplicates, winner_min_days.
+     * winner_min_trending, winner_min_duplicates, winner_min_days,
+     * winner_max_days, winner_max_seen_age_days.
      */
     app.get('/api/ads/search', async (req, res) => {
         try {
