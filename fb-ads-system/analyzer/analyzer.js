@@ -208,11 +208,7 @@ function analyzeAllAdsGlobally(ads) {
 
     const startDateMs = (ad.start_date ? ad.start_date * 1000 : ad.first_seen) || now;
     const durationDays = Math.max(1, (now - startDateMs) / (1000 * 3600 * 24));
-    // Duplicates: ưu tiên collation_count của Meta (nhóm creative do Meta gom),
-    // fallback về đếm trùng text tuyệt đối, rồi seen_count.
-    // GIẢ ĐỊNH: collation_count là kích thước nhóm TÍNH CẢ ad này.
-    // Nếu crawler của bạn đếm collation_count chỉ tính sibling (không tính chính nó)
-    // thì đổi thành (ad.collation_count + 1).
+    
     const dupFromText = text ? (textMap[text] || 0) : 0;
     const duplicatesCount = Math.max(1, Math.round(ad.collation_count || dupFromText || ad.seen_count || 1));
 
@@ -294,9 +290,6 @@ function analyzeAllAdsGlobally(ads) {
       estimated_reach_max: spendReachData.estimated_reach_max,
       estimated_spend: spendReachData.estimated_spend,
       cpm_used: spendReachData.cpm_used,
-      // Tín hiệu thô để sau này build bộ lọc "Quảng cáo mới lên",
-      // "Ready to Scale", "Đang chạy mạnh". Ngưỡng chỉ là gợi ý,
-      // chỉnh khi build filter thật.
       filter_signals: {
         age_days: Math.round(durationDays),
         is_new: durationDays <= 7,
@@ -330,14 +323,14 @@ function analyzeAllAdsGlobally(ads) {
 async function updateAdsCollection(col, analyzedAds) {
   const ops = [];
   for (const ad of analyzedAds) {
-    if (!ad.ad_archive_id) continue; // thiếu ID thì bỏ qua (tránh gom nhầm khi upsert)
-    const { _id, ...rest } = ad; // _id của DB crawler không mang sang (tránh lỗi immutable _id)
+    if (!ad.ad_archive_id) continue;
+    const { _id, ...rest } = ad;
     ops.push({
       updateOne: {
         filter: { ad_archive_id: ad.ad_archive_id },
         update: {
           $set: {
-            ...rest, // ad_archive_id vẫn nằm trong document
+            ...rest,
             analyzed_at: Date.now()
           }
         },
@@ -346,7 +339,6 @@ async function updateAdsCollection(col, analyzedAds) {
     });
   }
 
-  // Chia nhỏ bulk (giới hạn ~1000 op/lần) để tránh vượt message 16MB của Mongo
   for (let i = 0; i < ops.length; i += 1000) {
     await col.bulkWrite(ops.slice(i, i + 1000));
   }
@@ -381,8 +373,6 @@ async function updateProductsCollection(db, analyzedAds) {
       updateOne: {
         filter: { domain: p.domain },
         update: {
-          // Dùng $set (không phải $inc): các chỉ số này được tính lại toàn bộ
-          // mỗi vòng, $inc sẽ cộng dồn vô hạn theo số vòng lặp.
           $set: {
             updated_at: Date.now(),
             total_spend_usd: Number(totalSpendUsd.toFixed(1)),
@@ -567,24 +557,47 @@ async function main() {
       try {
         console.log(`\n🔍 [Scanner] Đang kiểm tra dữ liệu từ collection 'ads' trong db '${CRAWLER_DB_NAME}'...`);
 
-        // Lấy toàn bộ ads hoặc có thể tuỳ chỉnh query lọc ads mới nhất dựa theo last_seen/updated_at
-        const rawAds = await rawAdsCol.find({}).toArray();
+        // SỬ DỤNG CURSOR VÀ CHIA MẺ (BATCHING) CHỐNG TRÀN RAM
+        const cursor = rawAdsCol.find({});
+        let batch = [];
+        const BATCH_SIZE = 2500; // Số lượng quảng cáo nhét vào RAM mỗi lượt (Tối ưu cho 8GB RAM)
+        let totalProcessed = 0;
 
-        if (rawAds.length > 0) {
-          console.log(`📊 [Analyzer] Đã nạp ${rawAds.length} quảng cáo gốc. Bắt đầu tính điểm...`);
+        for await (const rawAd of cursor) {
+          batch.push(rawAd);
 
-          // Chạy thuật toán chấm điểm
-          const processedAds = analyzeAllAdsGlobally(rawAds);
+          // Khi gom đủ một mẻ 2500 bài, mang đi phân tích và lưu DB
+          if (batch.length >= BATCH_SIZE) {
+            console.log(`📊 [Analyzer] Đang xử lý mẻ ${BATCH_SIZE} quảng cáo... (Đã quét ${totalProcessed})`);
+            const processedAds = analyzeAllAdsGlobally(batch);
 
-          // Cập nhật DB & Elasticsearch
+            await updateAdsCollection(analyzedAdsCol, processedAds);
+            await updateProductsCollection(analyzerDb, processedAds);
+            await syncToElasticsearch(esClient, processedAds);
+
+            totalProcessed += batch.length;
+            batch = []; // QUAN TRỌNG: Giải phóng RAM để nhét mẻ tiếp theo
+          }
+        }
+
+        // Xử lý nốt phần dư cuối cùng (nếu tổng số không chia hết cho 2500)
+        if (batch.length > 0) {
+          console.log(`📊 [Analyzer] Đang xử lý mẻ cuối cùng gồm ${batch.length} quảng cáo...`);
+          const processedAds = analyzeAllAdsGlobally(batch);
+
           await updateAdsCollection(analyzedAdsCol, processedAds);
           await updateProductsCollection(analyzerDb, processedAds);
           await syncToElasticsearch(esClient, processedAds);
 
-          console.log(`✅ [Analyzer] Hoàn thành phân tích vòng này!`);
+          totalProcessed += batch.length;
+        }
+
+        if (totalProcessed > 0) {
+          console.log(`✅ [Analyzer] Hoàn thành vòng này! Đã phân tích an toàn tổng cộng ${totalProcessed} quảng cáo.`);
         } else {
           console.log(`💤 [Scanner] Chưa có dữ liệu quảng cáo nào từ Crawler.`);
         }
+
       } catch (err) {
         console.error("❌ [Loop Error] Có lỗi xảy ra trong quá trình phân tích vòng lặp:", err.message);
       }
