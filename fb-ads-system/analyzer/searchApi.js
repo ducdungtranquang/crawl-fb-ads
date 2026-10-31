@@ -28,6 +28,73 @@ function checkSpecialHeader(req, res, next) {
     next();
 }
 
+// ===== MINEA-STYLE FILTER PRESETS =====
+// Các preset dùng field do analyzer tính sẵn (duration_days, duplicates_count,
+// scaling_score, trending_score, filter_signals). Mọi ngưỡng đều chỉnh được
+// qua query param — xem FILTER_DEFAULTS.
+const FILTER_DEFAULTS = {
+    new_max_days: 3,            // Ads mới lên: chạy <= 3 ngày
+    scale_min_days: 4,          // Ready to Scale: chạy khoảng 4-5 ngày
+    scale_max_days: 5,
+    scale_min_duplicates: 2,    // ... + có duplicate (đang nhân bản)
+    scale_min_scaling_score: 6, // ... + scaling_score đạt ngưỡng SCALING
+    winner_min_score: 30,       // Weekly Winner: đạt level WINNER
+    winner_min_trending: 10,
+    winner_min_duplicates: 2,
+    winner_min_days: 3,
+};
+
+function numParam(value, fallback) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Trả về mảng điều kiện Mongo cho preset (kết hợp AND với các filter khác).
+// presets: chuỗi 'new_ads,ready_to_scale' (chấp nhận alias new/scale/winner).
+function buildPresetConditions(presets, q) {
+    const conds = [];
+    const list = String(presets || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    for (const p of list) {
+        if (p === 'new_ads' || p === 'new') {
+            conds.push({
+                duration_days: { $lte: numParam(q.new_max_days, FILTER_DEFAULTS.new_max_days) },
+            });
+        } else if (p === 'ready_to_scale' || p === 'scale') {
+            conds.push({
+                duration_days: {
+                    $gte: numParam(q.scale_min_days, FILTER_DEFAULTS.scale_min_days),
+                    $lte: numParam(q.scale_max_days, FILTER_DEFAULTS.scale_max_days),
+                },
+                duplicates_count: { $gte: numParam(q.scale_min_duplicates, FILTER_DEFAULTS.scale_min_duplicates) },
+                scaling_score: { $gte: numParam(q.scale_min_scaling_score, FILTER_DEFAULTS.scale_min_scaling_score) },
+            });
+        } else if (p === 'weekly_winner' || p === 'winner') {
+            conds.push({
+                score: { $gte: numParam(q.winner_min_score, FILTER_DEFAULTS.winner_min_score) },
+                trending_score: { $gte: numParam(q.winner_min_trending, FILTER_DEFAULTS.winner_min_trending) },
+                duplicates_count: { $gte: numParam(q.winner_min_duplicates, FILTER_DEFAULTS.winner_min_duplicates) },
+                duration_days: { $gte: numParam(q.winner_min_days, FILTER_DEFAULTS.winner_min_days) },
+            });
+        }
+        // preset lạ: bỏ qua trong im lặng (không vỡ request)
+    }
+    return conds;
+}
+
+// Sort mặc định theo preset khi user không truyền sort_by tường minh.
+function resolvePresetSort(presets, hasExplicitSortBy) {
+    if (hasExplicitSortBy) return null;
+    const list = String(presets || '').split(',').map(s => s.trim().toLowerCase());
+    if (list.includes('weekly_winner') || list.includes('winner')) return { field: 'trending_score', order: -1 };
+    if (list.includes('ready_to_scale') || list.includes('scale')) return { field: 'scaling_score', order: -1 };
+    if (list.includes('new_ads') || list.includes('new')) return { field: 'start_date', order: -1 };
+    return null;
+}
+
 /**
  * Khởi tạo API Server (Đã gỡ bỏ Kafka)
  * @param {import('mongodb').Db} dbInstance 
@@ -56,6 +123,11 @@ function initSearchServer(dbInstance) {
 
     /**
      * 🟢 API 1: TÌM KIẾM QUẢNG CÁO (Nâng cấp bộ lọc chuẩn Minea)
+     * Thêm param `filter` (preset): new_ads | ready_to_scale | weekly_winner
+     * (nhiều preset cách nhau bằng dấu phẩy, kết hợp AND với các filter khác).
+     * Ngưỡng chỉnh qua: new_max_days, scale_min_days, scale_max_days,
+     * scale_min_duplicates, scale_min_scaling_score, winner_min_score,
+     * winner_min_trending, winner_min_duplicates, winner_min_days.
      */
     app.get('/api/ads/search', async (req, res) => {
         try {
@@ -74,8 +146,7 @@ function initSearchServer(dbInstance) {
                 page_name,     // Lọc theo tên Page
                 domain,        // Lọc theo tên miền
                 is_active,     // Lọc theo trạng thái quảng cáo (true/false)
-                sort_by = 'score',
-                sort_order = -1
+                filter,        // Preset kiểu Minea: new_ads | ready_to_scale | weekly_winner
             } = req.query;
 
             const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
@@ -124,7 +195,13 @@ function initSearchServer(dbInstance) {
             }
 
             // 2. CÁC BỘ LỌC CHUẨN MINEA
-            if (country) query.platforms = String(country).toUpperCase();
+            // FIX: country trước đây map nhầm sang `platforms` (tên nền tảng) nên
+            // lọc theo quốc gia luôn trả về rỗng. Giờ lọc theo country_mentions
+            // (mảng) hoặc latest_detail_country do analyzer ghi.
+            if (country) {
+                const codeRe = new RegExp(`^${escapeRegExp(String(country).trim())}$`, 'i');
+                query.$or = [{ country_mentions: codeRe }, { latest_detail_country: codeRe }];
+            }
             if (page_name) query.page_name = { $regex: String(page_name), $options: 'i' };
             if (domain) query.domain = { $regex: String(domain), $options: 'i' };
             if (is_active !== undefined) query.is_active = is_active === 'true';
@@ -143,28 +220,65 @@ function initSearchServer(dbInstance) {
                 if (Number.isFinite(maxScore)) query.score.$lte = maxScore;
             }
 
-            if (level) query.level = { $in: String(level).split(',').map(x => x.trim().toUpperCase()).filter(Boolean) };
+            // FIX: level/scaling_level trong DB có prefix emoji (vd '🏆 LEGEND',
+            // '🚀 SCALING HARD') nên match chính xác 'LEGEND'/'SCALING' không ra.
+            // Đổi sang regex không phân biệt hoa thường.
+            if (level) {
+                const words = String(level).split(',').map(x => x.trim()).filter(Boolean);
+                query.level = { $in: words.map(w => new RegExp(escapeRegExp(w), 'i')) };
+            }
             if (estimated_spend) query.estimated_spend = { $in: String(estimated_spend).split(',').map(x => x.trim().toUpperCase()).filter(Boolean) };
             if (Number.isFinite(Number(min_trending_score))) query.trending_score = { $gte: Number(min_trending_score) };
             if (funnel) query.funnel = { $in: String(funnel).split(',').map(x => x.trim().toUpperCase()).filter(Boolean) };
-            if (scaling_level) query.scaling_level = { $in: String(scaling_level).split(',').map(x => x.trim().toUpperCase()).filter(Boolean) };
+            if (scaling_level) {
+                const words = String(scaling_level).split(',').map(x => x.trim()).filter(Boolean);
+                query.scaling_level = { $in: words.map(w => new RegExp(escapeRegExp(w), 'i')) };
+            }
+
+            // 3. PRESET KIỂU MINEA (kết hợp AND với mọi filter trên)
+            const presetList = String(filter || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+            const presetConds = buildPresetConditions(filter, req.query);
+            if (presetConds.length) query.$and = presetConds;
 
             const total = Object.keys(query).length === 0 ? await adsCol.estimatedDocumentCount() : await adsCol.countDocuments(query);
 
-            const allowedSortFields = new Set(['score', 'trending_score', 'start_date', 'seen_count', 'analyzed_at', 'first_seen', 'last_seen', 'scaling_score', 'estimated_spend_usd']);
-            const safeSortField = allowedSortFields.has(String(sort_by)) ? String(sort_by) : 'score';
-            const sortOptions = { [safeSortField]: Number(sort_order) === 1 ? 1 : -1 };
+            const presetSort = resolvePresetSort(filter, req.query.sort_by !== undefined);
+            const requestedSort = presetSort ? presetSort.field : (req.query.sort_by || 'score');
+            const requestedOrder = presetSort ? presetSort.order : (Number(req.query.sort_order) === 1 ? 1 : -1);
+            const allowedSortFields = new Set(['score', 'trending_score', 'start_date', 'seen_count', 'analyzed_at', 'first_seen', 'last_seen', 'scaling_score', 'estimated_spend_usd', 'duplicates_count', 'duration_days', 'estimated_spend_max_usd', 'estimated_spend_min_usd', 'estimated_reach']);
+            const safeSortField = allowedSortFields.has(String(requestedSort)) ? String(requestedSort) : 'score';
+            const sortOptions = { [safeSortField]: requestedOrder };
 
             const results = await adsCol.find(query)
                 .project({
-                    ad_archive_id: 1, page_name: 1, page_like_count: 1, text: 1, link: 1, domain: 1,
-                    start_date: 1, seen_count: 1, score: 1, level: 1, trending_score: 1, estimated_spend_usd: 1,
-                    estimated_spend: 1, estimated_reach: 1, scaling_level: 1, funnel: 1, analyzed_at: 1,
+                    ad_archive_id: 1, ad_library_url: 1, page_name: 1, page_like_count: 1, text: 1, link: 1, domain: 1,
+                    start_date: 1, seen_count: 1, score: 1, level: 1, trending_score: 1, scaling_score: 1,
+                    estimated_spend_usd: 1, estimated_spend_min_usd: 1, estimated_spend_max_usd: 1,
+                    estimated_spend: 1, estimated_reach: 1, estimated_reach_min: 1, estimated_reach_max: 1,
+                    duplicates_count: 1, duration_days: 1, cpm_used: 1, filter_signals: 1,
+                    scaling_level: 1, funnel: 1, analyzed_at: 1,
                     thumbnail_local: 1, is_active: 1, images: { $slice: 1 }, videos: { $slice: 1 }
                 })
                 .sort(sortOptions).skip(skip).limit(limit).toArray();
 
-            return res.json({ success: true, pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data: results });
+            return res.json({ success: true, applied_presets: presetList, pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data: results });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
+        }
+    });
+
+    /**
+     * 🟢 API 1b: SỐ LƯỢNG THEO TỪNG PRESET (để frontend hiển thị badge/đánh giá)
+     */
+    app.get('/api/ads/filter-stats', async (req, res) => {
+        try {
+            const total = await adsCol.estimatedDocumentCount();
+            const presets = {};
+            for (const name of ['new_ads', 'ready_to_scale', 'weekly_winner']) {
+                const conds = buildPresetConditions(name, {});
+                presets[name] = await adsCol.countDocuments(conds.length ? { $and: conds } : {});
+            }
+            return res.json({ success: true, data: { total, presets, defaults: FILTER_DEFAULTS } });
         } catch (error) {
             return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
         }
@@ -212,7 +326,7 @@ function initSearchServer(dbInstance) {
 
             const similarAds = await adsCol.find(query)
                 .project({
-                    ad_archive_id: 1, page_name: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1,
+                    ad_archive_id: 1, ad_library_url: 1, page_name: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1,
                     estimated_spend_usd: 1, thumbnail_local: 1, images: { $slice: 1 }, videos: { $slice: 1 }
                 })
                 .sort({ score: -1 })
@@ -240,7 +354,7 @@ function initSearchServer(dbInstance) {
 
             const ads = await adsCol.find(query)
                 .project({
-                    ad_archive_id: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1, level: 1,
+                    ad_archive_id: 1, ad_library_url: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1, level: 1,
                     is_active: 1, start_date: 1, estimated_spend_usd: 1, estimated_reach: 1,
                     images: { $slice: 1 }, videos: { $slice: 1 }
                 })
@@ -300,7 +414,7 @@ function initSearchServer(dbInstance) {
 
             const topAds = await adsCol.find({ domain })
                 .sort({ score: -1 }).limit(20)
-                .project({ ad_archive_id: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1, level: 1, estimated_spend_usd: 1, images: { $slice: 1 }, videos: { $slice: 1 } })
+                .project({ ad_archive_id: 1, ad_library_url: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1, level: 1, estimated_spend_usd: 1, images: { $slice: 1 }, videos: { $slice: 1 } })
                 .toArray();
 
             return res.json({ success: true, data: { ...productInfo, top_ads: topAds } });
@@ -314,4 +428,4 @@ function initSearchServer(dbInstance) {
     });
 }
 
-module.exports = { initSearchServer };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, FILTER_DEFAULTS };
