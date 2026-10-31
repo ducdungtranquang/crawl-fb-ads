@@ -53,6 +53,42 @@ function escapeRegExp(s) {
     return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Bỏ dấu tiếng Việt để bắt thêm trường hợp text đã strip dấu lúc index.
+function stripViDiacritics(s) {
+    return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D');
+}
+
+// Query text search cho ES. strict=true: match_phrase (cụm đúng thứ tự) +
+// match operator AND (đủ mọi token) — loại kết quả trúng 1 token lẻ
+// ("Đà Nẵng", "Đa năng" khi tìm "Thực phẩm chức năng").
+// strict=false: OR như cũ, chỉ dùng fallback khi strict trả về 0 hit.
+function buildTextSearchQuery(keyword, strict) {
+    const kw = String(keyword).trim();
+    const kwAscii = stripViDiacritics(kw);
+    const variants = kwAscii !== kw ? [kw, kwAscii] : [kw];
+    const should = [];
+    for (const v of variants) {
+        if (strict) {
+            should.push(
+                { match_phrase: { full_text_search: { query: v, boost: 10 } } },
+                { match_phrase: { normalized_text: { query: v, boost: 8 } } },
+                { match: { full_text_search: { query: v, operator: 'and', boost: 5 } } },
+                { match: { normalized_text: { query: v, operator: 'and', boost: 4 } } },
+                { match: { text: { query: v, operator: 'and', boost: 3 } } },
+                { match: { page_name: { query: v, operator: 'and', boost: 2 } } },
+            );
+        } else {
+            should.push(
+                { match: { full_text_search: { query: v, boost: 5 } } },
+                { match: { normalized_text: { query: v, boost: 4 } } },
+                { match: { text: { query: v, boost: 3 } } },
+                { match: { page_name: { query: v, boost: 2 } } },
+            );
+        }
+    }
+    return { bool: { should, minimum_should_match: 1 } };
+}
+
 // Trả về mảng điều kiện Mongo cho preset (kết hợp AND với các filter khác).
 // presets: chuỗi 'new_ads,ready_to_scale' (chấp nhận alias new/scale/winner).
 function buildPresetConditions(presets, q) {
@@ -154,39 +190,38 @@ function initSearchServer(dbInstance) {
             const skip = (page - 1) * limit;
 
             const query = {};
+            let esRank = null; // thứ hạng ES, dùng sort theo relevance khi không có sort_by tường minh
 
             // 1. SEARCH TEXT (Elasticsearch)
+            // Chất lượng: match_phrase (cụm đúng thứ tự) + match operator AND (đủ
+            // mọi token) để "Thực phẩm chức năng" không trả về "Đà Nẵng"/"Đa năng"
+            // (trước đây match OR + minimum_should_match 1 nên trúng 1 token "năng"
+            // là đã lọt). Strict mà 0 hit thì fallback sang OR như cũ.
             if (text) {
                 const keyword = Array.isArray(text) ? text.map(x => String(x).trim()).filter(Boolean).join(" ") : String(text).trim();
                 if (keyword) {
                     try {
                         const esLimit = Math.min(Math.max(page * limit * 5, 100), 5000);
-                        const searchQuery = {
-                            bool: {
-                                should: [
-                                    { match: { full_text_search: { query: keyword, boost: 5 } } },
-                                    { match: { normalized_text: { query: keyword, boost: 4 } } },
-                                    { match: { text: { query: keyword, boost: 3 } } },
-                                    { match: { page_name: { query: keyword, boost: 2 } } }
-                                ],
-                                minimum_should_match: 1
-                            }
-                        };
-
-                        const esResponse = await esClient.search({
+                        const esParams = {
                             index: ELASTIC_INDEX,
-                            query: searchQuery,
                             _source: ['ad_archive_id'],
                             size: esLimit,
                             track_total_hits: false
-                        });
+                        };
 
-                        const hits = esResponse.hits?.hits || [];
+                        let esResponse = await esClient.search({ ...esParams, query: buildTextSearchQuery(keyword, true) });
+                        let hits = esResponse.hits?.hits || [];
+                        if (!hits.length) {
+                            esResponse = await esClient.search({ ...esParams, query: buildTextSearchQuery(keyword, false) });
+                            hits = esResponse.hits?.hits || [];
+                        }
+
                         const adIdsFromEs = [...new Set(hits.map(hit => hit?._source?.ad_archive_id).filter(Boolean).map(String))];
 
                         if (!adIdsFromEs.length) {
                             return res.json({ success: true, pagination: { total: 0, page, limit, pages: 0 }, data: [] });
                         }
+                        esRank = new Map(adIdsFromEs.map((id, i) => [id, i]));
                         query.ad_archive_id = { $in: adIdsFromEs };
                     } catch (esError) {
                         return res.status(500).json({ success: false, message: 'Elasticsearch Error', error: esError.message });
@@ -260,6 +295,12 @@ function initSearchServer(dbInstance) {
                     thumbnail_local: 1, is_active: 1, images: { $slice: 1 }, videos: { $slice: 1 }
                 })
                 .sort(sortOptions).skip(skip).limit(limit).toArray();
+
+            // Khi search text mà user không chọn sort_by: giữ thứ hạng relevance
+            // của ES thay vì để analyzer score quyết định thứ tự.
+            if (esRank && req.query.sort_by === undefined) {
+                results.sort((a, b) => (esRank.get(String(a.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER) - (esRank.get(String(b.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER));
+            }
 
             return res.json({ success: true, applied_presets: presetList, pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data: results });
         } catch (error) {
@@ -428,4 +469,4 @@ function initSearchServer(dbInstance) {
     });
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, FILTER_DEFAULTS };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics };
