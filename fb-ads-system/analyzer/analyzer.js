@@ -184,6 +184,26 @@ function summarizeDetailHistory(ad) {
   };
 }
 
+// Hash 64-bit (2 x 32-bit: FNV-1a + djb2) cho text: key cố định ~13 ký tự
+// thay vì giữ nguyên cả đoạn text trong textMap. Hàng triệu text unique mà
+// giữ nguyên string làm key = hàng GB RAM -> tràn. Va chạm 64-bit với vài
+// triệu text là không đáng kể (~1e-6); text va chạm chỉ làm D lệch nhẹ cho
+// đúng text đó, không ảnh hưởng số liệu khác.
+function hashTextKey(s) {
+  let h1 = 0x811c9dc5, h2 = 5381;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = ((h2 << 5) + h2 + c) | 0;
+  }
+  return (h1 >>> 0).toString(36) + ':' + (h2 >>> 0).toString(36);
+}
+
+function logMemory(tag) {
+  const m = process.memoryUsage();
+  console.log(`${tag} — RSS ${(m.rss / 1048576).toFixed(0)}MB, heap ${(m.heapUsed / 1048576).toFixed(0)}MB`);
+}
+
 // Cộng dồn 1 ad vào các map đếm toàn cục (dùng chung cho pass 1 và fallback)
 function countIntoMaps(maps, ad) {
   const text = ad.normalized_text || normalize(ad.text || '');
@@ -191,12 +211,16 @@ function countIntoMaps(maps, ad) {
   const pageName = ad.page_name || 'unknown';
 
   maps.pageMap[pageName] = (maps.pageMap[pageName] || 0) + 1;
-  if (text) maps.textMap[text] = (maps.textMap[text] || 0) + 1; // text rỗng không đếm (tránh phình D)
+  if (text) {
+    const k = hashTextKey(text);
+    if (maps.textMap[k] === undefined) maps.textKeys = (maps.textKeys || 0) + 1;
+    maps.textMap[k] = (maps.textMap[k] || 0) + 1; // text rỗng không đếm (tránh phình D)
+  }
   if (domain) maps.domainMap[domain] = (maps.domainMap[domain] || 0) + 1;
 }
 
 function emptyMaps() {
-  return { pageMap: {}, textMap: {}, domainMap: {} };
+  return { pageMap: {}, textMap: {}, domainMap: {}, textKeys: 0 };
 }
 
 // ===== NGƯỠNG PRESET (MINEA-STYLE) — phải khớp FILTER_DEFAULTS trong searchApi.js =====
@@ -240,7 +264,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     // GIẢ ĐỊNH: collation_count là kích thước nhóm TÍNH CẢ ad này.
     // Nếu crawler của bạn đếm collation_count chỉ tính sibling (không tính chính nó)
     // thì đổi thành (ad.collation_count + 1).
-    const dupFromText = text ? (textMap[text] || 0) : 0;
+    const dupFromText = text ? (textMap[hashTextKey(text)] || 0) : 0;
     const duplicatesCount = Math.max(1, Math.round(ad.collation_count || dupFromText || ad.seen_count || 1));
 
     const spendReachData = estimateSpendAndReach(ad, durationDays, duplicatesCount);
@@ -374,34 +398,39 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
 
 // ===== DATABASE BULK WRITES =====
 async function updateAdsCollection(col, analyzedAds) {
-  const ops = [];
+  let written = 0;
   let skipped = 0;
-  for (const ad of analyzedAds) {
-    const archiveId = ad.ad_archive_id || ad.ad_id || ad.id;
-    if (!archiveId) { skipped++; continue; } // thiếu ID thì bỏ qua (tránh gom nhầm khi upsert)
-    const { _id, ...rest } = ad; // _id của DB crawler không mang sang (tránh lỗi immutable _id)
-    ops.push({
-      updateOne: {
-        filter: { ad_archive_id: archiveId },
-        update: {
-          $set: {
-            ...rest,
-            ad_archive_id: archiveId, // chuẩn hóa ID, giữ ad_archive_id trong document
-            analyzed_at: Date.now()
-          }
-        },
-        upsert: true
-      }
-    });
+  // Ghi theo lát 1000: dựng ops rồi ghi ngay từng lát, không giữ toàn bộ
+  // ops của cả batch trong RAM (batch lớn + doc nặng = OOM). 1000 op/lần
+  // vẫn dưới message 16MB của Mongo.
+  for (let s = 0; s < analyzedAds.length; s += 1000) {
+    const ops = [];
+    for (const ad of analyzedAds.slice(s, s + 1000)) {
+      const archiveId = ad.ad_archive_id || ad.ad_id || ad.id;
+      if (!archiveId) { skipped++; continue; } // thiếu ID thì bỏ qua (tránh gom nhầm khi upsert)
+      const { _id, ...rest } = ad; // _id của DB crawler không mang sang (tránh lỗi immutable _id)
+      ops.push({
+        updateOne: {
+          filter: { ad_archive_id: archiveId },
+          update: {
+            $set: {
+              ...rest,
+              ad_archive_id: archiveId, // chuẩn hóa ID, giữ ad_archive_id trong document
+              analyzed_at: Date.now()
+            }
+          },
+          upsert: true
+        }
+      });
+    }
+    if (ops.length) {
+      await col.bulkWrite(ops);
+      written += ops.length;
+    }
   }
   if (skipped) console.log(`⚠️ [DB Ads] Bỏ qua ${skipped} ad thiếu ID (không có ad_archive_id/ad_id/id).`);
-
-  // Chia nhỏ bulk (giới hạn ~1000 op/lần) để tránh vượt message 16MB của Mongo
-  for (let i = 0; i < ops.length; i += 1000) {
-    await col.bulkWrite(ops.slice(i, i + 1000));
-  }
-  if (ops.length) {
-    console.log(`💾 [DB Ads] Đã cập nhật (Bulk Write) ${ops.length} bản ghi.`);
+  if (written) {
+    console.log(`💾 [DB Ads] Đã cập nhật (Bulk Write) ${written} bản ghi.`);
   }
 }
 
@@ -461,9 +490,12 @@ async function updateProductsCollection(db, analyzedAds) {
 async function syncToElasticsearch(esClient, analyzedAds) {
   if (!analyzedAds || analyzedAds.length === 0) return;
 
-  const docs = analyzedAds
-    .filter(ad => ad.ad_archive_id || ad.ad_id || ad.id)
-    .map(ad => ({
+  let allOk = true;
+  // Ghi theo lát 1000 để không giữ toàn bộ docs ES của cả batch trong RAM.
+  for (let s = 0; s < analyzedAds.length; s += 1000) {
+    const docs = analyzedAds.slice(s, s + 1000)
+      .filter(ad => ad.ad_archive_id || ad.ad_id || ad.id)
+      .map(ad => ({
       ad_archive_id: String(ad.ad_archive_id || ad.ad_id || ad.id),
       ad_library_url: ad.ad_library_url || '',
       text: ad.text || '',
@@ -488,11 +520,8 @@ async function syncToElasticsearch(esClient, analyzedAds) {
       funnel: ad.funnel || '',
       scaling_level: ad.scaling_level || ''
     }));
-
-  let allOk = true;
-  for (let i = 0; i < docs.length; i += 1000) {
-    const chunk = docs.slice(i, i + 1000);
-    const operations = chunk.flatMap(ad => [
+    if (!docs.length) continue;
+    const operations = docs.flatMap(ad => [
       { index: { _index: ELASTIC_INDEX, _id: ad.ad_archive_id } },
       ad
     ]);
@@ -632,9 +661,10 @@ async function main() {
           projection: { normalized_text: 1, text: 1, page_name: 1, link: 1 }
         });
         for await (const a of statsCursor) countIntoMaps(maps, a);
+        logMemory(`[Scanner] Pass 1 xong — unique texts (hash): ${maps.textKeys}, pages: ${Object.keys(maps.pageMap).length}, domains: ${Object.keys(maps.domainMap).length}`);
 
         // PASS 2: xử lý theo batch, dùng map toàn cục của pass 1
-        const BATCH_SIZE = 2500; // hạ xuống 1000 nếu RAM vẫn căng
+        const BATCH_SIZE = 500; // hạ xuống 200 nếu RAM vẫn căng (doc nặng)
         let batch = [];
         let totalProcessed = 0;
         const productStats = {};
@@ -646,9 +676,10 @@ async function main() {
           await syncToElasticsearch(esClient, processedAds);
           totalProcessed += batch.length;
           batch = []; // giải phóng RAM cho mẻ tiếp theo
+          logMemory('[Analyzer] Sau mẻ');
         };
 
-        const cursor = rawAdsCol.find({});
+        const cursor = rawAdsCol.find({}).batchSize(BATCH_SIZE);
         for await (const rawAd of cursor) {
           batch.push(rawAd);
           if (batch.length >= BATCH_SIZE) {
