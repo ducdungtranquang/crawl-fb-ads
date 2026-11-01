@@ -199,6 +199,22 @@ function emptyMaps() {
   return { pageMap: {}, textMap: {}, domainMap: {} };
 }
 
+// ===== NGƯỠNG PRESET (MINEA-STYLE) — phải khớp FILTER_DEFAULTS trong searchApi.js =====
+// Cờ filter_signals.is_* được tính sẵn ở đây để API chỉ lọc theo 1 field
+// boolean có index (đếm/lọc nhanh), thay vì chạy $or + nhiều range mỗi request.
+// Đổi ngưỡng ở đây thì đổi cả bên searchApi.js cho khớp.
+const PRESET_THRESHOLDS = {
+  new_max_days: 3,
+  scale_min_days: 3,
+  scale_max_days: 7,
+  scale_min_duplicates: 2,
+  winner_min_days: 7,
+  winner_min_duplicates: 2,
+  winner_min_score: 20,
+  winner_min_trending: 8,
+  winner_max_seen_age_days: 7,
+};
+
 // ===== CORE ANALYZE PROCESS =====
 function analyzeAllAdsGlobally(ads, globalMaps) {
   const now = Date.now();
@@ -213,6 +229,8 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
   return ads.map(ad => {
     const text = ad.normalized_text || normalize(ad.text || '');
     const domain = extractDomain(ad.link);
+    // Chuẩn hóa ID: crawler có thể lưu ad_id/id thay vì ad_archive_id
+    const archiveId = ad.ad_archive_id || ad.ad_id || ad.id || null;
     const detailSummary = summarizeDetailHistory(ad);
 
     const startDateMs = (ad.start_date ? ad.start_date * 1000 : ad.first_seen) || now;
@@ -282,10 +300,25 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     score = scalingScore * 1.2 + score + spendWeight + reachWeight + trendingScore * 0.5 + (detailSummary.detail_history_length * 0.5);
     score = Number(score.toFixed(1));
 
+    // Cờ preset tính sẵn (xem PRESET_THRESHOLDS): API lọc theo 1 field
+    // boolean có index thay vì $or + nhiều range → đếm/lọc nhanh.
+    // Dùng duration_days đã làm tròn để khớp đúng field API nhìn thấy.
+    const durationRounded = Math.round(durationDays);
+    const seenWithinWeek = recentMinutes <= PRESET_THRESHOLDS.winner_max_seen_age_days * 24 * 60;
+    const isNewAd = durationRounded <= PRESET_THRESHOLDS.new_max_days;
+    const isReadyToScale = durationRounded >= PRESET_THRESHOLDS.scale_min_days
+      && durationRounded <= PRESET_THRESHOLDS.scale_max_days
+      && duplicatesCount >= PRESET_THRESHOLDS.scale_min_duplicates;
+    const isWeeklyWinner = durationRounded >= PRESET_THRESHOLDS.winner_min_days
+      && duplicatesCount >= PRESET_THRESHOLDS.winner_min_duplicates
+      && (score >= PRESET_THRESHOLDS.winner_min_score || trendingScore >= PRESET_THRESHOLDS.winner_min_trending)
+      && seenWithinWeek;
+
     return {
       ...ad,
+      ad_archive_id: archiveId,
       domain,
-      ad_library_url: ad.ad_archive_id ? `https://www.facebook.com/ads/library/?id=${ad.ad_archive_id}` : null,
+      ad_library_url: archiveId ? `https://www.facebook.com/ads/library/?id=${archiveId}` : null,
       score,
       duration_days: Math.round(durationDays),
       duplicates_count: duplicatesCount,
@@ -311,6 +344,10 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
         is_new: durationDays <= 7,
         recent_minutes: Math.round(recentMinutes),
         is_recently_seen: recentMinutes < 60,
+        is_new_ad: isNewAd,
+        is_ready_to_scale: isReadyToScale,
+        is_weekly_winner: isWeeklyWinner,
+        seen_within_week: seenWithinWeek,
         duplicates_count: duplicatesCount,
         page_ads_count: pageAds,
         domain_ads_count: domainAds,
@@ -338,15 +375,18 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
 // ===== DATABASE BULK WRITES =====
 async function updateAdsCollection(col, analyzedAds) {
   const ops = [];
+  let skipped = 0;
   for (const ad of analyzedAds) {
-    if (!ad.ad_archive_id) continue; // thiếu ID thì bỏ qua (tránh gom nhầm khi upsert)
+    const archiveId = ad.ad_archive_id || ad.ad_id || ad.id;
+    if (!archiveId) { skipped++; continue; } // thiếu ID thì bỏ qua (tránh gom nhầm khi upsert)
     const { _id, ...rest } = ad; // _id của DB crawler không mang sang (tránh lỗi immutable _id)
     ops.push({
       updateOne: {
-        filter: { ad_archive_id: ad.ad_archive_id },
+        filter: { ad_archive_id: archiveId },
         update: {
           $set: {
-            ...rest, // ad_archive_id vẫn nằm trong document
+            ...rest,
+            ad_archive_id: archiveId, // chuẩn hóa ID, giữ ad_archive_id trong document
             analyzed_at: Date.now()
           }
         },
@@ -354,6 +394,7 @@ async function updateAdsCollection(col, analyzedAds) {
       }
     });
   }
+  if (skipped) console.log(`⚠️ [DB Ads] Bỏ qua ${skipped} ad thiếu ID (không có ad_archive_id/ad_id/id).`);
 
   // Chia nhỏ bulk (giới hạn ~1000 op/lần) để tránh vượt message 16MB của Mongo
   for (let i = 0; i < ops.length; i += 1000) {
@@ -421,9 +462,9 @@ async function syncToElasticsearch(esClient, analyzedAds) {
   if (!analyzedAds || analyzedAds.length === 0) return;
 
   const docs = analyzedAds
-    .filter(ad => ad.ad_archive_id)
+    .filter(ad => ad.ad_archive_id || ad.ad_id || ad.id)
     .map(ad => ({
-      ad_archive_id: String(ad.ad_archive_id),
+      ad_archive_id: String(ad.ad_archive_id || ad.ad_id || ad.id),
       ad_library_url: ad.ad_library_url || '',
       text: ad.text || '',
       headline: ad.headline || '',
@@ -560,7 +601,12 @@ async function main() {
       { key: { estimated_reach: -1 }, name: "reach_sort" },
       { key: { domain: 1 }, name: "domain_filter" },
       { key: { level: 1 }, name: "level_filter" },
-      { key: { trending_score: -1 }, name: "trending_sort" }
+      { key: { trending_score: -1 }, name: "trending_sort" },
+      { key: { duration_days: 1 }, name: "idx_duration_days" },
+      { key: { last_seen: -1 }, name: "idx_last_seen" },
+      { key: { 'filter_signals.is_new_ad': 1, start_date: -1 }, name: "idx_new_ad_flag" },
+      { key: { 'filter_signals.is_ready_to_scale': 1, scaling_score: -1 }, name: "idx_scale_flag" },
+      { key: { 'filter_signals.is_weekly_winner': 1, trending_score: -1 }, name: "idx_winner_flag" }
     ]);
 
     await productsCol.createIndexes([
