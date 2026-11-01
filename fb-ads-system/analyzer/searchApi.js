@@ -514,9 +514,46 @@ function initSearchServer(dbInstance) {
         }
     });
 
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
         console.log(`🖥️  API Search Server đang hoạt động tại cổng: http://localhost:${PORT}`);
+    });
+    server.on('error', (err) => {
+        console.error(`❌ [Search API] Không mở được cổng ${PORT}:`, err.message);
+        process.exit(1);
     });
 }
 
 module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics };
+
+// ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
+// Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
+// có giới hạn rồi thoát lỗi rõ ràng để pm2 restart, không lặp lặng lẽ.
+// Chỉ chạy khi file được gọi trực tiếp; khi analyzer (hay test) require thì
+// khối này không chạy.
+if (require.main === module) {
+    const { MongoClient } = require('mongodb');
+    const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/?directConnection=true&serverSelectionTimeoutMS=2000&appName=mongosh+2';
+    const ANALYZER_DB_NAME = 'fb_ads_analyzer';
+    const MAX_ATTEMPTS = parseInt(process.env.SEARCH_START_RETRIES || '5', 10);
+    const RETRY_MS = parseInt(process.env.SEARCH_START_RETRY_MS || '3000', 10);
+
+    (async () => {
+        let lastErr = null;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+                console.log(`🔄 [Search API] Đang kết nối MongoDB (lần ${attempt}/${MAX_ATTEMPTS})...`);
+                const client = new MongoClient(MONGO_URI);
+                await client.connect();
+                console.log('💾 [Search API] Kết nối MongoDB thành công!');
+                initSearchServer(client.db(ANALYZER_DB_NAME));
+                return;
+            } catch (err) {
+                lastErr = err;
+                console.error(`❌ [Search API] Kết nối thất bại (lần ${attempt}/${MAX_ATTEMPTS}):`, err.message);
+                if (attempt < MAX_ATTEMPTS) await new Promise((r) => setTimeout(r, RETRY_MS));
+            }
+        }
+        console.error(`❌ [Search API] Không kết nối được MongoDB sau ${MAX_ATTEMPTS} lần — thoát để pm2 restart. Lỗi cuối:`, lastErr && lastErr.message);
+        process.exit(1);
+    })();
+}
