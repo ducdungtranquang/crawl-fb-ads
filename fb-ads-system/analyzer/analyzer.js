@@ -589,9 +589,21 @@ async function ensureIndexExists(esClient) {
   return true;
 }
 
+// Vòng lặp incremental: vòng FULL quét toàn bộ, vòng thường chỉ lấy doc
+// mới/thay đổi theo watermark (last_seen/first_seen, đơn vị ms như analyzer
+// vẫn dùng). Vòng đầu sau khi (re)start luôn FULL để build map + bắt kịp.
+function isFullLoop(loopCount, watermark, every) {
+  return watermark === 0 || loopCount % every === 0;
+}
+
+function buildLoopQuery(isFull, watermark) {
+  if (isFull) return {};
+  return { $or: [{ last_seen: { $gte: watermark } }, { first_seen: { $gte: watermark } }] };
+}
+
 // ===== MAIN POLLING PROCESS (THAY THẾ KAFKA) =====
 async function main() {
-  console.log("[System] Khởi chạy tiến trình Analyzer (Chế độ Database Polling)...");
+  console.log(`[System] Khởi chạy tiến trình Analyzer (Chế độ Database Polling) — PID ${process.pid}. Chỉ chạy 1 bản analyzer duy nhất, bản trùng sẽ nhân đôi tải và nhân đôi ghi.`);
 
   const client = new MongoClient(MONGO_URI);
 
@@ -621,9 +633,26 @@ async function main() {
   const analyzedAdsCol = analyzerDb.collection('analyzed_ads');
   const productsCol = analyzerDb.collection('products');
 
+  // Tạo index nếu chưa có index nào cùng key (tránh trùng khi tên khác nhau).
+  // Index trên collection crawler (last_seen/first_seen) là bắt buộc để vòng
+  // incremental không phải quét toàn bộ collection mỗi 60s.
+  async function ensureIndexes(col, specs) {
+    let existing = [];
+    try { existing = await col.indexes(); } catch (_) { /* collection mới: tạo hết */ }
+    const existingKeys = new Set(existing.map(i => JSON.stringify(i.key)));
+    for (const s of specs) {
+      if (existingKeys.has(JSON.stringify(s.key))) {
+        console.log(`⏭️ [DB Index] Bỏ qua ${s.name} (đã có index cùng key).`);
+        continue;
+      }
+      await col.createIndex(s.key, { name: s.name, ...(s.unique ? { unique: true } : {}) });
+      console.log(`✅ [DB Index] Đã tạo ${s.name}.`);
+    }
+  }
+
   // Khởi tạo các Index phân tích
   try {
-    await analyzedAdsCol.createIndexes([
+    await ensureIndexes(analyzedAdsCol, [
       { key: { ad_archive_id: 1 }, name: "ad_archive_id_unique", unique: true },
       { key: { score: -1, analyzed_at: -1 }, name: "score_analyzed_sort" },
       { key: { estimated_spend_usd: -1 }, name: "spend_usd_sort" },
@@ -638,9 +667,14 @@ async function main() {
       { key: { 'filter_signals.is_weekly_winner': 1, trending_score: -1 }, name: "idx_winner_flag" }
     ]);
 
-    await productsCol.createIndexes([
+    await ensureIndexes(productsCol, [
       { key: { domain: 1 }, name: "domain_unique", unique: true },
       { key: { product_score: -1 }, name: "product_score_sort" }
+    ]);
+
+    await ensureIndexes(rawAdsCol, [
+      { key: { last_seen: -1 }, name: "idx_crawler_last_seen" },
+      { key: { first_seen: -1 }, name: "idx_crawler_first_seen" }
     ]);
   } catch (indexErr) {
     console.warn("⚠️ [DB Index] Lỗi tạo index, hệ thống vẫn tiếp tục hoạt động:", indexErr.message);
@@ -648,20 +682,46 @@ async function main() {
 
   console.log("⚡ [Analyzer] Hệ thống đã sẵn sàng. Bắt đầu vòng lặp quét dữ liệu...");
 
+  // Trạng thái vòng lặp incremental: quét toàn bộ (FULL) mỗi FULL_RESCAN_EVERY
+  // vòng, các vòng còn lại chỉ xử lý doc mới/thay đổi. Quét toàn bộ mỗi 60s
+  // là nguyên nhân CPU 79% + sập VM khi collection lớn.
+  const FULL_RESCAN_EVERY = 30; // 30 vòng x 60s ≈ 30 phút quét toàn bộ 1 lần
+  const WATERMARK_OVERLAP_MS = 5 * 60 * 1000; // chồng 5 phút, tránh sót doc cập nhật muộn
+  let loopCount = 0;
+  let watermark = 0; // 0 = vòng đầu quét toàn bộ
+  let cachedMaps = null;
+
   // Hàm quét định kỳ thay thế Consumer — 2 lượt, bảo vệ RAM mà số vẫn chuẩn:
   // lượt 1 chỉ đếm toàn cục (projection nhẹ), lượt 2 xử lý theo batch.
   async function runAnalyzeLoop() {
     while (true) {
+      const loopStart = Date.now();
+      loopCount++;
+      const isFull = isFullLoop(loopCount, watermark, FULL_RESCAN_EVERY);
       try {
-        console.log(`\n🔍 [Scanner] Đang kiểm tra dữ liệu từ collection 'ads' trong db '${CRAWLER_DB_NAME}'...`);
+        console.log(`\n🔍 [Scanner] Vòng #${loopCount} (${isFull ? 'FULL' : 'incremental'}) — collection 'ads' trong db '${CRAWLER_DB_NAME}'...`);
 
-        // PASS 1: quét nhẹ 1 lượt để đếm toàn cục (chỉ 4 field, không giữ document)
-        const maps = emptyMaps();
-        const statsCursor = rawAdsCol.find({}, {
-          projection: { normalized_text: 1, text: 1, page_name: 1, link: 1 }
-        });
-        for await (const a of statsCursor) countIntoMaps(maps, a);
-        logMemory(`[Scanner] Pass 1 xong — unique texts (hash): ${maps.textKeys}, pages: ${Object.keys(maps.pageMap).length}, domains: ${Object.keys(maps.domainMap).length}`);
+        // Vòng FULL: pass 1 đếm toàn cục rồi xử lý hết. Vòng incremental:
+        // chỉ doc mới/thay đổi (last_seen/first_seen >= watermark), dùng lại
+        // map toàn cục của vòng FULL gần nhất — duplicate của text hoàn toàn
+        // mới có thể đếm thiếu tới vòng FULL sau (collation_count/seen_count
+        // vẫn fallback). Doc thiếu cả 2 field thời gian chỉ refresh ở vòng FULL.
+        let maps;
+        let loopQuery;
+        if (isFull) {
+          // PASS 1: quét nhẹ 1 lượt để đếm toàn cục (chỉ 4 field, không giữ document)
+          maps = emptyMaps();
+          const statsCursor = rawAdsCol.find({}, {
+            projection: { normalized_text: 1, text: 1, page_name: 1, link: 1 }
+          });
+          for await (const a of statsCursor) countIntoMaps(maps, a);
+          logMemory(`[Scanner] Pass 1 xong — unique texts (hash): ${maps.textKeys}, pages: ${Object.keys(maps.pageMap).length}, domains: ${Object.keys(maps.domainMap).length}`);
+          cachedMaps = maps;
+          loopQuery = {};
+        } else {
+          maps = cachedMaps || emptyMaps();
+          loopQuery = buildLoopQuery(false, watermark);
+        }
 
         // PASS 2: xử lý theo batch, dùng map toàn cục của pass 1
         const BATCH_SIZE = 500; // hạ xuống 200 nếu RAM vẫn căng (doc nặng)
@@ -679,7 +739,7 @@ async function main() {
           logMemory('[Analyzer] Sau mẻ');
         };
 
-        const cursor = rawAdsCol.find({}).batchSize(BATCH_SIZE);
+        const cursor = rawAdsCol.find(loopQuery).batchSize(BATCH_SIZE);
         for await (const rawAd of cursor) {
           batch.push(rawAd);
           if (batch.length >= BATCH_SIZE) {
@@ -692,14 +752,25 @@ async function main() {
           await flushBatch();
         }
 
-        // Products: ghi 1 lần duy nhất, đủ toàn bộ vòng
-        await flushProductsCollection(analyzerDb, productStats);
+        // Products: CHỈ ghi ở vòng FULL. Vòng incremental chỉ thấy 1 lát doc
+        // nên $set toàn bộ sẽ làm tụt tổng products về đúng lát đó.
+        if (isFull) {
+          // Products: ghi 1 lần duy nhất, đủ toàn bộ vòng
+          await flushProductsCollection(analyzerDb, productStats);
+        } else {
+          console.log(`⏭️ [DB Products] Bỏ qua tổng hợp products ở vòng incremental (chỉ vòng FULL mới ghi).`);
+        }
 
         if (totalProcessed > 0) {
           console.log(`✅ [Analyzer] Hoàn thành vòng này! Đã phân tích an toàn tổng cộng ${totalProcessed} quảng cáo.`);
         } else {
           console.log(`💤 [Scanner] Chưa có dữ liệu quảng cáo nào từ Crawler.`);
         }
+        const loopMs = Date.now() - loopStart;
+        console.log(`⏱️ [Scanner] Vòng #${loopCount} xong trong ${(loopMs / 1000).toFixed(1)}s, xử lý ${totalProcessed} ad.`);
+        if (loopMs > POLLING_INTERVAL) console.warn(`⚠️ [Scanner] Vòng chạy lâu hơn POLLING_INTERVAL (${POLLING_INTERVAL / 1000}s) — CPU sẽ bị chiếm gần như liên tục, cân nhắc tăng interval.`);
+        // Chỉ tiến watermark khi vòng thành công (lỗi thì giữ nguyên để vòng sau quét lại kèm chồng lấn).
+        watermark = loopStart - WATERMARK_OVERLAP_MS;
       } catch (err) {
         console.error("❌ [Loop Error] Có lỗi xảy ra trong quá trình phân tích vòng lặp:", err.message);
       }
