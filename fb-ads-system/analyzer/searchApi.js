@@ -262,6 +262,41 @@ function initSearchServer(dbInstance) {
     app.use('/static/images', express.static(imageStoragePath));
     app.use(checkSpecialHeader);
 
+    // ===== ADS TƯƠNG TỰ (dùng chung cho detail + endpoint /similar) =====
+    // Ưu tiên cùng Domain (khớp chính xác, dùng được index domain_score),
+    // nếu không có domain thì cùng Page (khớp chính xác, index page_score).
+    // Không dùng regex ở đây để tránh quét toàn collection như vụ page_name.
+    const SIMILAR_PROJECTION = {
+        ad_archive_id: 1, ad_library_url: 1, page_name: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1,
+        trending_score: 1, estimated_spend_usd: 1, start_date: 1, duplicates_count: 1, duration_days: 1,
+        industry: 1, thumbnail_r2: 1, thumbnail_local: 1, images: { $slice: 1 }, videos: { $slice: 1 }
+    };
+
+    function buildSimilarQuery(sourceAd, adId) {
+        const query = { ad_archive_id: { $ne: adId } };
+        if (sourceAd.domain) {
+            query.domain = sourceAd.domain;
+        } else if (sourceAd.page_name) {
+            query.page_name = sourceAd.page_name;
+        } else {
+            return null; // Không đủ cơ sở để tìm tương tự
+        }
+        return query;
+    }
+
+    async function fetchSimilarAds(sourceAd, adId, page, limit) {
+        const query = buildSimilarQuery(sourceAd, adId);
+        if (!query) return { similarAds: [], total: 0, pages: 0, has_more: false };
+        const total = await adsCol.countDocuments(query);
+        const similarAds = await adsCol.find(query)
+            .project(SIMILAR_PROJECTION)
+            .sort({ score: -1 })
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .toArray();
+        return { similarAds, total, pages: Math.ceil(total / limit), has_more: page * limit < total };
+    }
+
     /**
      * 🟢 API 1: TÌM KIẾM QUẢNG CÁO (Nâng cấp bộ lọc chuẩn Minea)
      * Thêm param `filter` (preset): new_ads | ready_to_scale | weekly_winner
@@ -445,7 +480,13 @@ function initSearchServer(dbInstance) {
     });
 
     /**
-     * 🟢 API 2: LẤY CHI TIẾT QUẢNG CÁO
+     * 🟢 API 2: LẤY CHI TIẾT QUẢNG CÁO (kèm ads tương tự)
+     * Mặc định trả kèm 10 ads tương tự (cùng domain, nếu không có domain
+     * thì cùng page, sort score giảm dần) trong `similar_ads` + phân trang
+     * trong `similar_pagination`. Muốn lấy thêm: gọi lại detail với
+     * ?similar_page=2 (và/hoặc ?similar_limit=N), hoặc gọi endpoint
+     * /api/ads/:id/similar?page=2. Tắt kèm similar: ?similar_limit=0
+     * hoặc ?include_similar=false. `data` giữ nguyên shape cũ.
      */
     app.get('/api/ads/detail/:id', async (req, res) => {
         try {
@@ -455,7 +496,20 @@ function initSearchServer(dbInstance) {
             const adDetail = await adsCol.findOne({ ad_archive_id: adId });
             if (!adDetail) return res.status(404).json({ success: false, message: `Không tìm thấy ID: ${adId}` });
 
-            return res.json({ success: true, data: adDetail });
+            const includeSimilar = req.query.include_similar !== 'false' && req.query.include_similar !== '0';
+            const similarLimit = req.query.similar_limit === undefined
+                ? 10
+                : Math.min(Math.max(parseInt(req.query.similar_limit, 10) || 0, 0), 20);
+            const similarPage = Math.max(parseInt(req.query.similar_page, 10) || 1, 1);
+            let similarAds = [];
+            let similarPagination = { total: 0, page: similarPage, limit: similarLimit, pages: 0, has_more: false };
+            if (includeSimilar && similarLimit > 0) {
+                const result = await fetchSimilarAds(adDetail, adId, similarPage, similarLimit);
+                similarAds = result.similarAds;
+                similarPagination = { total: result.total, page: similarPage, limit: similarLimit, pages: result.pages, has_more: result.has_more };
+            }
+
+            return res.json({ success: true, data: adDetail, similar_ads: similarAds, similar_pagination: similarPagination });
         } catch (error) {
             return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
         }
@@ -464,36 +518,24 @@ function initSearchServer(dbInstance) {
     /**
      * 🟢 API 3: QUẢNG CÁO TƯƠNG TỰ (SIMILAR ADS) - Tính năng Minea
      * Tìm các quảng cáo chung Domain hoặc chung Page để gợi ý.
+     * Phân trang để lấy thêm: ?page=1&limit=10 (mặc định limit 10, tối đa
+     * 50). Response giữ `data` là mảng như cũ, thêm `pagination`.
      */
     app.get('/api/ads/:id/similar', async (req, res) => {
         try {
             const adId = req.params.id;
-            const limit = Math.min(parseInt(req.query.limit, 10) || 10, 50);
+            const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 50);
+            const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
 
             const sourceAd = await adsCol.findOne({ ad_archive_id: adId });
             if (!sourceAd) return res.status(404).json({ success: false, message: 'Ad not found.' });
 
-            const query = { ad_archive_id: { $ne: adId } };
-
-            // Ưu tiên tìm cùng Domain, nếu không có domain thì tìm cùng Page
-            if (sourceAd.domain) {
-                query.domain = sourceAd.domain;
-            } else if (sourceAd.page_name) {
-                query.page_name = sourceAd.page_name;
-            } else {
-                return res.json({ success: true, data: [] }); // Không đủ cơ sở để tìm tương tự
-            }
-
-            const similarAds = await adsCol.find(query)
-                .project({
-                    ad_archive_id: 1, ad_library_url: 1, page_name: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1,
-                    estimated_spend_usd: 1, thumbnail_local: 1, images: { $slice: 1 }, videos: { $slice: 1 }
-                })
-                .sort({ score: -1 })
-                .limit(limit)
-                .toArray();
-
-            return res.json({ success: true, data: similarAds });
+            const result = await fetchSimilarAds(sourceAd, adId, page, limit);
+            return res.json({
+                success: true,
+                pagination: { total: result.total, page, limit, pages: result.pages, has_more: result.has_more },
+                data: result.similarAds
+            });
         } catch (error) {
             return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
         }
