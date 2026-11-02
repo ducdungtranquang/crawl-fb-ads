@@ -67,6 +67,40 @@ function calcGrowthFallback(ad) {
   return ad.seen_count / ageHours;
 }
 
+// ===== PHÂN LOẠI NGÀNH NGHỀ =====
+// value: mã chuẩn lưu trong field `industry` (API lọc theo đó, FE map theo
+// value). PHẢI KHỚP với INDUSTRIES trong searchApi.js — đổi value ở đây thì
+// đổi cả bên kia. keywords: cụm từ đã normalize (chữ thường, giữ dấu) để
+// phân loại từ text + headline. Thứ tự mảng = thứ tự ưu tiên khi ad khớp
+// nhiều ngành (khớp trước thắng). Bảng này KHÔNG dùng cho hệ số spend
+// (mInd) — mInd giữ nguyên 3 nhánh cũ trong estimateSpendAndReach để không
+// đổi số spend đã tính (vd: "thực phẩm chức năng" phân loại beauty_health
+// nhưng mInd vẫn 1.0 như cũ).
+const INDUSTRY_CATEGORIES = [
+  { value: 'beauty_health', keywords: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc'] },
+  { value: 'electronics', keywords: ['điện thoại', 'iphone', 'samsung', 'laptop', 'macbook', 'tai nghe', 'airpods', 'đồng hồ thông minh', 'smartwatch', 'apple watch', 'máy tính bảng', 'ipad', 'loa bluetooth', 'camera', 'flycam', 'sạc dự phòng', 'bàn phím', 'chuột gaming', 'phụ kiện điện thoại'] },
+  { value: 'fashion', keywords: ['thời trang', 'quần áo', 'giày', 'túi', 'đồng hồ', 'fashion', 'wear', 'váy', 'đầm', 'áo dài', 'sneaker', 'dép', 'quần jean', 'áo khoác', 'túi xách', 'giày dép'] },
+  { value: 'home_living', keywords: ['nội thất', 'sofa', 'bàn ghế', 'đèn', 'chăn ga', 'gối', 'rèm', 'vệ sinh', 'làm sạch', 'tẩy rửa', 'nước giặt', 'nước rửa chén', 'lau nhà', 'hút bụi', 'máy lọc nước', 'máy lọc không khí', 'đồ gia dụng', 'nhà bếp', 'xoong', 'chảo'] },
+  { value: 'food_beverage', keywords: ['nhà hàng', 'quán ăn', 'đồ ăn', 'thực phẩm', 'bánh', 'kẹo', 'cà phê', 'trà sữa', 'đồ uống', 'yến sào', 'hải sản', 'đặc sản', 'ăn vặt', 'thịt bò', 'gạo'] },
+  { value: 'real_estate', keywords: ['bất động sản', 'nhà đất', 'căn hộ', 'chung cư', 'đất nền', 'biệt thự', 'nhà phố', 'shophouse', 'cho thuê nhà', 'bán nhà', 'dự án căn hộ'] },
+  { value: 'finance', keywords: ['tài chính', 'đầu tư', 'crypto', 'forex', 'bank', 'ngân hàng', 'chứng khoán', 'cổ phiếu', 'vay vốn', 'vay tiền', 'bảo hiểm', 'tín dụng', 'coin', 'bitcoin', 'trading', 'lãi suất', 'thẻ tín dụng'] },
+  { value: 'education', keywords: ['khóa học', 'học tiếng anh', 'đào tạo', 'tuyển sinh', 'luyện thi', 'ielts', 'toeic', 'học online', 'gia sư', 'du học', 'kỹ năng'] },
+  { value: 'automotive', keywords: ['ô tô', 'xe hơi', 'xe máy', 'xe điện', 'phụ kiện ô tô', 'độ xe', 'lốp xe', 'bảo dưỡng xe', 'mua bán xe', 'xe tải'] },
+  { value: 'pets', keywords: ['thú cưng', 'thức ăn cho chó', 'thức ăn cho mèo', 'cát mèo', 'phụ kiện thú cưng', 'spa thú cưng', 'chó', 'mèo'] },
+  { value: 'travel', keywords: ['du lịch', 'tour', 'vé máy bay', 'khách sạn', 'resort', 'nghỉ dưỡng', 'combo du lịch', 'visa', 'hộ chiếu', 'vé tham quan'] },
+  { value: 'entertainment', keywords: ['game', 'trò chơi', 'phim', 'ca nhạc', 'concert', 'vé xem phim', 'truyện', 'livestream', 'giải trí', 'pubg', 'liên quân', 'nạp game'] },
+  { value: 'gambling', keywords: ['casino', 'cá cược', 'cá độ', 'nhà cái', 'tài xỉu', 'xóc đĩa', 'bắn cá', 'nổ hũ', 'lô đề', 'đánh bài', 'poker'] },
+  { value: 'other', keywords: [] },
+];
+
+function classifyIndustry(ad) {
+  const fullText = normalize((ad.text || '') + ' ' + (ad.headline || ''));
+  for (const cat of INDUSTRY_CATEGORIES) {
+    if (cat.keywords.some(k => fullText.includes(k))) return cat.value;
+  }
+  return 'other';
+}
+
 function detectFunnel(ad) {
   const text = (ad.text || '').toLowerCase();
   const link = (ad.link || '').toLowerCase();
@@ -225,7 +259,7 @@ function emptyMaps() {
 // boolean có index (đếm/lọc nhanh), thay vì chạy $or + nhiều range mỗi request.
 // Đổi ngưỡng ở đây thì đổi cả bên searchApi.js cho khớp.
 const PRESET_THRESHOLDS = {
-  new_max_days: 3,
+  new_max_days: 5,
   scale_min_days: 3,
   scale_max_days: 7,
   scale_min_duplicates: 2,
@@ -386,6 +420,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       burst,
       fallback_growth: fallback,
       funnel: detectFunnel(ad),
+      industry: classifyIndustry(ad),
       ...detailSummary,
       keyword_frequency: (Array.isArray(ad.keyword_mentions) ? ad.keyword_mentions : []).length,
       country_frequency: (Array.isArray(ad.country_mentions) ? ad.country_mentions : []).length
@@ -515,6 +550,7 @@ async function syncToElasticsearch(esClient, analyzedAds) {
       scaling_score: ad.scaling_score || 0,
       trending_score: ad.trending_score || 0,
       funnel: ad.funnel || '',
+      industry: ad.industry || 'other',
       scaling_level: ad.scaling_level || ''
     }));
     if (!docs.length) continue;
@@ -641,6 +677,7 @@ async function main() {
         { key: { estimated_reach: -1 }, name: "reach_sort" },
         { key: { domain: 1 }, name: "domain_filter" },
         { key: { level: 1 }, name: "level_filter" },
+        { key: { industry: 1 }, name: "idx_industry" },
         { key: { trending_score: -1 }, name: "trending_sort" },
         { key: { duration_days: 1 }, name: "idx_duration_days" },
         { key: { last_seen: -1 }, name: "idx_last_seen" },
@@ -720,3 +757,7 @@ main().then(() => process.exit(0)).catch((err) => {
   console.error('❌ [Analyzer] Lỗi không xử lý được:', err);
   process.exit(1);
 });
+
+
+// Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS };
