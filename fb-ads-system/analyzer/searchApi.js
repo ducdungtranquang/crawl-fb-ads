@@ -90,6 +90,19 @@ function escapeRegExp(s) {
     return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Regex tiền tố có neo (^): Mongo mới dùng được index trên field đó để thu
+// hẹp phạm vi quét. Regex không neo ("Thái Dao" không có ^) bắt Mongo quét
+// toàn bộ collection + sort lại trong RAM — đó là nguyên nhân
+// page_name + sort_by=start_date timeout, trong khi weekly_winner (cờ
+// boolean + sort trending_score khớp đầu index idx_weekly_winner) chỉ mất
+// vài giây. escape để ký tự đặc biệt trong tên Page/domain không bị hiểu
+// thành regex. Đánh đổi: chỉ khớp Page/domain BẮT ĐẦU bằng chuỗi nhập;
+// muốn tìm chuỗi con ở giữa tên thì cần field chuẩn hóa / ES, không dùng
+// regex không neo trên Mongo.
+function prefixRegex(s) {
+    return new RegExp(`^${escapeRegExp(String(s).trim())}`, 'i');
+}
+
 // Bỏ dấu tiếng Việt để bắt thêm trường hợp text đã strip dấu lúc index.
 function stripViDiacritics(s) {
     return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D');
@@ -324,8 +337,8 @@ function initSearchServer(dbInstance) {
                 const codeRe = new RegExp(`^${escapeRegExp(String(country).trim())}$`, 'i');
                 query.$or = [{ country_mentions: codeRe }, { latest_detail_country: codeRe }];
             }
-            if (page_name) query.page_name = { $regex: String(page_name), $options: 'i' };
-            if (domain) query.domain = { $regex: String(domain), $options: 'i' };
+            if (page_name) query.page_name = prefixRegex(page_name);
+            if (domain) query.domain = prefixRegex(domain);
             if (is_active !== undefined) query.is_active = is_active === 'true';
 
             if (date_from || date_to) {
@@ -380,7 +393,7 @@ function initSearchServer(dbInstance) {
                     start_date: 1, seen_count: 1, score: 1, level: 1, trending_score: 1, scaling_score: 1,
                     estimated_spend_usd: 1, estimated_spend_min_usd: 1, estimated_spend_max_usd: 1,
                     estimated_spend: 1, estimated_reach: 1, estimated_reach_min: 1, estimated_reach_max: 1,
-                    duplicates_count: 1, duration_days: 1, cpm_used: 1, filter_signals: 1, industry: 1,
+                    duplicates_count: 1, duration_days: 1, cpm_used: 1, filter_signals: 1, industry: 1, thumbnail_r2: 1,
                     scaling_level: 1, funnel: 1, analyzed_at: 1,
                     thumbnail_local: 1, is_active: 1, images: { $slice: 1 }, videos: { $slice: 1 }
                 })
@@ -570,7 +583,7 @@ function initSearchServer(dbInstance) {
     });
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, prefixRegex, escapeRegExp };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
