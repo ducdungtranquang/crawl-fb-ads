@@ -34,7 +34,7 @@ function checkSpecialHeader(req, res, next) {
 // qua query param — xem FILTER_DEFAULTS. Ngưỡng mặc định phải khớp
 // PRESET_THRESHOLDS trong analyzer.js (nơi tính sẵn cờ filter_signals.*).
 const FILTER_DEFAULTS = {
-    new_max_days: 3,            // Ads mới lên: chạy <= 3 ngày
+    new_max_days: 5,            // Ads mới lên: chạy <= 5 ngày (du di 3–5 ngày)
     scale_min_days: 3,          // Ready to Scale: chạy 3-7 ngày (giai đoạn trước winner)
     scale_max_days: 7,
     scale_min_duplicates: 2,    // ... + creative đã bị duplicate (đang nhân bản)
@@ -46,6 +46,40 @@ const FILTER_DEFAULTS = {
     winner_min_trending: 8,
     winner_max_seen_age_days: 7, // ... + còn thấy trong 7 ngày qua (0 = không ràng buộc)
 };
+
+// ===== DANH MỤC NGÀNH NGHỀ =====
+// value: mã chuẩn trong field `industry` do analyzer ghi (xem
+// INDUSTRY_CATEGORIES trong analyzer.js). PHẢI KHỚP value hai bên — đổi ở
+// đây thì đổi cả bên analyzer. FE map trực tiếp theo `value`, hiển thị theo
+// `label`. Chỉ ad nào được analyzer bản mới (có phân loại ngành) chạy qua mới
+// có field `industry`; ad cũ chưa có field sẽ không lọt khi lọc theo ngành.
+const INDUSTRIES = [
+    { value: 'beauty_health', label: 'Làm đẹp & Sức khỏe' },
+    { value: 'electronics', label: 'Điện tử & Công nghệ' },
+    { value: 'fashion', label: 'Thời trang' },
+    { value: 'home_living', label: 'Nhà cửa & Đời sống' },
+    { value: 'food_beverage', label: 'Ẩm thực & Đồ uống' },
+    { value: 'real_estate', label: 'Bất động sản' },
+    { value: 'finance', label: 'Tài chính & Đầu tư' },
+    { value: 'education', label: 'Giáo dục & Khóa học' },
+    { value: 'automotive', label: 'Ô tô & Xe cộ' },
+    { value: 'pets', label: 'Thú cưng' },
+    { value: 'travel', label: 'Du lịch & Nghỉ dưỡng' },
+    { value: 'entertainment', label: 'Giải trí & Game' },
+    { value: 'gambling', label: 'Cá cược & Casino' },
+    { value: 'other', label: 'Khác' },
+];
+const INDUSTRY_VALUES = new Set(INDUSTRIES.map(i => i.value));
+
+// Điều kiện Mongo cho param `industry` (nhiều giá trị cách nhau bằng dấu
+// phẩy, không phân biệt hoa thường). Giá trị lạ bị bỏ qua trong im lặng như
+// preset lạ; tất cả lạ thì trả null = không lọc.
+function buildIndustryCondition(industryParam) {
+    const values = String(industryParam || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    const valid = [...new Set(values)].filter(v => INDUSTRY_VALUES.has(v));
+    if (!valid.length) return null;
+    return { industry: { $in: valid } };
+}
 
 function numParam(value, fallback) {
     const n = Number(value);
@@ -210,6 +244,8 @@ function initSearchServer(dbInstance) {
      * 🟢 API 1: TÌM KIẾM QUẢNG CÁO (Nâng cấp bộ lọc chuẩn Minea)
      * Thêm param `filter` (preset): new_ads | ready_to_scale | weekly_winner
      * (nhiều preset cách nhau bằng dấu phẩy, kết hợp AND với các filter khác).
+     * Thêm param `industry`: beauty_health,fashion,... (xem INDUSTRIES;
+     * nhiều giá trị cách nhau bằng dấu phẩy, kết hợp AND với các filter khác).
      * Ngưỡng chỉnh qua: new_max_days, scale_min_days, scale_max_days,
      * scale_min_duplicates, scale_min_scaling_score, winner_min_score,
      * winner_min_trending, winner_min_duplicates, winner_min_days,
@@ -233,6 +269,7 @@ function initSearchServer(dbInstance) {
                 domain,        // Lọc theo tên miền
                 is_active,     // Lọc theo trạng thái quảng cáo (true/false)
                 filter,        // Preset kiểu Minea: new_ads | ready_to_scale | weekly_winner
+                industry,      // Lọc theo ngành nghề: beauty_health,fashion,... (xem INDUSTRIES)
             } = req.query;
 
             const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
@@ -320,10 +357,13 @@ function initSearchServer(dbInstance) {
                 query.scaling_level = { $in: words.map(w => new RegExp(escapeRegExp(w), 'i')) };
             }
 
-            // 3. PRESET KIỂU MINEA (kết hợp AND với mọi filter trên)
+            // 3. PRESET KIỂU MINEA + LỌC NGÀNH NGHỀ (kết hợp AND với mọi filter trên)
             const presetList = String(filter || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
             const presetConds = buildPresetConditions(filter, req.query);
-            if (presetConds.length) query.$and = presetConds;
+            const industryCond = buildIndustryCondition(industry);
+            const andConds = [...presetConds];
+            if (industryCond) andConds.push(industryCond);
+            if (andConds.length) query.$and = andConds;
 
             const total = Object.keys(query).length === 0 ? await adsCol.estimatedDocumentCount() : await adsCol.countDocuments(query);
 
@@ -340,7 +380,7 @@ function initSearchServer(dbInstance) {
                     start_date: 1, seen_count: 1, score: 1, level: 1, trending_score: 1, scaling_score: 1,
                     estimated_spend_usd: 1, estimated_spend_min_usd: 1, estimated_spend_max_usd: 1,
                     estimated_spend: 1, estimated_reach: 1, estimated_reach_min: 1, estimated_reach_max: 1,
-                    duplicates_count: 1, duration_days: 1, cpm_used: 1, filter_signals: 1,
+                    duplicates_count: 1, duration_days: 1, cpm_used: 1, filter_signals: 1, industry: 1,
                     scaling_level: 1, funnel: 1, analyzed_at: 1,
                     thumbnail_local: 1, is_active: 1, images: { $slice: 1 }, videos: { $slice: 1 }
                 })
@@ -352,7 +392,7 @@ function initSearchServer(dbInstance) {
                 results.sort((a, b) => (esRank.get(String(a.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER) - (esRank.get(String(b.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER));
             }
 
-            return res.json({ success: true, applied_presets: presetList, pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data: results });
+            return res.json({ success: true, applied_presets: presetList, applied_industries: industryCond ? industryCond.industry.$in : [], pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data: results });
         } catch (error) {
             return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
         }
@@ -369,10 +409,17 @@ function initSearchServer(dbInstance) {
                 const conds = buildPresetConditions(name, {});
                 presets[name] = await adsCol.countDocuments(conds.length ? { $and: conds } : {});
             }
-            return res.json({ success: true, data: { total, presets, defaults: FILTER_DEFAULTS } });
+            return res.json({ success: true, data: { total, presets, defaults: FILTER_DEFAULTS, industries: INDUSTRIES } });
         } catch (error) {
             return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
         }
+    });
+
+    /**
+     * 🟢 API 1c: DANH MỤC NGÀNH NGHỀ (để FE map filter, không cần hardcode)
+     */
+    app.get('/api/ads/industries', async (req, res) => {
+        return res.json({ success: true, data: INDUSTRIES });
     });
 
     /**
@@ -523,7 +570,7 @@ function initSearchServer(dbInstance) {
     });
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
