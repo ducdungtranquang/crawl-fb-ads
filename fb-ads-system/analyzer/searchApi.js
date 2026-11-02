@@ -90,17 +90,26 @@ function escapeRegExp(s) {
     return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Regex tiền tố có neo (^): Mongo mới dùng được index trên field đó để thu
-// hẹp phạm vi quét. Regex không neo ("Thái Dao" không có ^) bắt Mongo quét
-// toàn bộ collection + sort lại trong RAM — đó là nguyên nhân
-// page_name + sort_by=start_date timeout, trong khi weekly_winner (cờ
-// boolean + sort trending_score khớp đầu index idx_weekly_winner) chỉ mất
-// vài giây. escape để ký tự đặc biệt trong tên Page/domain không bị hiểu
-// thành regex. Đánh đổi: chỉ khớp Page/domain BẮT ĐẦU bằng chuỗi nhập;
-// muốn tìm chuỗi con ở giữa tên thì cần field chuẩn hóa / ES, không dùng
-// regex không neo trên Mongo.
+// Giữ lại để tương thích, nhưng KHÔNG dùng cho lọc page_name/domain
+// chính nữa vì regex 'i' không dùng được index (xem lowerPrefixRange).
 function prefixRegex(s) {
     return new RegExp(`^${escapeRegExp(String(s).trim())}`, 'i');
+}
+
+// Range tiền tố trên field *_lower đã chuẩn hóa (xem analyzer.js):
+// Mongo dùng được index cho $gte/$lt trên chuỗi thường, còn regex
+// không phân biệt hoa thường thì KHÔNG dùng được index — explain ngày
+// 02/11 chứng minh: regex /^Christabel/i + sort start_date, dù đã có
+// index {page_name:1, start_date:-1}, vẫn quét 314168 docs trong 50.7s
+// để trả 2 ad. Vì vậy page_name/domain KHÔNG lọc bằng regex nữa mà lọc
+// bằng range trên page_name_lower/domain_lower (đã toLowerCase sẵn,
+// index {page_name_lower:1, start_date:-1}). Chỉ khớp tên bắt đầu bằng
+// chuỗi nhập (đã lower), không phân biệt hoa thường, không tìm chuỗi
+// con ở giữa tên. Field *_lower phải được migration/analyzer ghi trước
+// khi deploy searchApi bản này, nếu không query sẽ trả rỗng.
+function lowerPrefixRange(s) {
+    const v = String(s).trim().toLowerCase();
+    return { $gte: v, $lt: v + '\uffff' };
 }
 
 // Bỏ dấu tiếng Việt để bắt thêm trường hợp text đã strip dấu lúc index.
@@ -337,8 +346,8 @@ function initSearchServer(dbInstance) {
                 const codeRe = new RegExp(`^${escapeRegExp(String(country).trim())}$`, 'i');
                 query.$or = [{ country_mentions: codeRe }, { latest_detail_country: codeRe }];
             }
-            if (page_name) query.page_name = prefixRegex(page_name);
-            if (domain) query.domain = prefixRegex(domain);
+            if (page_name) query.page_name_lower = lowerPrefixRange(page_name);
+            if (domain) query.domain_lower = lowerPrefixRange(domain);
             if (is_active !== undefined) query.is_active = is_active === 'true';
 
             if (date_from || date_to) {
@@ -583,7 +592,7 @@ function initSearchServer(dbInstance) {
     });
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, prefixRegex, escapeRegExp };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, prefixRegex, escapeRegExp, lowerPrefixRange };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
