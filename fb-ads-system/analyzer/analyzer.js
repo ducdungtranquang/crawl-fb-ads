@@ -421,6 +421,8 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       fallback_growth: fallback,
       funnel: detectFunnel(ad),
       industry: classifyIndustry(ad),
+      page_name_lower: String(ad.page_name || '').toLowerCase(),
+      domain_lower: String(domain || '').toLowerCase(),
       ...detailSummary,
       keyword_frequency: (Array.isArray(ad.keyword_mentions) ? ad.keyword_mentions : []).length,
       country_frequency: (Array.isArray(ad.country_mentions) ? ad.country_mentions : []).length
@@ -683,7 +685,9 @@ async function main() {
         { key: { last_seen: -1 }, name: "idx_last_seen" },
         { key: { 'filter_signals.is_new_ad': 1, start_date: -1 }, name: "idx_new_ad_flag" },
         { key: { 'filter_signals.is_ready_to_scale': 1, scaling_score: -1 }, name: "idx_scale_flag" },
-        { key: { 'filter_signals.is_weekly_winner': 1, trending_score: -1 }, name: "idx_winner_flag" }
+        { key: { 'filter_signals.is_weekly_winner': 1, trending_score: -1 }, name: "idx_winner_flag" },
+        { key: { page_name_lower: 1, start_date: -1 }, name: "idx_page_lower_start_date" },
+        { key: { domain_lower: 1, start_date: -1 }, name: "idx_domain_lower_start_date" }
       ]);
 
       await ensureIndexes(productsCol, [
