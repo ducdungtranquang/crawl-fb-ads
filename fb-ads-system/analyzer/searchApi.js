@@ -266,6 +266,20 @@ function initSearchServer(dbInstance) {
     // Ưu tiên cùng Domain (khớp chính xác, dùng được index domain_score),
     // nếu không có domain thì cùng Page (khớp chính xác, index page_score).
     // Không dùng regex ở đây để tránh quét toàn collection như vụ page_name.
+    // LOẠI DUPLICATE: ad tương tự phải KHÁC text chuẩn hóa của ad gốc.
+    // Đây đúng định nghĩa duplicate mà analyzer dùng để tính
+    // duplicates_count: text = normalized_text || normalize(text)
+    // (chữ thường, gộp khoảng trắng, giữ dấu), đếm trùng qua textMap,
+    // ưu tiên collation_count của Meta; text rỗng không tính là duplicate
+    // nên ad gốc text rỗng thì không loại trừ gì thêm. Nhóm collation của
+    // Meta không có ID riêng được lưu, nên không lọc trực tiếp theo nhóm
+    // đó được — ad cùng nhóm collation chia sẻ cùng creative text nên
+    // trong cùng domain/page, lọc theo normalized_text sẽ loại được
+    // chúng. Ad cùng hình nhưng khác text thì KHÔNG bị tính là duplicate
+    // theo định nghĩa này nên vẫn được giữ lại.
+    function duplicateTextOf(ad) {
+        return String(ad.normalized_text || ad.text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    }
     const SIMILAR_PROJECTION = {
         ad_archive_id: 1, ad_library_url: 1, page_name: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1,
         trending_score: 1, estimated_spend_usd: 1, start_date: 1, duplicates_count: 1, duration_days: 1,
@@ -281,6 +295,12 @@ function initSearchServer(dbInstance) {
         } else {
             return null; // Không đủ cơ sở để tìm tương tự
         }
+        // Loại ad có cùng normalized_text với ad gốc (duplicate), trừ
+        // chính ad gốc đã loại ở trên. Doc thiếu field normalized_text
+        // sẽ lọt qua $ne — field này do crawler ghi và analyzer giữ qua
+        // spread nên bình thường luôn có.
+        const dupText = duplicateTextOf(sourceAd);
+        if (dupText) query.normalized_text = { $ne: dupText };
         return query;
     }
 
@@ -481,8 +501,9 @@ function initSearchServer(dbInstance) {
 
     /**
      * 🟢 API 2: LẤY CHI TIẾT QUẢNG CÁO (kèm ads tương tự)
-     * Mặc định trả kèm 10 ads tương tự (cùng domain, nếu không có domain
-     * thì cùng page, sort score giảm dần) trong `similar_ads` + phân trang
+     * Mặc định trả kèm 10 ads tương tự không phải duplicate (cùng domain,
+     * nếu không có domain thì cùng page, khác normalized_text của ad gốc,
+     * sort score giảm dần) trong `similar_ads` + phân trang
      * trong `similar_pagination`. Muốn lấy thêm: gọi lại detail với
      * ?similar_page=2 (và/hoặc ?similar_limit=N), hoặc gọi endpoint
      * /api/ads/:id/similar?page=2. Tắt kèm similar: ?similar_limit=0
@@ -517,7 +538,8 @@ function initSearchServer(dbInstance) {
 
     /**
      * 🟢 API 3: QUẢNG CÁO TƯƠNG TỰ (SIMILAR ADS) - Tính năng Minea
-     * Tìm các quảng cáo chung Domain hoặc chung Page để gợi ý.
+     * Tìm các quảng cáo chung Domain hoặc chung Page để gợi ý, loại
+     * ad có cùng normalized_text với ad gốc (duplicate).
      * Phân trang để lấy thêm: ?page=1&limit=10 (mặc định limit 10, tối đa
      * 50). Response giữ `data` là mảng như cũ, thêm `pagination`.
      */
