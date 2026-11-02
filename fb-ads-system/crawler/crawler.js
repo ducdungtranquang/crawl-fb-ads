@@ -60,6 +60,10 @@ function getRandomUserAgent() {
     return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
+function getTodayDateStr() {
+    return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' });
+}
+
 function normalize(text) {
     return text?.toLowerCase().replace(/\s+/g, ' ').trim();
 }
@@ -355,11 +359,11 @@ async function scanKeyword(context, keyword, index, total) {
         } catch { }
     });
 
-    // LƯU Ý: Đang quét US, bạn có thể đổi 'country=US' thành 'country=VN' nếu muốn tập trung thị trường Việt Nam
-    const url = `https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=US&media_type=all&search_type=keyword_unordered&q=${encodeURIComponent(keyword)}`;
+    const today = getTodayDateStr();
+    const url = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&is_targeted_country=false&media_type=all&q=${encodeURIComponent(keyword)}&search_type=keyword_unordered&sort_data[mode]=relevancy_monthly_grouped&sort_data[direction]=desc&start_date[min]=${today}&start_date[max]=`;
 
     try {
-        console.log(`\n🔍 [Tiến trình ${index}/${total}] Đang quét từ khóa: "${keyword}"`);
+        console.log(`\n🔍 [Tiến trình ${index}/${total}] Đang quét từ khóa: "${keyword}" (Bắt đầu từ: ${today})`);
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.waitForTimeout(randomDelay(4000, 7000));
 
@@ -437,25 +441,25 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
         'friday', 'nano', 'step', 'holiday', 'hold', 'oh',
         'fa', 'leg', 'feet', 'game', 'tool', 'ad', 'spy', 'run', 'talk', 'speak', 're', 'peak',
         'black', 'red', 'white', 'blue', 'orange', 'ju','yi', 'don',        
-        'sport', 'eu', 'us',"supplements", "weight loss", "sunscreen", "acne treatment", "perfume", 
-        "milk tea", "coffee", "real estate",'pe','motor', 'bike', 'xe', 
+        'sport', 'eu', 'us', "supplements", "weight loss", "sunscreen", "acne treatment", "perfume", 
+        "milk tea", "coffee", "real estate", 'pe', 'motor', 'bike', 'xe', 
         "clothing", "shoes", 'add', 'pretty', 'anime', 'cartoon',
         'run', 'test', 'failed', 'usually', 'always', 'often ', 'improve',
         'down', 'hi', 'country', 'great', 'full', 'emotion',
         'email', 'scare', 'fear', 'oxy', 'provide', 'sick',
         'toys', 'hand', 'hair', 'lips', 'eyes', 'play',
         'jwery', 'royal', 'loyal', 'one', 'two', 'second', 'first', 'the',
-        'super', 'char', 'agile','water', 'soft', 'sea', 'beach',
+        'super', 'char', 'agile', 'water', 'soft', 'sea', 'beach',
         'update', 'tele', 'ads', 'tools', 'team',
-        'good', 'bad', 'study', 'template', 'like', 'love', 'perfume', 'sweet'
-        ,'spicy', 'sour', 'bitter', 'meat', 'chicken',
+        'good', 'bad', 'study', 'template', 'like', 'love', 'perfume', 'sweet',
+        'spicy', 'sour', 'bitter', 'meat', 'chicken',
         'cat', 'dog', 'thanks', 'grateful', 'friends', 'enemy',
         'group', 'game', 'attack', 'defend',
         'record', 'report', 'fight',
         'ai', 'image', 'video', 'clip', 'bonus', 'plus', 'all',
-        'hate','versatile', 'performance', 'quality', 'ensure', 'commit',
+        'hate', 'versatile', 'performance', 'quality', 'ensure', 'commit',
         'forget', 'miss', 'take', 'endow', 'window', 'lamp',
-        'pen', 'eraser', 'delete', 'insert', 'sandal','camera', 'follow', 
+        'pen', 'eraser', 'delete', 'insert', 'sandal', 'camera', 'follow', 
         "handbags", "watches", "accessories", "buy now", "watch now", 
         "promotion", "discount", "special offer", "e-commerce", "smartphones", 
         "laptops", "tablets", "home appliances", "motorcycles", "cars", 
