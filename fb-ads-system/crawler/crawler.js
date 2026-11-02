@@ -2,7 +2,17 @@ const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
+// [R2-THUMBNAIL] 1/4: module upload thumbnail lên Cloudflare R2 (xem r2-upload.js).
+const { uploadThumbnailToR2, r2ThumbnailExists, thumbnailKeyFor, r2PublicUrl, isR2Enabled } = require('./r2-upload');
 
+// ============================================================
+// [R2-THUMBNAIL] Các chỗ đã sửa để đẩy thumbnail lên R2:
+//   1. require('./r2-upload') ở đầu file (module upload + chống trùng)
+//   2. Hàm downloadThumbnail (HEAD R2 trước, rồi upload, fallback local)
+//   3. Dòng `const thumb = ...` trong saveAdAndDetailDirectly
+//   4. Field `thumbnail_r2` trong newAdDoc (cạnh `thumbnail_local`)
+// Muốn tắt R2: để trống key trong r2-upload.js là crawler tự về file local.
+// ============================================================
 process.removeAllListeners('warning');
 process.on('warning', (warning) => {
     if (warning.name === 'TimeoutNegativeWarning') return;
@@ -132,18 +142,30 @@ async function initializeInfrastructure() {
     console.log('✅ Crawler MongoDB connected & Index created.');
 }
 
+// [R2-THUMBNAIL] 2/4 ĐÃ SỬA: hàm này đẩy thumbnail lên R2 (HEAD check chống trùng)
+// thay vì chỉ ghi file local như trước.
 async function downloadThumbnail(page, imageUrl, adId) {
-    if (!imageUrl || !adId) return null;
+    // Thumbnail dùng chung theo hash của URL ảnh: ad trùng creative
+    // (cùng ảnh) và ad đã upload rồi đều trỏ chung 1 object R2.
+    // Check tồn tại trước: có rồi thì thôi, khỏi tải/upload lại.
+    if (!imageUrl || !adId) return { local: null, r2: null };
     try {
-        const response = await page.request.get(imageUrl, { timeout: 5000 });
-        if (!response.ok()) return null;
-        const buffer = await response.body();
-        const fileName = `${adId}.jpg`;
+        const key = thumbnailKeyFor(imageUrl);
+        if (await r2ThumbnailExists(key)) return { local: null, r2: r2PublicUrl(key) };
+        const fileName = `${path.basename(key)}`;
         const filePath = path.join(STORAGE_PATH, fileName);
+        if (!isR2Enabled()) {
+            try { await fs.promises.access(filePath); return { local: `/images/${fileName}`, r2: null }; } catch {}
+        }
+        const response = await page.request.get(imageUrl, { timeout: 5000 });
+        if (!response.ok()) return { local: null, r2: null };
+        const buffer = await response.body();
+        const r2Url = await uploadThumbnailToR2(buffer, key);
+        if (r2Url) return { local: null, r2: r2Url };
         await fs.promises.writeFile(filePath, buffer);
-        return `/images/${fileName}`; 
+        return { local: `/images/${fileName}`, r2: null };
     } catch {
-        return null;
+        return { local: null, r2: null };
     }
 }
 
@@ -157,12 +179,13 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
 
     if (!existing) {
         const firstImage = ad.images && ad.images.length > 0 ? ad.images[0] : null;
-        const localThumb = firstImage ? await downloadThumbnail(page, firstImage.original_image_url || firstImage.url, ad.ad_archive_id) : null;
+        // [R2-THUMBNAIL] 3/4: thumb = { local, r2 } — ưu tiên URL R2, fallback file local.
+        const thumb = firstImage ? await downloadThumbnail(page, firstImage.original_image_url || firstImage.url, ad.ad_archive_id) : { local: null, r2: null };
 
         const newAdDoc = {
             ...ad,
             domain,
-            thumbnail_local: localThumb,
+            thumbnail_local: thumb.local, thumbnail_r2: thumb.r2, // [R2-THUMBNAIL] 4/4: URL ảnh trên R2 (null nếu R2 tắt/lỗi)
             first_seen: now,
             last_seen: now,
             seen_count: 1,
@@ -502,7 +525,13 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
 
         // Từ khóa chung chung (dễ quét trúng nhiều camp rộng)
         "discover", "secret", "hack", "tips and tricks", "how to", "tutorial", 
-        "lifestyle", "luxury", "cheap", "save money", "glow up", "transformation"
+        "lifestyle", "luxury", "cheap", "save money", "glow up", "transformation",
+
+        // --- TỪ KHÓA BỔ SUNG (02/11/2026) — giữ nguyên toàn bộ từ khóa cũ phía trên ---
+        "headphones", "air purifier", "robot vacuum", "ergonomic chair", "collagen peptides", "probiotics",
+        "resistance bands", "red light therapy", "teeth whitening", "pet grooming", "baby toys", "wedding dress",
+        "home gym", "electric bike", "buy 1 get 1", "bundle deal", "back in stock", "gift ideas", 'no', 'yeah', 'ok', 'nope','maybe', 'fine', 'great', 'perfect', 'awesome', 'cool', 'wow', 'amazing', 'fantastic', 'incredible', 'unbelievable', 'mind-blowing', 'life-changing', 'game-changer', 'revolutionary', 
+        'cutting-edge', 'state-of-the-art', 'next-level', 'innovative', 'groundbreaking'
     ];
 
     let keywordRetries = 0;
