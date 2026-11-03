@@ -272,7 +272,11 @@ function normalizeQueryParams(raw) {
     if (text !== undefined) q.text = text;
     const country = firstParam(raw, ['country', 'countries', 'country_code']);
     if (country !== undefined) q.country = country;
-    const pageName = firstParam(raw, ['page_name', 'page', 'fanpage', 'pageName']);
+    // NOTE 2026-11-04: 'page' KHÔNG được làm alias của page_name — 'page'
+    // là số trang phân trang, route FE luôn gửi page=1 nên alias cũ biến
+    // mọi query thành lọc page_name tiền tố "1" (chỉ còn ad của page bắt
+    // đầu bằng "1": vũ trụ 335 ad, VN 19 ad, preset ra 0).
+    const pageName = firstParam(raw, ['page_name', 'fanpage', 'pageName']);
     if (pageName !== undefined) q.page_name = pageName;
     const domain = firstParam(raw, ['domain', 'landing_domain', 'site']);
     if (domain !== undefined) q.domain = domain;
