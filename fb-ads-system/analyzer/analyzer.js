@@ -77,18 +77,20 @@ function calcGrowthFallback(ad) {
 // đổi số spend đã tính (vd: "thực phẩm chức năng" phân loại beauty_health
 // nhưng mInd vẫn 1.0 như cũ).
 const INDUSTRY_CATEGORIES = [
-  { value: 'beauty_health', keywords: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc'] },
+  { value: 'beauty_health', keywords: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'thực phẩm bảo vệ sức khỏe', 'viên uống', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc', 'sữa tắm', 'nước hoa', 'son môi', 'kem dưỡng', 'mặt nạ', 'kem đánh răng', 'bàn chải đánh răng', 'đồ dùng cá nhân'] },
   { value: 'electronics', keywords: ['điện thoại', 'iphone', 'samsung', 'laptop', 'macbook', 'tai nghe', 'airpods', 'đồng hồ thông minh', 'smartwatch', 'apple watch', 'máy tính bảng', 'ipad', 'loa bluetooth', 'camera', 'flycam', 'sạc dự phòng', 'bàn phím', 'chuột gaming', 'phụ kiện điện thoại'] },
-  { value: 'fashion', keywords: ['thời trang', 'quần áo', 'giày', 'túi', 'đồng hồ', 'fashion', 'wear', 'váy', 'đầm', 'áo dài', 'sneaker', 'dép', 'quần jean', 'áo khoác', 'túi xách', 'giày dép'] },
-  { value: 'home_living', keywords: ['nội thất', 'sofa', 'bàn ghế', 'đèn', 'chăn ga', 'gối', 'rèm', 'vệ sinh', 'làm sạch', 'tẩy rửa', 'nước giặt', 'nước rửa chén', 'lau nhà', 'hút bụi', 'máy lọc nước', 'máy lọc không khí', 'đồ gia dụng', 'nhà bếp', 'xoong', 'chảo'] },
-  { value: 'food_beverage', keywords: ['nhà hàng', 'quán ăn', 'đồ ăn', 'thực phẩm', 'bánh', 'kẹo', 'cà phê', 'trà sữa', 'đồ uống', 'yến sào', 'hải sản', 'đặc sản', 'ăn vặt', 'thịt bò', 'gạo'] },
+  { value: 'fashion', keywords: ['thời trang', 'quần áo', 'giày', 'túi', 'đồng hồ', 'fashion', 'wear', 'váy', 'đầm', 'áo dài', 'sneaker', 'dép', 'quần jean', 'áo khoác', 'túi xách', 'giày dép', 'mũ', 'khăn choàng', 'thắt lưng', 'kính râm', 'trang sức', 'vòng cổ', 'nhẫn', 'bông tai', 'đồ lót', 'đồ ngủ'] },
+  { value: 'home_living', keywords: ['nội thất', 'sofa', 'bàn ghế', 'đèn', 'chăn ga', 'gối', 'rèm', 'vệ sinh', 'làm sạch', 'tẩy rửa', 'nước giặt', 'nước rửa chén', 'lau nhà', 'hút bụi', 'máy lọc nước', 'máy lọc không khí', 'đồ gia dụng', 'nhà bếp', 'xoong', 'chảo', 'gia dụng', 'đồ trang trí', 'trang trí', 'decor', 'tranh treo tường', 'gương trang trí', 'thảm trải', 'nến thơm', 'lọ hoa', 'nồi', 'bình giữ nhiệt', 'hộp đựng', 'dụng cụ nhà bếp', 'kệ', 'giá treo'] },
+  { value: 'food_beverage', keywords: ['nhà hàng', 'quán ăn', 'đồ ăn', 'thực phẩm', 'bánh', 'kẹo', 'cà phê', 'trà sữa', 'đồ uống', 'yến sào', 'hải sản', 'đặc sản', 'ăn vặt', 'thịt bò', 'gạo', 'mật ong', 'hạt dinh dưỡng', 'gia vị', 'nước mắm', 'trà'] },
+  { value: 'toys', keywords: ['đồ chơi', 'đồ chơi trẻ em', 'lego', 'mô hình', 'búp bê', 'gấu bông', 'xe đồ chơi', 'xếp hình', 'thú nhồi bông', 'robot đồ chơi', 'đồ chơi giáo dục', 'bộ xếp hình'] },
+  { value: 'plants', keywords: ['hạt giống', 'cây giống', 'cây cảnh', 'cây ăn quả', 'giống cây', 'hạt rau', 'phân bón', 'chậu cây', 'cây trồng', 'rau giống', 'hoa giống'] },
   { value: 'real_estate', keywords: ['bất động sản', 'nhà đất', 'căn hộ', 'chung cư', 'đất nền', 'biệt thự', 'nhà phố', 'shophouse', 'cho thuê nhà', 'bán nhà', 'dự án căn hộ'] },
   { value: 'finance', keywords: ['tài chính', 'đầu tư', 'crypto', 'forex', 'bank', 'ngân hàng', 'chứng khoán', 'cổ phiếu', 'vay vốn', 'vay tiền', 'bảo hiểm', 'tín dụng', 'coin', 'bitcoin', 'trading', 'lãi suất', 'thẻ tín dụng'] },
   { value: 'education', keywords: ['khóa học', 'học tiếng anh', 'đào tạo', 'tuyển sinh', 'luyện thi', 'ielts', 'toeic', 'học online', 'gia sư', 'du học', 'kỹ năng'] },
   { value: 'automotive', keywords: ['ô tô', 'xe hơi', 'xe máy', 'xe điện', 'phụ kiện ô tô', 'độ xe', 'lốp xe', 'bảo dưỡng xe', 'mua bán xe', 'xe tải'] },
   { value: 'pets', keywords: ['thú cưng', 'thức ăn cho chó', 'thức ăn cho mèo', 'cát mèo', 'phụ kiện thú cưng', 'spa thú cưng', 'chó', 'mèo'] },
   { value: 'travel', keywords: ['du lịch', 'tour', 'vé máy bay', 'khách sạn', 'resort', 'nghỉ dưỡng', 'combo du lịch', 'visa', 'hộ chiếu', 'vé tham quan'] },
-  { value: 'entertainment', keywords: ['game', 'trò chơi', 'phim', 'ca nhạc', 'concert', 'vé xem phim', 'truyện', 'livestream', 'giải trí', 'pubg', 'liên quân', 'nạp game'] },
+  { value: 'entertainment', keywords: ['game', 'trò chơi', 'phim', 'ca nhạc', 'concert', 'vé xem phim', 'truyện', 'livestream', 'giải trí', 'pubg', 'liên quân', 'nạp game', 'truyện tranh', 'tiểu thuyết', 'webtoon', 'manhwa', 'manga', 'anime', 'hoạt hình', 'truyền hình', 'gameshow', 'chương trình truyền hình', 'show truyền hình', 'phim hoạt hình', 'phim bộ', 'phim lẻ', 'esports', 'streamer', 'ngôn tình', 'xem phim', 'đọc truyện', 'thể thao điện tử', 'game thủ'] },
   { value: 'gambling', keywords: ['casino', 'cá cược', 'cá độ', 'nhà cái', 'tài xỉu', 'xóc đĩa', 'bắn cá', 'nổ hũ', 'lô đề', 'đánh bài', 'poker'] },
   { value: 'other', keywords: [] },
 ];
@@ -136,7 +138,7 @@ const CREATIVE_KINDS = {
 };
 const SHOP_CTAS = ['shop now', 'mua ngay', 'đặt hàng', 'mua hàng', 'order now', 'buy now', 'add to cart', 'thêm vào giỏ', 'đặt mua', 'mua sắm'];
 const PRODUCT_TOKENS = ['cod', 'freeship', 'miễn phí vận chuyển', 'giảm giá', '% off', 'flash sale', 'chỉ còn', 'giá chỉ', 'mua 1 tặng 1', 'khuyến mãi', 'đặt hàng', 'sale'];
-const ENTERTAINMENT_TOKENS = ['game', 'trò chơi', 'chơi game', 'phim', 'ca nhạc', 'concert', 'truyện', 'livestream', 'giải trí', 'anime', 'hoạt hình', 'webtoon', 'manhwa', 'manhua', 'manga', 'comic', 'tiểu thuyết', 'âm nhạc', 'xem phim', 'đọc truyện'];
+const ENTERTAINMENT_TOKENS = ['game', 'trò chơi', 'chơi game', 'phim', 'ca nhạc', 'concert', 'truyện', 'livestream', 'giải trí', 'anime', 'hoạt hình', 'webtoon', 'manhwa', 'manhua', 'manga', 'comic', 'tiểu thuyết', 'âm nhạc', 'xem phim', 'đọc truyện', 'truyền hình', 'gameshow', 'esports', 'streamer', 'phim hoạt hình', 'show truyền hình'];
 const AI_CONTENT_TOKENS = ['tạo bởi ai', 'ai tạo', 'video ai', 'ảnh ai', 'giọng ai', 'nhân vật ai', 'ai vẽ', 'deepfake', 'ai-generated', 'generated by ai', 'made with ai', 'do ai tạo', 'bằng ai'];
 const ENTERTAINMENT_CTAS = ['play game', 'chơi game', 'chơi ngay', 'xem ngay', 'watch now'];
 
@@ -154,6 +156,25 @@ function classifyCreativeKind(ad, funnel) {
     || AI_CONTENT_TOKENS.some((t) => fullText.includes(t));
   if (hasEntertainmentCta || hasEntertainmentText) return 'entertainment';
   return 'other';
+}
+
+
+// ===== ƯU TIÊN PRESET: SẢN PHẨM LÊN TRƯỚC, GIẢI TRÍ XUỐNG SAU =====
+// preset_priority: 0 = ngành sản phẩm ưu tiên (gia dụng, đồ chơi, thực
+// phẩm chức năng, thời trang, đồ dùng cá nhân, đồ trang trí, hạt
+// giống/cây giống), 1 = trung lập, 2 = giải trí/cá cược (game, phim,
+// truyện, chương trình truyền hình...). Chỉ dùng để XẾP HẠNG trong 3
+// preset (new_ads, ready_to_scale, weekly_winner), không lọc bỏ ad.
+// Ngành quyết định trước; ad thuần giải trí nhưng không khớp ngành nào
+// (industry 'other') mà creative_kind là entertainment cũng xuống 2.
+const PRESET_PRIORITY_INDUSTRIES = new Set(['beauty_health', 'fashion', 'home_living', 'food_beverage', 'toys', 'plants']);
+const PRESET_DEPRIORITIZED_INDUSTRIES = new Set(['entertainment', 'gambling']);
+
+function presetPriority(industry, creativeKind) {
+  if (PRESET_PRIORITY_INDUSTRIES.has(industry)) return 0;
+  if (PRESET_DEPRIORITIZED_INDUSTRIES.has(industry)) return 2;
+  if (creativeKind === 'entertainment') return 2;
+  return 1;
 }
 
 function detectFunnel(ad) {
@@ -285,6 +306,57 @@ function hashTextKey(s) {
   return (h1 >>> 0).toString(36) + ':' + (h2 >>> 0).toString(36);
 }
 
+
+// ===== GOM NHÓM DUPLICATE (1 AD GỐC / NHÓM) =====
+// Nhóm = cùng page_name (chữ thường) + cùng normalized_text. Text rỗng
+// KHÔNG gom (mỗi ad là nhóm riêng) — cùng quy tắc duplicates_count.
+// Khóa nhóm dùng chung hash 64-bit với textMap để không giữ text dài
+// trong RAM. Ad đại diện = ad chạy sớm nhất (start_date, rồi
+// first_seen); hòa thì ad_archive_id nhỏ hơn thắng để quyết định
+// deterministic dù thứ tự cursor đổi. Crawler không lưu page_id nên
+// dùng page_name làm khóa page (khớp với pageMap hiện có).
+function groupKeyFor(pageName, text) {
+  if (!text) return null;
+  return hashTextKey(String(pageName || '').toLowerCase().trim() + '\n' + text);
+}
+
+function resolveGroupArchiveId(ad) {
+  return ad.ad_archive_id || ad.ad_id || ad.id || null;
+}
+
+function groupStartMsOf(ad) {
+  const ms = (ad.start_date ? ad.start_date * 1000 : ad.first_seen) || 0;
+  return ms > 0 ? ms : Number.MAX_SAFE_INTEGER;
+}
+
+// Cộng dồn 1 ad vào groupMap: { [key]: { repId, repStart, size } }.
+function accumulateGroupMap(groupMap, ad, text) {
+  const key = groupKeyFor(ad.page_name, text);
+  if (!key) return null;
+  const id = resolveGroupArchiveId(ad);
+  const startMs = groupStartMsOf(ad);
+  const entry = groupMap[key] || (groupMap[key] = { repId: null, repStart: Number.MAX_SAFE_INTEGER, size: 0 });
+  entry.size += 1;
+  if (id && (startMs < entry.repStart || (startMs === entry.repStart && (entry.repId === null || String(id) < String(entry.repId))))) {
+    entry.repId = id;
+    entry.repStart = startMs;
+  }
+  return key;
+}
+
+// Thông tin nhóm cho 1 ad ở pass 2 (đọc từ groupMap toàn cục của pass 1).
+// Nhóm không có ID nào (repId null) hoặc ad thiếu ID: coi là đại diện để
+// không ad nào bị ẩn khỏi list chỉ vì thiếu ID (doc thiếu ID vốn đã bị
+// bỏ qua ở bước ghi, nhưng pass 2 vẫn cần cờ an toàn).
+function selectGroupInfo(groupMap, ad, text, archiveId) {
+  const key = groupKeyFor(ad.page_name, text);
+  if (!key) return { key: null, size: 1, isRep: true };
+  const entry = groupMap && groupMap[key];
+  if (!entry) return { key, size: 1, isRep: true };
+  const isRep = !entry.repId || !archiveId || String(entry.repId) === String(archiveId);
+  return { key, size: entry.size || 1, isRep };
+}
+
 function logMemory(tag) {
   const m = process.memoryUsage();
   console.log(`${tag} — RSS ${(m.rss / 1048576).toFixed(0)}MB, heap ${(m.heapUsed / 1048576).toFixed(0)}MB`);
@@ -303,10 +375,13 @@ function countIntoMaps(maps, ad) {
     maps.textMap[k] = (maps.textMap[k] || 0) + 1; // text rỗng không đếm (tránh phình D)
   }
   if (domain) maps.domainMap[domain] = (maps.domainMap[domain] || 0) + 1;
+  // Nhóm duplicate cho dedupe: pass 1 xây groupMap toàn cục, pass 2 chỉ
+  // đọc (xem accumulateGroupMap). Text rỗng -> null, không gom.
+  if (maps.groupMap) accumulateGroupMap(maps.groupMap, ad, text);
 }
 
 function emptyMaps() {
-  return { pageMap: {}, textMap: {}, domainMap: {}, textKeys: 0 };
+  return { pageMap: {}, textMap: {}, domainMap: {}, textKeys: 0, groupMap: {} };
 }
 
 // ===== NGƯỠNG PRESET (MINEA-STYLE) — phải khớp FILTER_DEFAULTS trong searchApi.js =====
@@ -336,6 +411,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     for (const ad of ads) countIntoMaps(maps, ad);
   }
   const { pageMap, textMap, domainMap } = maps;
+  const groupMap = maps.groupMap || {};
 
   return ads.map(ad => {
     const text = ad.normalized_text || normalize(ad.text || '');
@@ -353,6 +429,10 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     // thì đổi thành (ad.collation_count + 1).
     const dupFromText = text ? (textMap[hashTextKey(text)] || 0) : 0;
     const duplicatesCount = Math.max(1, Math.round(ad.collation_count || dupFromText || ad.seen_count || 1));
+    // Gom nhóm duplicate (page + text): ad đại diện = ad chạy sớm nhất.
+    // groupMap xây ở pass 1; thiếu entry (doc mới ngoài pass 1) thì coi
+    // là nhóm riêng để không ẩn nhầm.
+    const groupInfo = selectGroupInfo(groupMap, ad, text, archiveId);
 
     const spendReachData = estimateSpendAndReach(ad, durationDays, duplicatesCount);
 
@@ -436,14 +516,18 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       .map((c) => String(c).trim().toLowerCase()).filter(Boolean);
     const latestCountryLower = String(detailSummary.latest_detail_country || '').trim().toLowerCase();
     const countriesLower = [...new Set([...countryMentionsLower, ...(latestCountryLower ? [latestCountryLower] : [])])];
+    const industryValue = classifyIndustry(ad);
+    const presetPriorityValue = presetPriority(industryValue, creativeKind);
     return {
       ...ad,
       ad_archive_id: archiveId,
       domain,
       ad_library_url: archiveId ? `https://www.facebook.com/ads/library/?id=${archiveId}` : null,
       score,
-      duration_days: Math.round(durationDays),
       duplicates_count: duplicatesCount,
+      duplicate_group_key: groupInfo.key,
+      duplicate_group_size: groupInfo.size,
+      is_group_rep: groupInfo.isRep,
       page_ads_count: pageAds,
       domain_ads_count: domainAds,
       clones_count: clones,
@@ -487,7 +571,8 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       burst,
       fallback_growth: fallback,
       funnel: funnelValue,
-      industry: classifyIndustry(ad),
+      industry: industryValue,
+      preset_priority: presetPriorityValue,
       creative_kind: creativeKind,
       creative_rank: CREATIVE_KINDS[creativeKind],
       // "Đang chạy" = còn thấy trong 7 ngày qua (last_seen, ms). Quy tắc
@@ -625,6 +710,9 @@ async function syncToElasticsearch(esClient, analyzedAds) {
       estimated_reach_max: ad.estimated_reach_max || 0,
       estimated_spend: ad.estimated_spend || '',
       duplicates_count: ad.duplicates_count || 1,
+      duplicate_group_size: ad.duplicate_group_size || 1,
+      is_group_rep: ad.is_group_rep !== false,
+      preset_priority: ad.preset_priority ?? 1,
       duration_days: ad.duration_days || 0,
       scaling_score: ad.scaling_score || 0,
       trending_score: ad.trending_score || 0,
@@ -687,6 +775,9 @@ async function ensureIndexExists(esClient) {
         estimated_reach_max: { type: 'long' },
         estimated_spend: { type: 'keyword' },
         duplicates_count: { type: 'long' },
+        duplicate_group_size: { type: 'long' },
+        is_group_rep: { type: 'boolean' },
+        preset_priority: { type: 'long' },
         duration_days: { type: 'double' },
         scaling_score: { type: 'double' },
         trending_score: { type: 'double' },
@@ -780,6 +871,12 @@ async function main() {
         { key: { scaling_level: 1, start_date: -1 }, name: "idx_scaling_start_date" },
         { key: { estimated_spend: 1, start_date: -1 }, name: "idx_spend_tier_start_date" },
         { key: { start_date: -1 }, name: "idx_start_date" },
+        { key: { duplicate_group_key: 1 }, name: "idx_group_key" },
+        { key: { is_group_rep: 1, start_date: -1 }, name: "idx_group_rep_start_date" },
+        { key: { preset_priority: 1, creative_rank: 1, start_date: -1 }, name: "idx_preset_priority" },
+        { key: { 'filter_signals.is_new_ad': 1, preset_priority: 1, start_date: -1 }, name: "idx_new_ad_priority" },
+        { key: { 'filter_signals.is_ready_to_scale': 1, preset_priority: 1, scaling_score: -1 }, name: "idx_scale_priority" },
+        { key: { 'filter_signals.is_weekly_winner': 1, preset_priority: 1, trending_score: -1 }, name: "idx_winner_priority" },
         { key: { page_name_lower: 1, score: -1 }, name: "idx_page_lower_score" },
         { key: { domain_lower: 1, score: -1 }, name: "idx_domain_lower_score" }
       ]);
@@ -802,7 +899,7 @@ async function main() {
     // PASS 1: quét nhẹ 1 lượt để đếm toàn cục (chỉ 4 field, không giữ document)
     const maps = emptyMaps();
     const statsCursor = rawAdsCol.find({}, {
-      projection: { normalized_text: 1, text: 1, page_name: 1, link: 1 }
+      projection: { normalized_text: 1, text: 1, page_name: 1, link: 1, ad_archive_id: 1, ad_id: 1, id: 1, start_date: 1, first_seen: 1 }
     });
     for await (const a of statsCursor) countIntoMaps(maps, a);
     logMemory(`[Scanner] Pass 1 xong — unique texts (hash): ${maps.textKeys}, pages: ${Object.keys(maps.pageMap).length}, domains: ${Object.keys(maps.domainMap).length}`);
@@ -858,4 +955,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally };

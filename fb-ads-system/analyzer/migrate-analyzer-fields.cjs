@@ -9,7 +9,14 @@
  *   country_mentions_lower, latest_detail_country_lower, countries_lower,
  *   industry (phân loại lại bằng đúng bảng từ khóa của analyzer.js,
  *   với quy tắc khớp nguyên từ cho từ đơn — xem industryKeywordMatch),
+ *   preset_priority (0 sản phẩm ưu tiên / 1 trung lập / 2 giải trí —
+ *   cùng quy tắc presetPriority của analyzer.js, từ industry +
+ *   creative_rank đã có trên doc),
  *   is_active (còn thấy trong 7 ngày qua, cùng quy tắc searchApi).
+ * KHÔNG migrate field nhóm duplicate (duplicate_group_key/size,
+ * is_group_rep): chúng cần đếm toàn cục ở pass 1 của analyzer —
+ * chỉ 1 lượt analyzer FULL mới ghi đúng. Dedupe ở API ở chế độ
+ * fallback (dedupe_fallback='schema') cho tới lượt đó.
  * Ngoài ra ghi lại countries_lower cho doc đã có field nhưng thiếu
  * 'all'/latest country? Không: chỉ ghi field còn thiếu hoặc doc được
  * chọn bởi filter bên dưới; doc đã đủ field thì bỏ qua.
@@ -35,18 +42,20 @@ const ACTIVE_WINDOW_MS = 7 * 24 * 3600 * 1000;
 // thời điểm viết script 03/11). Analyzer chạy lại là nguồn chính xác
 // nhất; script này chỉ để bộ lọc chạy đúng ngay trước lượt analyzer đó.
 const INDUSTRY_CATEGORIES = [
-  { value: 'beauty_health', keywords: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc'] },
+  { value: 'beauty_health', keywords: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'thực phẩm bảo vệ sức khỏe', 'viên uống', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc', 'sữa tắm', 'nước hoa', 'son môi', 'kem dưỡng', 'mặt nạ', 'kem đánh răng', 'bàn chải đánh răng', 'đồ dùng cá nhân'] },
   { value: 'electronics', keywords: ['điện thoại', 'iphone', 'samsung', 'laptop', 'macbook', 'tai nghe', 'airpods', 'đồng hồ thông minh', 'smartwatch', 'apple watch', 'máy tính bảng', 'ipad', 'loa bluetooth', 'camera', 'flycam', 'sạc dự phòng', 'bàn phím', 'chuột gaming', 'phụ kiện điện thoại'] },
-  { value: 'fashion', keywords: ['thời trang', 'quần áo', 'giày', 'túi', 'đồng hồ', 'fashion', 'wear', 'váy', 'đầm', 'áo dài', 'sneaker', 'dép', 'quần jean', 'áo khoác', 'túi xách', 'giày dép'] },
-  { value: 'home_living', keywords: ['nội thất', 'sofa', 'bàn ghế', 'đèn', 'chăn ga', 'gối', 'rèm', 'vệ sinh', 'làm sạch', 'tẩy rửa', 'nước giặt', 'nước rửa chén', 'lau nhà', 'hút bụi', 'máy lọc nước', 'máy lọc không khí', 'đồ gia dụng', 'nhà bếp', 'xoong', 'chảo'] },
-  { value: 'food_beverage', keywords: ['nhà hàng', 'quán ăn', 'đồ ăn', 'thực phẩm', 'bánh', 'kẹo', 'cà phê', 'trà sữa', 'đồ uống', 'yến sào', 'hải sản', 'đặc sản', 'ăn vặt', 'thịt bò', 'gạo'] },
+  { value: 'fashion', keywords: ['thời trang', 'quần áo', 'giày', 'túi', 'đồng hồ', 'fashion', 'wear', 'váy', 'đầm', 'áo dài', 'sneaker', 'dép', 'quần jean', 'áo khoác', 'túi xách', 'giày dép', 'mũ', 'khăn choàng', 'thắt lưng', 'kính râm', 'trang sức', 'vòng cổ', 'nhẫn', 'bông tai', 'đồ lót', 'đồ ngủ'] },
+  { value: 'home_living', keywords: ['nội thất', 'sofa', 'bàn ghế', 'đèn', 'chăn ga', 'gối', 'rèm', 'vệ sinh', 'làm sạch', 'tẩy rửa', 'nước giặt', 'nước rửa chén', 'lau nhà', 'hút bụi', 'máy lọc nước', 'máy lọc không khí', 'đồ gia dụng', 'nhà bếp', 'xoong', 'chảo', 'gia dụng', 'đồ trang trí', 'trang trí', 'decor', 'tranh treo tường', 'gương trang trí', 'thảm trải', 'nến thơm', 'lọ hoa', 'nồi', 'bình giữ nhiệt', 'hộp đựng', 'dụng cụ nhà bếp', 'kệ', 'giá treo'] },
+  { value: 'food_beverage', keywords: ['nhà hàng', 'quán ăn', 'đồ ăn', 'thực phẩm', 'bánh', 'kẹo', 'cà phê', 'trà sữa', 'đồ uống', 'yến sào', 'hải sản', 'đặc sản', 'ăn vặt', 'thịt bò', 'gạo', 'mật ong', 'hạt dinh dưỡng', 'gia vị', 'nước mắm', 'trà'] },
+  { value: 'toys', keywords: ['đồ chơi', 'đồ chơi trẻ em', 'lego', 'mô hình', 'búp bê', 'gấu bông', 'xe đồ chơi', 'xếp hình', 'thú nhồi bông', 'robot đồ chơi', 'đồ chơi giáo dục', 'bộ xếp hình'] },
+  { value: 'plants', keywords: ['hạt giống', 'cây giống', 'cây cảnh', 'cây ăn quả', 'giống cây', 'hạt rau', 'phân bón', 'chậu cây', 'cây trồng', 'rau giống', 'hoa giống'] },
   { value: 'real_estate', keywords: ['bất động sản', 'nhà đất', 'căn hộ', 'chung cư', 'đất nền', 'biệt thự', 'nhà phố', 'shophouse', 'cho thuê nhà', 'bán nhà', 'dự án căn hộ'] },
   { value: 'finance', keywords: ['tài chính', 'đầu tư', 'crypto', 'forex', 'bank', 'ngân hàng', 'chứng khoán', 'cổ phiếu', 'vay vốn', 'vay tiền', 'bảo hiểm', 'tín dụng', 'coin', 'bitcoin', 'trading', 'lãi suất', 'thẻ tín dụng'] },
   { value: 'education', keywords: ['khóa học', 'học tiếng anh', 'đào tạo', 'tuyển sinh', 'luyện thi', 'ielts', 'toeic', 'học online', 'gia sư', 'du học', 'kỹ năng'] },
   { value: 'automotive', keywords: ['ô tô', 'xe hơi', 'xe máy', 'xe điện', 'phụ kiện ô tô', 'độ xe', 'lốp xe', 'bảo dưỡng xe', 'mua bán xe', 'xe tải'] },
   { value: 'pets', keywords: ['thú cưng', 'thức ăn cho chó', 'thức ăn cho mèo', 'cát mèo', 'phụ kiện thú cưng', 'spa thú cưng', 'chó', 'mèo'] },
   { value: 'travel', keywords: ['du lịch', 'tour', 'vé máy bay', 'khách sạn', 'resort', 'nghỉ dưỡng', 'combo du lịch', 'visa', 'hộ chiếu', 'vé tham quan'] },
-  { value: 'entertainment', keywords: ['game', 'trò chơi', 'phim', 'ca nhạc', 'concert', 'vé xem phim', 'truyện', 'livestream', 'giải trí', 'pubg', 'liên quân', 'nạp game'] },
+  { value: 'entertainment', keywords: ['game', 'trò chơi', 'phim', 'ca nhạc', 'concert', 'vé xem phim', 'truyện', 'livestream', 'giải trí', 'pubg', 'liên quân', 'nạp game', 'truyện tranh', 'tiểu thuyết', 'webtoon', 'manhwa', 'manga', 'anime', 'hoạt hình', 'truyền hình', 'gameshow', 'chương trình truyền hình', 'show truyền hình', 'phim hoạt hình', 'phim bộ', 'phim lẻ', 'esports', 'streamer', 'ngôn tình', 'xem phim', 'đọc truyện', 'thể thao điện tử', 'game thủ'] },
   { value: 'gambling', keywords: ['casino', 'cá cược', 'cá độ', 'nhà cái', 'tài xỉu', 'xóc đĩa', 'bắn cá', 'nổ hũ', 'lô đề', 'đánh bài', 'poker'] },
   { value: 'other', keywords: [] },
 ];
@@ -66,6 +75,14 @@ function classifyIndustry(doc) {
   }
   return 'other';
 }
+const PRESET_PRIORITY_INDUSTRIES = new Set(['beauty_health', 'fashion', 'home_living', 'food_beverage', 'toys', 'plants']);
+function presetPriorityValue(industry, creativeRank) {
+  if (PRESET_PRIORITY_INDUSTRIES.has(industry)) return 0;
+  if (industry === 'entertainment' || industry === 'gambling') return 2;
+  if (creativeRank === 2) return 2;
+  return 1;
+}
+
 function extractDomain(link) {
   try {
     const u = new URL(String(link || ''));
@@ -83,13 +100,15 @@ function computeFields(doc, nowMs) {
   const latestCountryLower = String(latestCountry).trim().toLowerCase();
   const countriesLower = [...new Set([...countryMentionsLower, ...(latestCountryLower ? [latestCountryLower] : [])])];
   const lastSeen = typeof doc.last_seen === 'number' ? doc.last_seen : 0;
+  const industry = classifyIndustry(doc);
   return {
     page_name_lower: String(doc.page_name || '').toLowerCase(),
     domain_lower: String(domain || '').toLowerCase(),
     country_mentions_lower: countryMentionsLower,
     latest_detail_country_lower: latestCountryLower,
     countries_lower: countriesLower,
-    industry: classifyIndustry(doc),
+    industry,
+    preset_priority: presetPriorityValue(industry, doc.creative_rank),
     is_active: lastSeen > 0 && (now - lastSeen) <= ACTIVE_WINDOW_MS,
   };
 }
@@ -123,13 +142,14 @@ async function main() {
         { domain_lower: { $exists: false } },
         { countries_lower: { $exists: false } },
         { industry: { $exists: false } },
+        { preset_priority: { $exists: false } },
         { is_active: { $exists: false } },
       ],
     };
     const needing = await col.countDocuments(filter);
     console.log(`Collection: ${DB_NAME}.${COL_NAME} — tổng ~${total} docs, cần migration: ${needing} docs${args.dryRun ? ' (DRY-RUN, không ghi)' : ''}${args.limit ? `, giới hạn ${args.limit}` : ''}.`);
     const cursor = col.find(filter, {
-      projection: { ad_archive_id: 1, page_name: 1, domain: 1, link: 1, text: 1, headline: 1, country_mentions: 1, latest_detail_country: 1, last_country: 1, last_seen: 1 },
+      projection: { ad_archive_id: 1, page_name: 1, domain: 1, link: 1, text: 1, headline: 1, country_mentions: 1, latest_detail_country: 1, last_country: 1, last_seen: 1, creative_rank: 1 },
       noCursorTimeout: true,
     }).batchSize(200);
     let scanned = 0, updated = 0, ops = [];
@@ -175,4 +195,4 @@ if (require.main === module) {
   main().catch(e => { console.error(e); process.exit(1); });
 }
 
-module.exports = { computeFields, classifyIndustry, industryKeywordMatch, INDUSTRY_CATEGORIES, parseArgs };
+module.exports = { computeFields, classifyIndustry, industryKeywordMatch, INDUSTRY_CATEGORIES, parseArgs, presetPriority: presetPriorityValue };

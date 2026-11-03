@@ -38,6 +38,13 @@ const INDEXES = [
   { key: { score: -1 }, name: 'idx_score' },
   { key: { score: -1, analyzed_at: -1 }, name: 'score_analyzed_sort' },
   { key: { start_date: -1 }, name: 'idx_start_date' },
+  // Gom nhóm duplicate (dedupe) + ưu tiên preset (sản phẩm lên trước).
+  { key: { duplicate_group_key: 1 }, name: 'idx_group_key' },
+  { key: { is_group_rep: 1, start_date: -1 }, name: 'idx_group_rep_start_date' },
+  { key: { preset_priority: 1, creative_rank: 1, start_date: -1 }, name: 'idx_preset_priority' },
+  { key: { 'filter_signals.is_new_ad': 1, preset_priority: 1, start_date: -1 }, name: 'idx_new_ad_priority' },
+  { key: { 'filter_signals.is_ready_to_scale': 1, preset_priority: 1, scaling_score: -1 }, name: 'idx_scale_priority' },
+  { key: { 'filter_signals.is_weekly_winner': 1, preset_priority: 1, trending_score: -1 }, name: 'idx_winner_priority' },
   { key: { last_seen: -1 }, name: 'idx_last_seen' },
   { key: { duration_days: 1 }, name: 'idx_duration_days' },
   { key: { estimated_spend_usd: -1 }, name: 'spend_usd_sort' },
