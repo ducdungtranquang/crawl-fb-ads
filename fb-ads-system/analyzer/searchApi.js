@@ -39,12 +39,12 @@ const FILTER_DEFAULTS = {
     scale_max_days: 7,
     scale_min_duplicates: 2,    // ... + creative đã bị duplicate (đang nhân bản)
     scale_min_scaling_score: 0, // 0 = không ràng buộc scaling_score (chỉ sort theo nó)
-    winner_min_days: 7,         // Weekly Winner: chạy >= 7 ngày không tắt
-    winner_max_days: 0,         // 0 = không giới hạn trên (chạy càng lâu càng win)
+    winner_min_days: 7,         // Weekly Winner: chạy 7-9 ngày không tắt (cửa sổ FE đang ép)
+    winner_max_days: 9,         // 9 = khớp route FE (winner_min_days=7&winner_max_days=9); 0 = không giới hạn trên
     winner_min_duplicates: 2,   // ... + có duplicate (duplicates_count tính cả chính ad)
-    winner_min_score: 20,       // ... + (score cao HOẶC trending cao)
-    winner_min_trending: 8,
-    winner_max_seen_age_days: 7, // ... + còn thấy trong 7 ngày qua (0 = không ràng buộc)
+    winner_min_score: 15,       // ... + (score cao HOẶC trending cao) — nới từ 20/8
+    winner_min_trending: 6,
+    winner_max_seen_age_days: 14, // ... + còn thấy trong 14 ngày qua (nới từ 7; 0 = không ràng buộc)
 };
 
 // ===== DANH MỤC NGÀNH NGHỀ =====
@@ -71,14 +71,472 @@ const INDUSTRIES = [
 ];
 const INDUSTRY_VALUES = new Set(INDUSTRIES.map(i => i.value));
 
+// ===== CHUẨN HÓA THAM SỐ ĐẦU VÀO (FIX 2026-11-03) =====
+// Test UI 03/11 cho thấy nhiều bộ lọc đứng một mình trả 0 dù dữ liệu có:
+// nguyên nhân ở searchApi gồm (1) FE gửi tên/giá trị tham số khác với tên
+// searchApi đang đọc, (2) field mới (countries_lower, page_name_lower,
+// industry, creative_rank, is_active) chưa có trên doc cũ nên điều kiện
+// equality trả rỗng, (3) field is_active analyzer chưa từng ghi. Bản này
+// chấp nhận alias + nhãn tiếng Việt + giá trị thay thế, và fallback về
+// field gốc khi field mới chưa có (xem schema probe trong handler).
+// Mọi điều kiện fallback đều chậm hơn đường nhanh, nhưng TRẢ ĐÚNG kết
+// quả; sau khi migration/analyzer chạy xong, probe sẽ tự chuyển sang
+// đường nhanh có index. Không thay đổi ngữ nghĩa của đường nhanh.
+
+function normKey(s) {
+    return stripViDiacritics(String(s || '')).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+// Mã quốc gia từ tên nước FE có thể gửi (vd "Việt Nam", "Hoa Kỳ").
+const COUNTRY_NAME_MAP = {
+    'viet nam': 'vn', vietnam: 'vn', 'vn': 'vn',
+    'hoa ky': 'us', 'united states': 'us', usa: 'us', 'us': 'us', 'my': 'us',
+    'nhat ban': 'jp', japan: 'jp', 'jp': 'jp',
+    'thai lan': 'th', thailand: 'th', 'th': 'th',
+    'philippines': 'ph', 'phi lip pin': 'ph', 'ph': 'ph',
+    'malaysia': 'my', 'ma lai xi a': 'my',
+    'indonesia': 'id', 'in do ne xi a': 'id', 'id': 'id',
+    'singapore': 'sg', 'xin ga po': 'sg', 'sg': 'sg',
+    'han quoc': 'kr', 'korea': 'kr', 'south korea': 'kr', 'kr': 'kr',
+    'anh': 'gb', 'united kingdom': 'gb', 'uk': 'gb', 'gb': 'gb',
+    'duc': 'de', germany: 'de', 'de': 'de',
+    'phap': 'fr', france: 'fr', 'fr': 'fr',
+    'canada': 'ca', 'ca': 'ca',
+    'uc': 'au', australia: 'au', 'au': 'au',
+    'brazil': 'br', 'br': 'br',
+    'mexico': 'mx', 'mx': 'mx',
+    'uae': 'ae', 'cac tieu vuong quoc a rap': 'ae', 'ae': 'ae',
+    'dai loan': 'tw', taiwan: 'tw', 'tw': 'tw',
+    'hong kong': 'hk', 'hong kong': 'hk', 'hk': 'hk',
+    'trung quoc': 'cn', china: 'cn', 'cn': 'cn',
+    'an do': 'in', india: 'in', 'in': 'in',
+    'tay ban nha': 'es', spain: 'es', 'es': 'es',
+    'y': 'it', italy: 'it', 'it': 'it',
+    'ha lan': 'nl', netherlands: 'nl', 'nl': 'nl',
+    'nga': 'ru', russia: 'ru', 'ru': 'ru',
+    'tho nhi ky': 'tr', turkey: 'tr', 'tr': 'tr',
+};
+const COUNTRY_CODE_TO_NAME = { vn: 'vietnam', us: 'united states', jp: 'japan', th: 'thailand', ph: 'philippines', my: 'malaysia', id: 'indonesia', sg: 'singapore', kr: 'korea', gb: 'united kingdom', de: 'germany', fr: 'france', ca: 'canada', au: 'australia', br: 'brazil', mx: 'mexico', ae: 'uae', tw: 'taiwan', hk: 'hong kong', cn: 'china', in: 'india', es: 'spain', it: 'italy', nl: 'netherlands', ru: 'russia', tr: 'turkey' };
+
+function normalizeCountryCodes(countryParam) {
+    const out = [];
+    for (const raw of String(countryParam || '').split(',')) {
+        const t = String(raw).trim();
+        if (!t) continue;
+        const key = normKey(t);
+        const code = COUNTRY_NAME_MAP[key] || (/^[a-z]{2}$/.test(key) ? key : null);
+        if (!code || code === 'all') continue;
+        if (!out.includes(code)) out.push(code);
+    }
+    return out;
+}
+
+// Nhãn ngành FE gửi (label hiển thị hoặc slug) -> value chuẩn.
+function normalizeIndustryValues(industryParam) {
+    const out = [];
+    for (const raw of String(industryParam || '').split(',')) {
+        const t = String(raw).trim();
+        if (!t) continue;
+        const lower = t.toLowerCase();
+        if (INDUSTRY_VALUES.has(lower)) { if (!out.includes(lower)) out.push(lower); continue; }
+        const key = normKey(t);
+        const hit = INDUSTRIES.find(i => {
+            const lk = normKey(i.label);
+            return lk === key || lk.startsWith(key) || key.startsWith(lk) || lk.includes(key);
+        });
+        if (hit && !out.includes(hit.value)) out.push(hit.value);
+    }
+    return out;
+}
+
+// Nhóm chi tiêu: FE gửi nhãn tiếng Việt ("Rất cao") hoặc tier tiếng Anh
+// ("VERY HIGH") hoặc slug. Stored values: LOW/MEDIUM/HIGH/VERY HIGH,
+// ngưỡng analyzer: LOW < $50, MEDIUM $50-299, HIGH $300-999, VERY HIGH >= $1000
+// (estimated_spend_usd). Nhãn không map được thì bỏ qua (không lọc).
+const SPEND_TIER_MAP = {
+    'rat cao': 'VERY HIGH', 'very high': 'VERY HIGH', veryhigh: 'VERY HIGH', 'very_high': 'VERY HIGH',
+    'cao': 'HIGH', high: 'HIGH',
+    'trung binh': 'MEDIUM', medium: 'MEDIUM',
+    'thap': 'LOW', low: 'LOW',
+};
+const SPEND_TIER_RANGES = { 'LOW': [0, 50], 'MEDIUM': [50, 300], 'HIGH': [300, 1000], 'VERY HIGH': [1000, Infinity] };
+
+function normalizeSpendTiers(estimatedSpendParam) {
+    const out = [];
+    for (const raw of String(estimatedSpendParam || '').split(',')) {
+        const key = normKey(raw);
+        const tier = SPEND_TIER_MAP[key] || SPEND_TIER_MAP[String(raw).trim().toLowerCase()];
+        if (tier && !out.includes(tier)) out.push(tier);
+    }
+    return out;
+}
+
+const FUNNEL_MAP = {
+    leadgen: 'LEADGEN', lead: 'LEADGEN', 'khach hang tiem nang': 'LEADGEN', 'lead gen': 'LEADGEN',
+    dropship: 'DROPSHIP', 'ban hang': 'DROPSHIP', 'drop ship': 'DROPSHIP',
+    ecom: 'ECOM', ecommerce: 'ECOM', 'e commerce': 'ECOM', 'thuong mai dien tu': 'ECOM', 'ban le': 'ECOM',
+    unknown: 'UNKNOWN', 'khac': 'UNKNOWN', 'chua ro': 'UNKNOWN', 'other': 'UNKNOWN',
+};
+function normalizeFunnelValues(funnelParam) {
+    const out = [];
+    for (const raw of String(funnelParam || '').split(',')) {
+        const key = normKey(raw);
+        const v = FUNNEL_MAP[key] || FUNNEL_MAP[String(raw).trim().toLowerCase()] || String(raw).trim().toUpperCase();
+        if (['LEADGEN', 'DROPSHIP', 'ECOM', 'UNKNOWN'].includes(v) && !out.includes(v)) out.push(v);
+    }
+    return out;
+}
+
+// is_active: FE có thể gửi boolean, số, hoặc nhãn trạng thái.
+function parseActiveParam(v) {
+    if (v === undefined || v === null || v === '') return undefined;
+    if (v === true || v === false) return v;
+    const key = normKey(v);
+    if (['true', '1', 'yes', 'active', 'running', 'dang chay', 'dang chay'].includes(key)) return true;
+    if (['false', '0', 'no', 'inactive', 'paused', 'da tat', 'dung', 'ngung'].includes(key)) return false;
+    return undefined;
+}
+
+// "Đang chạy" = còn thấy trong 7 ngày qua (last_seen, mili giây — đã kiểm
+// chứng 01/11). Analyzer bản cũ KHÔNG ghi field is_active nên lọc bằng
+// is_active trực tiếp luôn trả 0; dùng last_seen thì đúng cả trước và sau
+// khi analyzer ghi field (cùng quy tắc 7 ngày, xem analyzer.js).
+const ACTIVE_WINDOW_MS = 7 * 24 * 3600 * 1000;
+function buildActiveCondition(activeBool) {
+    const cutoff = Date.now() - ACTIVE_WINDOW_MS;
+    if (activeBool === true) return { last_seen: { $gte: cutoff } };
+    return { $or: [{ last_seen: { $lt: cutoff } }, { last_seen: { $exists: false } }] };
+}
+
+// Ngày: nhận ISO (2026-10-27), MM/DD/YYYY, hoặc epoch giây/ms (số thuần).
+function parseDateParam(v) {
+    if (v === undefined || v === null || v === '') return null;
+    const s = String(v).trim();
+    if (/^\d+$/.test(s)) {
+        const n = Number(s);
+        return n > 1e12 ? Math.floor(n / 1000) : n; // ms -> giây
+    }
+    const ms = new Date(s).getTime();
+    return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
+}
+
+// Sort: FE gửi nhiều dạng tên. Map về field thật trong analyzed_ads.
+// 'scaling'/'điểm scaling' -> scaling_score (không phải score).
+const SORT_FIELD_ALIASES = {
+    scaling_score: 'scaling_score', scalingscore: 'scaling_score', scaling: 'scaling_score',
+    'diem scaling': 'scaling_score', 'diemscaling': 'scaling_score',
+    score: 'score', diem: 'score',
+    trending_score: 'trending_score', trendingscore: 'trending_score', trending: 'trending_score',
+    start_date: 'start_date', startdate: 'start_date', newest: 'start_date', 'moi nhat': 'start_date',
+    published: 'start_date', 'moi xuat ban nhat': 'start_date',
+    duplicates_count: 'duplicates_count', duplicates: 'duplicates_count', copies: 'duplicates_count',
+    'nhieu ban sao nhat': 'duplicates_count', 'ban sao': 'duplicates_count',
+    duration_days: 'duration_days', duration: 'duration_days', 'chay lau nhat': 'duration_days',
+    estimated_spend_usd: 'estimated_spend_usd', spend: 'estimated_spend_usd',
+    'chi tieu uoc tinh cao nhat': 'estimated_spend_usd', 'chi tieu': 'estimated_spend_usd',
+    estimated_reach: 'estimated_reach', reach: 'estimated_reach',
+    'luot tiep can uoc tinh': 'estimated_reach',
+    last_seen: 'last_seen', seen_count: 'seen_count', 'luot quet thay': 'last_seen',
+    analyzed_at: 'analyzed_at', first_seen: 'first_seen',
+};
+function normalizeSortField(sortBy) {
+    const key = normKey(sortBy);
+    if (ALLOWED_SORT_FIELDS.has(String(sortBy))) return String(sortBy);
+    return SORT_FIELD_ALIASES[key] || null;
+}
+function normalizeSortOrder(sortOrder) {
+    if (sortOrder === undefined || sortOrder === null || sortOrder === '') return -1;
+    const raw = String(sortOrder).trim();
+    if (raw === '-1' || raw === 'desc' || raw === 'descending') return -1;
+    if (raw === '1' || raw === 'asc' || raw === 'ascending') return 1;
+    if (typeof sortOrder === 'number') return sortOrder === 1 ? 1 : -1;
+    const key = normKey(sortOrder);
+    if (['asc', 'tang dan', 'tang', 'ascend'].includes(key)) return 1;
+    if (['desc', 'giam dan', 'giam', 'descend'].includes(key)) return -1;
+    return -1;
+}
+
+// Lấy tham số đầu tiên khác undefined trong danh sách alias.
+function firstParam(q, names) {
+    for (const n of names) if (q[n] !== undefined && q[n] !== '') return q[n];
+    return undefined;
+}
+
+// Chuẩn hóa query: alias -> key chuẩn, giữ nguyên mọi key khác (ngưỡng
+// preset, tuning params, product_first...). Handler chỉ đọc key chuẩn.
+function normalizeQueryParams(raw) {
+    const q = { ...raw };
+    const text = firstParam(raw, ['text', 'q', 'keyword', 'search', 'search_text', 'query']);
+    if (text !== undefined) q.text = text;
+    const country = firstParam(raw, ['country', 'countries', 'country_code']);
+    if (country !== undefined) q.country = country;
+    const pageName = firstParam(raw, ['page_name', 'page', 'fanpage', 'pageName']);
+    if (pageName !== undefined) q.page_name = pageName;
+    const domain = firstParam(raw, ['domain', 'landing_domain', 'site']);
+    if (domain !== undefined) q.domain = domain;
+    const active = firstParam(raw, ['is_active', 'active', 'status', 'trang_thai']);
+    if (active !== undefined) q.is_active = active;
+    const df = firstParam(raw, ['date_from', 'start_date_from', 'from_date', 'from', 'published_from']);
+    if (df !== undefined) q.date_from = df;
+    const dt = firstParam(raw, ['date_to', 'start_date_to', 'to_date', 'to', 'published_to']);
+    if (dt !== undefined) q.date_to = dt;
+    const minS = firstParam(raw, ['min_score', 'score_min', 'minScore']);
+    if (minS !== undefined) q.min_score = minS;
+    const maxS = firstParam(raw, ['max_score', 'score_max', 'maxScore']);
+    if (maxS !== undefined) q.max_score = maxS;
+    const mts = firstParam(raw, ['min_trending_score', 'trending_min', 'minTrendingScore']);
+    if (mts !== undefined) q.min_trending_score = mts;
+    const lvl = firstParam(raw, ['level', 'ad_level']);
+    if (lvl !== undefined) q.level = lvl;
+    const spend = firstParam(raw, ['estimated_spend', 'spend', 'spend_level', 'spendLevel']);
+    if (spend !== undefined) q.estimated_spend = spend;
+    const minSpend = firstParam(raw, ['min_spend_usd', 'min_spend', 'spend_min']);
+    if (minSpend !== undefined) q.min_spend_usd = minSpend;
+    const maxSpend = firstParam(raw, ['max_spend_usd', 'max_spend', 'spend_max']);
+    if (maxSpend !== undefined) q.max_spend_usd = maxSpend;
+    const funnel = firstParam(raw, ['funnel', 'funnel_stage']);
+    if (funnel !== undefined) q.funnel = funnel;
+    const scaling = firstParam(raw, ['scaling_level', 'scaling', 'scalingLevel']);
+    if (scaling !== undefined) q.scaling_level = scaling;
+    const filter = firstParam(raw, ['filter', 'preset', 'strategy', 'filter_type']);
+    if (filter !== undefined) q.filter = filter;
+    const industry = firstParam(raw, ['industry', 'category', 'nganh']);
+    if (industry !== undefined) q.industry = industry;
+    const sortBy = firstParam(raw, ['sort_by', 'sort', 'order_by', 'sortBy']);
+    if (sortBy !== undefined) q.sort_by = sortBy;
+    const sortOrder = firstParam(raw, ['sort_order', 'order', 'sortOrder', 'direction']);
+    if (sortOrder !== undefined) q.sort_order = sortOrder;
+    const page = firstParam(raw, ['page', 'page_number']);
+    if (page !== undefined) q.page = page;
+    const limit = firstParam(raw, ['limit', 'page_size', 'per_page', 'pageSize']);
+    if (limit !== undefined) q.limit = limit;
+    return q;
+}
+
+// Preset từ nhãn FE ("Ads mới lên", "Sẵn sàng Scale", "Weekly Winner",
+// "Tất cả Ads") -> tên preset chuẩn. "Tất cả" = không preset.
+function normalizePresetNames(filterParam) {
+    const out = [];
+    for (const raw of String(filterParam || '').split(',')) {
+        const key = normKey(raw);
+        if (['new_ads', 'new', 'ads moi len', 'moi len', 'ad moi', 'new ads'].includes(key)) out.push('new_ads');
+        else if (['ready_to_scale', 'scale', 'san sang scale', 'san sang scale', 'ready to scale'].includes(key)) out.push('ready_to_scale');
+        else if (['weekly_winner', 'winner', 'weekly winner'].includes(key)) out.push('weekly_winner');
+        else if (['tat ca', 'tat ca ads', 'all', 'all ads'].includes(key)) { /* không preset */ }
+        else if (String(raw).trim()) out.push(String(raw).trim().toLowerCase());
+    }
+    return [...new Set(out)];
+}
+
+// ===== SCHEMA PROBE (fallback khi field mới chưa có) =====
+// Analyzer chạy FULL 1 lượt và ghi đè toàn bộ doc, nên field mới có hay
+// không là "tất cả hoặc không": lấy 3 doc mới thấy nhất (last_seen desc,
+// có index) là đủ biết. Probe tối đa 5 phút/lần, lỗi thì mặc định
+// fallback (an toàn: trả đúng, chậm hơn). Handler truyền probe vào các
+// builder; gọi trực tiếp (test/unit) không truyền schema thì mặc định
+// đường nhanh như cũ để không vỡ test cũ.
+const SCHEMA_PROBE_TTL_MS = 5 * 60 * 1000;
+let schemaProbeCache = { at: 0, probe: { lower: true, country: true, industry: true, rank: true, flags: true } };
+let schemaProbeInFlight = null;
+async function refreshSchemaProbe(adsCol) {
+    const now = Date.now();
+    if (now - schemaProbeCache.at < SCHEMA_PROBE_TTL_MS) return schemaProbeCache.probe;
+    if (schemaProbeInFlight) return schemaProbeInFlight;
+    schemaProbeInFlight = (async () => {
+        try {
+            const docs = await adsCol.find({})
+                .project({ page_name_lower: 1, domain_lower: 1, countries_lower: 1, industry: 1, creative_rank: 1, filter_signals: 1 })
+                .sort({ last_seen: -1 }).limit(3).toArray();
+            const probe = { lower: true, country: true, industry: true, rank: true, flags: true };
+            if (!docs.length) {
+                Object.assign(probe, { lower: false, country: false, industry: false, rank: false, flags: false });
+            } else {
+                probe.lower = docs.every(d => typeof d.page_name_lower === 'string' && typeof d.domain_lower === 'string');
+                probe.country = docs.every(d => Array.isArray(d.countries_lower));
+                probe.industry = docs.every(d => typeof d.industry === 'string' && d.industry.length > 0);
+                probe.rank = docs.every(d => typeof d.creative_rank === 'number');
+                probe.flags = docs.every(d => d.filter_signals && typeof d.filter_signals.is_new_ad === 'boolean');
+            }
+            schemaProbeCache = { at: Date.now(), probe };
+            return probe;
+        } catch (e) {
+            console.warn('[Search API] Schema probe lỗi, dùng fallback an toàn:', e.message);
+            const probe = { lower: false, country: false, industry: false, rank: false, flags: false };
+            schemaProbeCache = { at: Date.now(), probe };
+            return probe;
+        } finally {
+            schemaProbeInFlight = null;
+        }
+    })();
+    return schemaProbeInFlight;
+}
+
+// Từ khóa phân loại ngành (bản sao gọn của INDUSTRY_CATEGORIES trong
+// analyzer.js) — CHỈ dùng cho fallback khi doc chưa có field industry.
+// Analyzer chạy lại thì fallback không dùng nữa. Từ khóa ngắn (<=3 ký
+// tự) phải khớp nguyên từ, cụm dài khớp chuỗi con — cùng quy tắc với
+// classifyIndustry sau fix boundary 03/11.
+const INDUSTRY_FALLBACK_KEYWORDS = {
+    beauty_health: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc'],
+    electronics: ['điện thoại', 'iphone', 'samsung', 'laptop', 'macbook', 'tai nghe', 'airpods', 'đồng hồ thông minh', 'smartwatch', 'apple watch', 'máy tính bảng', 'ipad', 'loa bluetooth', 'camera', 'flycam', 'sạc dự phòng', 'bàn phím', 'chuột gaming', 'phụ kiện điện thoại'],
+    fashion: ['thời trang', 'quần áo', 'giày', 'túi', 'đồng hồ', 'fashion', 'wear', 'váy', 'đầm', 'áo dài', 'sneaker', 'dép', 'quần jean', 'áo khoác', 'túi xách', 'giày dép'],
+    home_living: ['nội thất', 'sofa', 'bàn ghế', 'đèn', 'chăn ga', 'gối', 'rèm', 'vệ sinh', 'làm sạch', 'tẩy rửa', 'nước giặt', 'nước rửa chén', 'lau nhà', 'hút bụi', 'máy lọc nước', 'máy lọc không khí', 'đồ gia dụng', 'nhà bếp', 'xoong', 'chảo'],
+    food_beverage: ['nhà hàng', 'quán ăn', 'đồ ăn', 'thực phẩm', 'bánh', 'kẹo', 'cà phê', 'trà sữa', 'đồ uống', 'yến sào', 'hải sản', 'đặc sản', 'ăn vặt', 'thịt bò', 'gạo'],
+    real_estate: ['bất động sản', 'nhà đất', 'căn hộ', 'chung cư', 'đất nền', 'biệt thự', 'nhà phố', 'shophouse', 'cho thuê nhà', 'bán nhà', 'dự án căn hộ'],
+    finance: ['tài chính', 'đầu tư', 'crypto', 'forex', 'bank', 'ngân hàng', 'chứng khoán', 'cổ phiếu', 'vay vốn', 'vay tiền', 'bảo hiểm', 'tín dụng', 'coin', 'bitcoin', 'trading', 'lãi suất', 'thẻ tín dụng'],
+    education: ['khóa học', 'học tiếng anh', 'đào tạo', 'tuyển sinh', 'luyện thi', 'ielts', 'toeic', 'học online', 'gia sư', 'du học', 'kỹ năng'],
+    automotive: ['ô tô', 'xe hơi', 'xe máy', 'xe điện', 'phụ kiện ô tô', 'độ xe', 'lốp xe', 'bảo dưỡng xe', 'mua bán xe', 'xe tải'],
+    pets: ['thú cưng', 'thức ăn cho chó', 'thức ăn cho mèo', 'cát mèo', 'phụ kiện thú cưng', 'spa thú cưng', 'chó', 'mèo'],
+    travel: ['du lịch', 'tour', 'vé máy bay', 'khách sạn', 'resort', 'nghỉ dưỡng', 'combo du lịch', 'visa', 'hộ chiếu', 'vé tham quan'],
+    entertainment: ['game', 'trò chơi', 'phim', 'ca nhạc', 'concert', 'vé xem phim', 'truyện', 'livestream', 'giải trí', 'pubg', 'liên quân', 'nạp game'],
+    gambling: ['casino', 'cá cược', 'cá độ', 'nhà cái', 'tài xỉu', 'xóc đĩa', 'bắn cá', 'nổ hũ', 'lô đề', 'đánh bài', 'poker'],
+};
+function industryFallbackRegex(value) {
+    const kws = (INDUSTRY_FALLBACK_KEYWORDS[value] || []).slice().sort((a, b) => b.length - a.length);
+    if (!kws.length) return null;
+    const parts = kws.map(k => {
+        const e = escapeRegExp(k);
+        return k.includes(' ') ? e : `(?:^|[^\\p{L}\\p{N}])${e}(?:$|[^\\p{L}\\p{N}])`;
+    });
+    return new RegExp(parts.join('|'), 'iu');
+}
+function buildIndustryTextCondition(values) {
+    const branches = [];
+    for (const v of values) {
+        if (v === 'other') continue; // xử lý riêng bên dưới
+        const re = industryFallbackRegex(v);
+        if (re) branches.push({ $or: [{ normalized_text: re }, { text: re }] });
+    }
+    if (values.includes('other')) {
+        // 'other' = không khớp ngành nào: NOR trên mọi regex ngành, chỉ
+        // trên normalized_text để giữ query trong tầm kiểm soát.
+        const allRes = Object.keys(INDUSTRY_FALLBACK_KEYWORDS).map(industryFallbackRegex).filter(Boolean);
+        branches.push({ $nor: allRes.map(re => ({ normalized_text: re })) });
+    }
+    if (!branches.length) return null;
+    return branches.length === 1 ? branches[0] : { $or: branches };
+}
+
+
 // Điều kiện Mongo cho param `industry` (nhiều giá trị cách nhau bằng dấu
-// phẩy, không phân biệt hoa thường). Giá trị lạ bị bỏ qua trong im lặng như
-// preset lạ; tất cả lạ thì trả null = không lọc.
-function buildIndustryCondition(industryParam) {
-    const values = String(industryParam || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-    const valid = [...new Set(values)].filter(v => INDUSTRY_VALUES.has(v));
+// phẩy; chấp nhận slug lẫn nhãn tiếng Việt, vd "Làm đẹp & Sức khỏe").
+// Đường nhanh: equality trên field `industry` do analyzer ghi. Fallback
+// khi doc chưa có field industry (schema.industryField=false): regex từ
+// khóa trên text — chậm hơn nhưng trả đúng; sau 1 lượt analyzer mới
+// thì fallback không dùng nữa. Giá trị lạ bị bỏ qua trong im lặng;
+// tất cả lạ thì trả null = không lọc.
+function buildIndustryCondition(industryParam, schema) {
+    const valid = normalizeIndustryValues(industryParam);
     if (!valid.length) return null;
-    return { industry: { $in: valid } };
+    const industryField = !schema || schema.industryField !== false;
+    if (industryField) return { industry: { $in: valid } };
+    return buildIndustryTextCondition(valid);
+}
+
+// Điều kiện Mongo cho param `country` (mã quốc gia hoặc tên nước, vd VN,
+// "Việt Nam"; nhiều giá trị cách nhau bằng dấu phẩy).
+// Đường nhanh: equality trên field chuẩn hóa countries_lower do analyzer
+// ghi (xem ghi chú cũ: regex 'i' + $or quét 314168 docs / 50.7s).
+// Fallback khi doc chưa có countries_lower (schema.migrated=false):
+// equality trên country_mentions / latest_detail_country /
+// country_mentions_lower với đủ dạng hoa/thường + tên nước — dùng được
+// index đơn field, không regex. 'ALL' không phải mã nước nên bỏ qua.
+function buildCountryCondition(countryParam, schema) {
+    const codes = normalizeCountryCodes(countryParam);
+    if (!codes.length) return null;
+    const migrated = !schema || schema.migrated !== false;
+    if (migrated) {
+        return codes.length === 1 ? { countries_lower: codes[0] } : { countries_lower: { $in: codes } };
+    }
+    const variants = [];
+    for (const c of codes) {
+        variants.push(c.toUpperCase(), c.toLowerCase());
+        const name = COUNTRY_CODE_TO_NAME[c];
+        if (name) variants.push(name);
+    }
+    const uniq = [...new Set(variants)];
+    return {
+        $or: [
+            { country_mentions_lower: { $in: codes } },
+            { country_mentions: { $in: uniq } },
+            { latest_detail_country_lower: { $in: codes } },
+            { latest_detail_country: { $in: uniq } },
+        ],
+    };
+}
+
+// Điều kiện level: DB lưu kèm prefix emoji ('🏆 LEGEND', '🔥 WINNER',
+// '⚡ POTENTIAL', 'REGULAR'). Chấp nhận mã, tên có/không emoji, và nhãn
+// tiếng Việt. Regex $in khớp chuỗi con nên 'LEGEND' bắt được '🏆 LEGEND'.
+function buildLevelCondition(levelParam) {
+    const LEVEL_MAP = {
+        legend: 'LEGEND', 'huyen thoai': 'LEGEND',
+        winner: 'WINNER', 'nguoi thang': 'WINNER', 'chien thang': 'WINNER',
+        potential: 'POTENTIAL', 'tiem nang': 'POTENTIAL',
+        regular: 'REGULAR', 'thuong': 'REGULAR', 'binh thuong': 'REGULAR',
+    };
+    const words = [];
+    for (const raw of String(levelParam || '').split(',')) {
+        const t = String(raw).trim();
+        if (!t) continue;
+        const key = normKey(t.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, ''));
+        words.push(LEVEL_MAP[key] || LEVEL_MAP[String(raw).trim().toLowerCase()] || t);
+    }
+    const uniq = [...new Set(words)].filter(Boolean);
+    if (!uniq.length) return null;
+    return { level: { $in: uniq.map(w => new RegExp(escapeRegExp(w), 'i')) } };
+}
+
+// Điều kiện scaling_level: DB chỉ có 3 giá trị ('🚀 SCALING HARD',
+// '⚡ SCALING', 'NORMAL'), FE có 4 nhãn. Map: SCALING HARD -> đúng giá
+// trị đó; 'cao' -> scaling_score >= 6 (gồm SCALING + SCALING HARD);
+// 'trung bình' -> NORMAL; 'thấp' -> NORMAL + scaling_score <= 0. FE nên
+// gửi giá trị chuẩn (SCALING HARD / SCALING / NORMAL) để khỏi phải map
+// (xem FE brief). Nhiều giá trị -> $or.
+function buildScalingCondition(scalingParam) {
+    const branches = [];
+    for (const raw of String(scalingParam || '').split(',')) {
+        const t = String(raw).trim();
+        if (!t) continue;
+        const key = normKey(t.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, ''));
+        if (key === 'scaling hard' || key === 'rat cao' || key === 'very high') {
+            branches.push({ scaling_level: new RegExp(escapeRegExp('SCALING HARD'), 'i') });
+        } else if (key === 'scaling') {
+            branches.push({ scaling_level: /^⚡ SCALING$/i });
+        } else if (key === 'cao' || key === 'high') {
+            branches.push({ scaling_score: { $gte: 6 } });
+        } else if (key === 'trung binh' || key === 'medium' || key === 'trung') {
+            branches.push({ scaling_level: new RegExp(escapeRegExp('NORMAL'), 'i') });
+        } else if (key === 'thap' || key === 'low') {
+            branches.push({ scaling_level: new RegExp(escapeRegExp('NORMAL'), 'i'), scaling_score: { $lte: 0 } });
+        } else if (key === 'normal') {
+            branches.push({ scaling_level: new RegExp(escapeRegExp('NORMAL'), 'i') });
+        } else {
+            branches.push({ scaling_level: new RegExp(escapeRegExp(t), 'i') });
+        }
+    }
+    if (!branches.length) return null;
+    return branches.length === 1 ? branches[0] : { $or: branches };
+}
+
+// Điều kiện chi tiêu: tier chuẩn (LOW/MEDIUM/HIGH/VERY HIGH) trên field
+// estimated_spend + khoảng số trên estimated_spend_usd nếu FE gửi
+// min/max bằng số. Hai điều kiện cùng lúc thì AND (cùng 1 số estimated
+// spend nên không mâu thuẫn).
+function buildSpendCondition(estimatedSpendParam, minSpendUsd, maxSpendUsd) {
+    const conds = [];
+    const tiers = normalizeSpendTiers(estimatedSpendParam);
+    if (tiers.length) conds.push({ estimated_spend: { $in: tiers } });
+    const lo = minSpendUsd !== undefined ? Number(minSpendUsd) : NaN;
+    const hi = maxSpendUsd !== undefined ? Number(maxSpendUsd) : NaN;
+    if (Number.isFinite(lo) || Number.isFinite(hi)) {
+        const range = {};
+        if (Number.isFinite(lo)) range.$gte = lo;
+        if (Number.isFinite(hi)) range.$lte = hi;
+        conds.push({ estimated_spend_usd: range });
+    }
+    if (!conds.length) return null;
+    return conds.length === 1 ? conds[0] : { $and: conds };
 }
 
 function numParam(value, fallback) {
@@ -148,6 +606,61 @@ function buildTextSearchQuery(keyword, strict) {
     return { bool: { should, minimum_should_match: 1 } };
 }
 
+// Các field sort được phép (dùng chung cho handler + resolveSearchSort).
+const ALLOWED_SORT_FIELDS = new Set(['score', 'trending_score', 'start_date', 'seen_count', 'analyzed_at', 'first_seen', 'last_seen', 'scaling_score', 'estimated_spend_usd', 'duplicates_count', 'duration_days', 'estimated_spend_max_usd', 'estimated_spend_min_usd', 'estimated_reach']);
+
+// Param tinh chỉnh theo từng preset. Một preset dùng đường nhanh cờ khi
+// user không truyền param nào, HOẶC mọi param đã truyền đều BẰNG đúng giá
+// trị mặc định — trường hợp này hay gặp nhất: route FE luôn ép
+// winner_min_days=7&winner_max_days=9, trước đây 2 param đó làm hasAnyParam
+// bật đường tính trực tiếp ($or + nhiều range, 5-8s), dù ngưỡng y hệt mặc
+// định. So sánh bằng giá trị, không so sự hiện diện, thì URL của FE đi
+// đúng đường cờ (1 field boolean có index).
+const PRESET_TUNING_KEYS = {
+    new_ads: ['new_max_days'],
+    ready_to_scale: ['scale_min_days', 'scale_max_days', 'scale_min_duplicates', 'scale_min_scaling_score'],
+    weekly_winner: ['winner_min_days', 'winner_max_days', 'winner_min_duplicates', 'winner_min_score', 'winner_min_trending', 'winner_max_seen_age_days'],
+};
+const PRESET_ALIASES = { new: 'new_ads', scale: 'ready_to_scale', winner: 'weekly_winner' };
+
+function presetUsesFlag(presetName, q) {
+    const canonical = PRESET_ALIASES[presetName] || presetName;
+    const keys = PRESET_TUNING_KEYS[canonical] || [];
+    return keys.every((k) => q[k] === undefined || Number(q[k]) === FILTER_DEFAULTS[k]);
+}
+
+// Ưu tiên ad mua sắm/bán sản phẩm (creative_rank 0) lên trước, ad thuần
+// giải trí (rank 2) xuống sau, trong các preset. Mặc định BẬT; tắt bằng
+// ?product_first=0. Sort tường minh của user vẫn được giữ làm sort thứ 2
+// (trong cùng 1 rank thì xếp theo sort đó), không bị ghi đè.
+function productFirstEnabled(q) {
+    const v = q.product_first;
+    if (v === undefined) return true;
+    return !(v === '0' || v === 'false' || v === 'no' || v === 'off');
+}
+
+// Sort cho /api/ads/search: rank trước (khi có preset + product_first
+// VÀ doc đã có creative_rank — probe nói không có rank thì bỏ rank để
+// preset không trả rỗng vì điều kiện $exists), rồi tới sort của preset
+// hoặc sort tường minh. opts.hasCreativeRank mặc định true để test cũ
+// và gọi trực tiếp không vỡ; handler truyền giá trị từ schema probe.
+// sort_by lạ -> null -> fallback 'score'; sort_order nhận cả 'asc'/'desc',
+// 'tăng dần'/'giảm dần'.
+function resolveSearchSort(presets, q, opts) {
+    const hasCreativeRank = !opts || opts.hasCreativeRank !== false;
+    const presetList = normalizePresetNames(presets);
+    const hasPreset = presetList.length > 0;
+    const presetSort = resolvePresetSort(presets, q.sort_by !== undefined);
+    const normalizedField = q.sort_by !== undefined ? normalizeSortField(q.sort_by) : null;
+    const requestedSort = presetSort ? presetSort.field : (normalizedField || 'score');
+    const requestedOrder = presetSort ? presetSort.order : normalizeSortOrder(q.sort_order);
+    const safeSortField = ALLOWED_SORT_FIELDS.has(String(requestedSort)) ? String(requestedSort) : 'score';
+    if (hasPreset && hasCreativeRank && productFirstEnabled(q)) {
+        return { sortOptions: { creative_rank: 1, [safeSortField]: requestedOrder }, rankFirst: true };
+    }
+    return { sortOptions: { [safeSortField]: requestedOrder }, rankFirst: false };
+}
+
 // Trả về mảng điều kiện Mongo cho preset (kết hợp AND với các filter khác).
 // presets: chuỗi 'new_ads,ready_to_scale' (chấp nhận alias new/scale/winner).
 // Đường nhanh: dùng cờ filter_signals.* tính sẵn bởi analyzer (1 field
@@ -159,20 +672,23 @@ function hasAnyParam(q, keys) {
     return keys.some(k => q[k] !== undefined);
 }
 
-function buildPresetConditions(presets, q) {
+function buildPresetConditions(presets, q, opts) {
+    const useFlags = !opts || opts.useFlags !== false;
     const conds = [];
-    const list = String(presets || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    const list = normalizePresetNames(presets);
     for (const p of list) {
         if (p === 'new_ads' || p === 'new') {
-            if (hasAnyParam(q, ['new_max_days'])) {
+            if (useFlags && presetUsesFlag(p, q)) {
+                conds.push({ 'filter_signals.is_new_ad': true });
+            } else {
                 conds.push({
                     duration_days: { $lte: numParam(q.new_max_days, FILTER_DEFAULTS.new_max_days) },
                 });
-            } else {
-                conds.push({ 'filter_signals.is_new_ad': true });
             }
         } else if (p === 'ready_to_scale' || p === 'scale') {
-            if (hasAnyParam(q, ['scale_min_days', 'scale_max_days', 'scale_min_duplicates', 'scale_min_scaling_score'])) {
+            if (useFlags && presetUsesFlag(p, q)) {
+                conds.push({ 'filter_signals.is_ready_to_scale': true });
+            } else {
                 // Dấu hiệu sắp scale: còn non (3-7 ngày) nhưng creative đã bị
                 // duplicate — nhà quảng cáo đang nhân bản. scaling_score chỉ dùng
                 // để sort, không ép ngưỡng vì growth_history mỏng thì điểm này
@@ -187,11 +703,11 @@ function buildPresetConditions(presets, q) {
                 const minScaling = numParam(q.scale_min_scaling_score, FILTER_DEFAULTS.scale_min_scaling_score);
                 if (minScaling > 0) cond.scaling_score = { $gte: minScaling };
                 conds.push(cond);
-            } else {
-                conds.push({ 'filter_signals.is_ready_to_scale': true });
             }
         } else if (p === 'weekly_winner' || p === 'winner') {
-            if (hasAnyParam(q, ['winner_min_days', 'winner_max_days', 'winner_min_duplicates', 'winner_min_score', 'winner_min_trending', 'winner_max_seen_age_days'])) {
+            if (useFlags && presetUsesFlag(p, q)) {
+                conds.push({ 'filter_signals.is_weekly_winner': true });
+            } else {
                 // Winner kiểu Minea: sống lâu (>= 7 ngày không tắt) + còn chạy +
                 // bị duplicate + (điểm tổng cao HOẶC đà tăng mạnh). Dùng OR cho
                 // score/trending vì ad win theo kiểu bền hoặc kiểu bùng đều tính.
@@ -217,8 +733,6 @@ function buildPresetConditions(presets, q) {
                     ] });
                 }
                 conds.push({ $and: parts });
-            } else {
-                conds.push({ 'filter_signals.is_weekly_winner': true });
             }
         }
         // preset lạ: bỏ qua trong im lặng (không vỡ request)
@@ -229,7 +743,7 @@ function buildPresetConditions(presets, q) {
 // Sort mặc định theo preset khi user không truyền sort_by tường minh.
 function resolvePresetSort(presets, hasExplicitSortBy) {
     if (hasExplicitSortBy) return null;
-    const list = String(presets || '').split(',').map(s => s.trim().toLowerCase());
+    const list = normalizePresetNames(presets);
     if (list.includes('weekly_winner') || list.includes('winner')) return { field: 'trending_score', order: -1 };
     if (list.includes('ready_to_scale') || list.includes('scale')) return { field: 'scaling_score', order: -1 };
     if (list.includes('new_ads') || list.includes('new')) return { field: 'start_date', order: -1 };
@@ -330,6 +844,11 @@ function initSearchServer(dbInstance) {
      */
     app.get('/api/ads/search', async (req, res) => {
         try {
+            // Chuẩn hóa tham số: chấp nhận alias + nhãn FE (xem
+            // normalizeQueryParams). Probe schema 1 lần để biết field mới
+            // đã có trên doc chưa — chưa có thì dùng fallback field gốc.
+            const q = normalizeQueryParams(req.query);
+            const schema = await refreshSchemaProbe(adsCol);
             const {
                 text,
                 country,
@@ -347,23 +866,28 @@ function initSearchServer(dbInstance) {
                 is_active,     // Lọc theo trạng thái quảng cáo (true/false)
                 filter,        // Preset kiểu Minea: new_ads | ready_to_scale | weekly_winner
                 industry,      // Lọc theo ngành nghề: beauty_health,fashion,... (xem INDUSTRIES)
-            } = req.query;
+            } = q;
 
-            const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-            const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 100);
+            const page = Math.max(parseInt(q.page, 10) || 1, 1);
+            const limit = Math.min(Math.max(parseInt(q.limit, 10) || 100, 1), 100);
             const skip = (page - 1) * limit;
 
             const query = {};
             let esRank = null; // thứ hạng ES, dùng sort theo relevance khi không có sort_by tường minh
+            let searchFallback = null; // 'mongo' khi ES lỗi/0-hit và phải lọc bằng Mongo
 
-            // 1. SEARCH TEXT (Elasticsearch)
+            // 1. SEARCH TEXT (Elasticsearch, fallback Mongo khi ES lỗi/0-hit)
             // Chất lượng: match_phrase (cụm đúng thứ tự) + match operator AND (đủ
             // mọi token) để "Thực phẩm chức năng" không trả về "Đà Nẵng"/"Đa năng"
             // (trước đây match OR + minimum_should_match 1 nên trúng 1 token "năng"
-            // là đã lọt). Strict mà 0 hit thì fallback sang OR như cũ.
+            // là đã lọt). Strict mà 0 hit thì fallback sang OR như cũ. ES lỗi
+            // hoặc cả 2 lượt đều 0 hit thì fallback sang regex Mongo trên
+            // text/page_name thay vì trả 500/rỗng (ES có thể chưa index kịp
+            // hoặc đang down — text search vẫn phải chạy).
             if (text) {
                 const keyword = Array.isArray(text) ? text.map(x => String(x).trim()).filter(Boolean).join(" ") : String(text).trim();
                 if (keyword) {
+                    let esIds = null;
                     try {
                         const esLimit = Math.min(Math.max(page * limit * 5, 100), 5000);
                         const esParams = {
@@ -380,35 +904,64 @@ function initSearchServer(dbInstance) {
                             hits = esResponse.hits?.hits || [];
                         }
 
-                        const adIdsFromEs = [...new Set(hits.map(hit => hit?._source?.ad_archive_id).filter(Boolean).map(String))];
-
-                        if (!adIdsFromEs.length) {
-                            return res.json({ success: true, pagination: { total: 0, page, limit, pages: 0 }, data: [] });
-                        }
-                        esRank = new Map(adIdsFromEs.map((id, i) => [id, i]));
-                        query.ad_archive_id = { $in: adIdsFromEs };
+                        // _source thiếu ad_archive_id thì dùng _id của ES doc.
+                        esIds = [...new Set(hits.map(hit => hit?._source?.ad_archive_id || hit?._id).filter(Boolean).map(String))];
                     } catch (esError) {
-                        return res.status(500).json({ success: false, message: 'Elasticsearch Error', error: esError.message });
+                        console.warn('[Search API] ES lỗi, fallback Mongo cho text search:', esError.message);
+                        searchFallback = 'mongo-after-es-error';
+                    }
+                    if (esIds && esIds.length) {
+                        esRank = new Map(esIds.map((id, i) => [id, i]));
+                        query.ad_archive_id = { $in: esIds };
+                    } else {
+                        // ES 0 hit hoặc lỗi: regex Mongo (chậm, nhưng đúng).
+                        // Dùng cụm đã escape, khớp chuỗi con trên 3 field text.
+                        searchFallback = searchFallback || 'mongo';
+                        const re = new RegExp(escapeRegExp(keyword), 'i');
+                        query.$or = [{ normalized_text: re }, { text: re }, { page_name: re }];
                     }
                 }
             }
 
             // 2. CÁC BỘ LỌC CHUẨN MINEA
-            // FIX: country trước đây map nhầm sang `platforms` (tên nền tảng) nên
-            // lọc theo quốc gia luôn trả về rỗng. Giờ lọc theo country_mentions
-            // (mảng) hoặc latest_detail_country do analyzer ghi.
+            // country: equality trên countries_lower khi field đã có,
+            // fallback equality trên field gốc khi chưa (probe quyết định).
+            // Giá trị lạ (không map được mã/tên nước) -> bỏ qua, không lọc.
             if (country) {
-                const codeRe = new RegExp(`^${escapeRegExp(String(country).trim())}$`, 'i');
-                query.$or = [{ country_mentions: codeRe }, { latest_detail_country: codeRe }];
+                const countryCond = buildCountryCondition(country, schema);
+                if (countryCond) {
+                    if (countryCond.$or && query.$or) {
+                        // Text fallback cũng dùng $or: gộp cả hai bằng $and
+                        // để không ghi đè nhau.
+                        const textOr = query.$or;
+                        delete query.$or;
+                        query.$and = [{ $or: textOr }, countryCond, ...(query.$and || [])];
+                    } else Object.assign(query, countryCond);
+                }
             }
-            if (page_name) query.page_name_lower = lowerPrefixRange(page_name);
-            if (domain) query.domain_lower = lowerPrefixRange(domain);
-            if (is_active !== undefined) query.is_active = is_active === 'true';
+            // page_name/domain: range trên *_lower khi field đã có, regex
+            // tiền tố trên field gốc khi chưa (probe quyết định).
+            if (page_name) {
+                if (schema.lower) query.page_name_lower = lowerPrefixRange(page_name);
+                else query.page_name = prefixRegex(page_name);
+            }
+            if (domain) {
+                if (schema.lower) query.domain_lower = lowerPrefixRange(domain);
+                else query.domain = prefixRegex(domain);
+            }
+            // is_active: analyzer cũ không ghi field này -> lọc bằng
+            // last_seen trong 7 ngày (cùng quy tắc analyzer bản mới ghi).
+            if (is_active !== undefined) {
+                const activeBool = parseActiveParam(is_active);
+                if (activeBool !== undefined) Object.assign(query, buildActiveCondition(activeBool));
+            }
 
             if (date_from || date_to) {
+                const fromSec = parseDateParam(date_from);
+                const toSec = parseDateParam(date_to);
                 query.start_date = {};
-                if (date_from && !Number.isNaN(new Date(date_from).getTime())) query.start_date.$gte = Math.floor(new Date(date_from).getTime() / 1000);
-                if (date_to && !Number.isNaN(new Date(date_to).getTime())) query.start_date.$lte = Math.floor(new Date(date_to).getTime() / 1000);
+                if (fromSec !== null) query.start_date.$gte = fromSec;
+                if (toSec !== null) query.start_date.$lte = toSec;
                 if (Object.keys(query.start_date).length === 0) delete query.start_date;
             }
 
@@ -419,37 +972,58 @@ function initSearchServer(dbInstance) {
                 if (Number.isFinite(maxScore)) query.score.$lte = maxScore;
             }
 
-            // FIX: level/scaling_level trong DB có prefix emoji (vd '🏆 LEGEND',
-            // '🚀 SCALING HARD') nên match chính xác 'LEGEND'/'SCALING' không ra.
-            // Đổi sang regex không phân biệt hoa thường.
+            // level: regex $in trên giá trị có prefix emoji (xem
+            // buildLevelCondition). scaling_level: map nhãn FE về 3 giá trị
+            // thật của DB (xem buildScalingCondition).
             if (level) {
-                const words = String(level).split(',').map(x => x.trim()).filter(Boolean);
-                query.level = { $in: words.map(w => new RegExp(escapeRegExp(w), 'i')) };
+                const levelCond = buildLevelCondition(level);
+                if (levelCond) Object.assign(query, levelCond);
             }
-            if (estimated_spend) query.estimated_spend = { $in: String(estimated_spend).split(',').map(x => x.trim().toUpperCase()).filter(Boolean) };
+            const spendCond = buildSpendCondition(estimated_spend, q.min_spend_usd, q.max_spend_usd);
+            if (spendCond) {
+                if (spendCond.$and) query.$and = [...(query.$and || []), ...spendCond.$and];
+                else Object.assign(query, spendCond);
+            }
             if (Number.isFinite(Number(min_trending_score))) query.trending_score = { $gte: Number(min_trending_score) };
-            if (funnel) query.funnel = { $in: String(funnel).split(',').map(x => x.trim().toUpperCase()).filter(Boolean) };
-            if (scaling_level) {
-                const words = String(scaling_level).split(',').map(x => x.trim()).filter(Boolean);
-                query.scaling_level = { $in: words.map(w => new RegExp(escapeRegExp(w), 'i')) };
+            if (funnel) {
+                const funnelValues = normalizeFunnelValues(funnel);
+                if (funnelValues.length) query.funnel = { $in: funnelValues };
             }
 
             // 3. PRESET KIỂU MINEA + LỌC NGÀNH NGHỀ (kết hợp AND với mọi filter trên)
-            const presetList = String(filter || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-            const presetConds = buildPresetConditions(filter, req.query);
-            const industryCond = buildIndustryCondition(industry);
+            const presetList = normalizePresetNames(filter);
+            const presetConds = buildPresetConditions(filter, q, { useFlags: schema.flags });
+            const industryCond = buildIndustryCondition(industry, schema);
+            const industryValues = normalizeIndustryValues(industry);
             const andConds = [...presetConds];
             if (industryCond) andConds.push(industryCond);
-            if (andConds.length) query.$and = andConds;
+            if (scaling_level) {
+                const scalingCond = buildScalingCondition(scaling_level);
+                if (scalingCond) andConds.push(scalingCond);
+            }
+            // Sort theo rank chỉ có nghĩa khi doc đã có creative_rank
+            // (probe rank=false -> bỏ rank, không thêm điều kiện $exists
+            // làm preset trả rỗng như bản cũ khi analyzer chưa chạy lại).
+            const sortInfo = resolveSearchSort(filter, q, { hasCreativeRank: schema.rank });
+            if (sortInfo.rankFirst) andConds.push({ creative_rank: { $exists: true } });
+            if (andConds.length) query.$and = [...(query.$and || []), ...andConds];
 
-            const total = Object.keys(query).length === 0 ? await adsCol.estimatedDocumentCount() : await adsCol.countDocuments(query);
+            // Đếm: countDocuments trên query chậm (regex/$or) có thể vượt
+            // timeout của proxy FE. Giới hạn 30s; hết giờ thì vẫn trả data
+            // với total=null để FE hiện kết quả thay vì lỗi 500 (FE phải
+            // chịu được total=null, xem FE brief).
+            let total = null;
+            let countTimeout = false;
+            try {
+                total = Object.keys(query).length === 0
+                    ? await adsCol.estimatedDocumentCount()
+                    : await adsCol.countDocuments(query, { maxTimeMS: 30000 });
+            } catch (countErr) {
+                console.warn('[Search API] countDocuments timeout/lỗi:', countErr.message);
+                countTimeout = true;
+            }
 
-            const presetSort = resolvePresetSort(filter, req.query.sort_by !== undefined);
-            const requestedSort = presetSort ? presetSort.field : (req.query.sort_by || 'score');
-            const requestedOrder = presetSort ? presetSort.order : (Number(req.query.sort_order) === 1 ? 1 : -1);
-            const allowedSortFields = new Set(['score', 'trending_score', 'start_date', 'seen_count', 'analyzed_at', 'first_seen', 'last_seen', 'scaling_score', 'estimated_spend_usd', 'duplicates_count', 'duration_days', 'estimated_spend_max_usd', 'estimated_spend_min_usd', 'estimated_reach']);
-            const safeSortField = allowedSortFields.has(String(requestedSort)) ? String(requestedSort) : 'score';
-            const sortOptions = { [safeSortField]: requestedOrder };
+            const sortOptions = sortInfo.sortOptions;
 
             const results = await adsCol.find(query)
                 .project({
@@ -457,7 +1031,7 @@ function initSearchServer(dbInstance) {
                     start_date: 1, seen_count: 1, score: 1, level: 1, trending_score: 1, scaling_score: 1,
                     estimated_spend_usd: 1, estimated_spend_min_usd: 1, estimated_spend_max_usd: 1,
                     estimated_spend: 1, estimated_reach: 1, estimated_reach_min: 1, estimated_reach_max: 1,
-                    duplicates_count: 1, duration_days: 1, cpm_used: 1, filter_signals: 1, industry: 1, thumbnail_r2: 1,
+                    duplicates_count: 1, duration_days: 1, cpm_used: 1, filter_signals: 1, industry: 1, creative_kind: 1, creative_rank: 1, thumbnail_r2: 1,
                     scaling_level: 1, funnel: 1, analyzed_at: 1,
                     thumbnail_local: 1, is_active: 1, images: { $slice: 1 }, videos: { $slice: 1 }
                 })
@@ -465,11 +1039,45 @@ function initSearchServer(dbInstance) {
 
             // Khi search text mà user không chọn sort_by: giữ thứ hạng relevance
             // của ES thay vì để analyzer score quyết định thứ tự.
-            if (esRank && req.query.sort_by === undefined) {
-                results.sort((a, b) => (esRank.get(String(a.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER) - (esRank.get(String(b.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER));
+            if (esRank && q.sort_by === undefined) {
+                if (sortInfo.rankFirst) {
+                    results.sort((a, b) => ((a.creative_rank ?? 1) - (b.creative_rank ?? 1)) || ((esRank.get(String(a.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER) - (esRank.get(String(b.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER)));
+                } else {
+                    results.sort((a, b) => (esRank.get(String(a.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER) - (esRank.get(String(b.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER));
+                }
             }
 
-            return res.json({ success: true, applied_presets: presetList, applied_industries: industryCond ? industryCond.industry.$in : [], pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data: results });
+            // Echo để FE debug: bộ lọc nào đã áp dụng thật, giá trị nào bị
+            // bỏ (lạ), đường fallback nào đang chạy. Chỉ thêm field, không
+            // đổi shape cũ (data/pagination giữ nguyên).
+            return res.json({
+                success: true,
+                applied_presets: presetList,
+                applied_industries: industryValues,
+                applied_filters: {
+                    text: text ? String(text) : null,
+                    country: country ? normalizeCountryCodes(country) : [],
+                    page_name: page_name ? String(page_name) : null,
+                    domain: domain ? String(domain) : null,
+                    is_active: is_active !== undefined ? parseActiveParam(is_active) ?? null : null,
+                    industry: industryValues,
+                    estimated_spend: normalizeSpendTiers(estimated_spend),
+                    funnel: funnel ? normalizeFunnelValues(funnel) : [],
+                    sort_by: sortInfo.sortOptions,
+                    product_first: productFirstEnabled(q),
+                },
+                schema_fallback: {
+                    lower_fields: !schema.lower,
+                    country_fields: !schema.country,
+                    industry_field: !schema.industry,
+                    preset_flags: !schema.flags,
+                    creative_rank: !schema.rank,
+                },
+                ...(searchFallback ? { search_fallback: searchFallback } : {}),
+                ...(countTimeout ? { count_timeout: true } : {}),
+                pagination: { total, page, limit, pages: total === null ? null : Math.ceil(total / limit) },
+                data: results,
+            });
         } catch (error) {
             return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
         }
@@ -480,13 +1088,14 @@ function initSearchServer(dbInstance) {
      */
     app.get('/api/ads/filter-stats', async (req, res) => {
         try {
+            const schema = await refreshSchemaProbe(adsCol);
             const total = await adsCol.estimatedDocumentCount();
             const presets = {};
             for (const name of ['new_ads', 'ready_to_scale', 'weekly_winner']) {
-                const conds = buildPresetConditions(name, {});
+                const conds = buildPresetConditions(name, {}, { useFlags: schema.flags });
                 presets[name] = await adsCol.countDocuments(conds.length ? { $and: conds } : {});
             }
-            return res.json({ success: true, data: { total, presets, defaults: FILTER_DEFAULTS, industries: INDUSTRIES } });
+            return res.json({ success: true, data: { total, presets, defaults: FILTER_DEFAULTS, industries: INDUSTRIES, schema_fallback: { preset_flags: !schema.flags, industry_field: !schema.industry } } });
         } catch (error) {
             return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
         }
@@ -498,6 +1107,20 @@ function initSearchServer(dbInstance) {
     app.get('/api/ads/industries', async (req, res) => {
         return res.json({ success: true, data: INDUSTRIES });
     });
+
+    // Tìm ad theo ad_archive_id (chuỗi, FE có thể gửi số) hoặc _id
+    // ObjectId khi FE gửi _id của Mongo. Dùng chung cho detail/similar.
+    async function findAdById(id) {
+        const sid = String(id);
+        const byArchive = await adsCol.findOne({ ad_archive_id: sid });
+        if (byArchive) return byArchive;
+        let ObjectId = null;
+        try { ({ ObjectId } = require('mongodb')); } catch (_) { /* test env không có mongodb thật */ }
+        if (ObjectId && /^[0-9a-fA-F]{24}$/.test(sid)) {
+            try { return await adsCol.findOne({ _id: new ObjectId(sid) }); } catch (_) { return null; }
+        }
+        return null;
+    }
 
     /**
      * 🟢 API 2: LẤY CHI TIẾT QUẢNG CÁO (kèm ads tương tự)
@@ -514,7 +1137,7 @@ function initSearchServer(dbInstance) {
             const adId = req.params.id;
             if (!adId) return res.status(400).json({ success: false, message: 'Missing ad archive id parameters.' });
 
-            const adDetail = await adsCol.findOne({ ad_archive_id: adId });
+            const adDetail = await findAdById(adId);
             if (!adDetail) return res.status(404).json({ success: false, message: `Không tìm thấy ID: ${adId}` });
 
             const includeSimilar = req.query.include_similar !== 'false' && req.query.include_similar !== '0';
@@ -525,7 +1148,7 @@ function initSearchServer(dbInstance) {
             let similarAds = [];
             let similarPagination = { total: 0, page: similarPage, limit: similarLimit, pages: 0, has_more: false };
             if (includeSimilar && similarLimit > 0) {
-                const result = await fetchSimilarAds(adDetail, adId, similarPage, similarLimit);
+                const result = await fetchSimilarAds(adDetail, adDetail.ad_archive_id, similarPage, similarLimit);
                 similarAds = result.similarAds;
                 similarPagination = { total: result.total, page: similarPage, limit: similarLimit, pages: result.pages, has_more: result.has_more };
             }
@@ -549,10 +1172,10 @@ function initSearchServer(dbInstance) {
             const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 50);
             const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
 
-            const sourceAd = await adsCol.findOne({ ad_archive_id: adId });
+            const sourceAd = await findAdById(adId);
             if (!sourceAd) return res.status(404).json({ success: false, message: 'Ad not found.' });
 
-            const result = await fetchSimilarAds(sourceAd, adId, page, limit);
+            const result = await fetchSimilarAds(sourceAd, sourceAd.ad_archive_id, page, limit);
             return res.json({
                 success: true,
                 pagination: { total: result.total, page, limit, pages: result.pages, has_more: result.has_more },
@@ -605,7 +1228,7 @@ function initSearchServer(dbInstance) {
             const { domain, min_product_score, min_winning_ads, min_total_ads, sort_by = 'product_score', sort_order = -1 } = req.query;
             const query = {};
 
-            if (domain) query.domain = { $regex: domain, $options: 'i' };
+            if (domain) query.domain = new RegExp(`^${escapeRegExp(String(domain).trim())}$`, 'i');
             if (min_product_score) query.product_score = { $gte: parseInt(min_product_score, 10) };
             if (min_winning_ads) query.winning_ads = { $gte: parseInt(min_winning_ads, 10) };
             if (min_total_ads) query.total_ads = { $gte: parseInt(min_total_ads, 10) };
@@ -633,10 +1256,10 @@ function initSearchServer(dbInstance) {
             const { domain } = req.params;
             if (!domain) return res.status(400).json({ success: false, message: 'Domain is required.' });
 
-            const productInfo = await productsCol.findOne({ domain });
+            const productInfo = await productsCol.findOne({ domain: new RegExp(`^${escapeRegExp(String(domain).trim())}$`, 'i') });
             if (!productInfo) return res.status(404).json({ success: false, message: `Product not found.` });
 
-            const topAds = await adsCol.find({ domain })
+            const topAds = await adsCol.find({ domain: productInfo.domain })
                 .sort({ score: -1 }).limit(20)
                 .project({ ad_archive_id: 1, ad_library_url: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1, level: 1, estimated_spend_usd: 1, images: { $slice: 1 }, videos: { $slice: 1 } })
                 .toArray();
@@ -656,7 +1279,7 @@ function initSearchServer(dbInstance) {
     });
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, prefixRegex, escapeRegExp, lowerPrefixRange };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
