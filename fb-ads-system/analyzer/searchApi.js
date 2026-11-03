@@ -59,6 +59,8 @@ const INDUSTRIES = [
     { value: 'fashion', label: 'Thời trang' },
     { value: 'home_living', label: 'Nhà cửa & Đời sống' },
     { value: 'food_beverage', label: 'Ẩm thực & Đồ uống' },
+    { value: 'toys', label: 'Đồ chơi' },
+    { value: 'plants', label: 'Hạt giống & Cây giống' },
     { value: 'real_estate', label: 'Bất động sản' },
     { value: 'finance', label: 'Tài chính & Đầu tư' },
     { value: 'education', label: 'Giáo dục & Khóa học' },
@@ -345,23 +347,25 @@ async function refreshSchemaProbe(adsCol) {
     schemaProbeInFlight = (async () => {
         try {
             const docs = await adsCol.find({})
-                .project({ page_name_lower: 1, domain_lower: 1, countries_lower: 1, industry: 1, creative_rank: 1, filter_signals: 1 })
+                .project({ page_name_lower: 1, domain_lower: 1, countries_lower: 1, industry: 1, creative_rank: 1, filter_signals: 1, is_group_rep: 1, preset_priority: 1 })
                 .sort({ last_seen: -1 }).limit(3).toArray();
-            const probe = { lower: true, country: true, industry: true, rank: true, flags: true };
+            const probe = { lower: true, country: true, industry: true, rank: true, flags: true, groupRep: true, priority: true };
             if (!docs.length) {
-                Object.assign(probe, { lower: false, country: false, industry: false, rank: false, flags: false });
+                Object.assign(probe, { lower: false, country: false, industry: false, rank: false, flags: false, groupRep: false, priority: false });
             } else {
                 probe.lower = docs.every(d => typeof d.page_name_lower === 'string' && typeof d.domain_lower === 'string');
                 probe.country = docs.every(d => Array.isArray(d.countries_lower));
                 probe.industry = docs.every(d => typeof d.industry === 'string' && d.industry.length > 0);
                 probe.rank = docs.every(d => typeof d.creative_rank === 'number');
                 probe.flags = docs.every(d => d.filter_signals && typeof d.filter_signals.is_new_ad === 'boolean');
+                probe.groupRep = docs.every(d => typeof d.is_group_rep === 'boolean');
+                probe.priority = docs.every(d => typeof d.preset_priority === 'number');
             }
             schemaProbeCache = { at: Date.now(), probe };
             return probe;
         } catch (e) {
             console.warn('[Search API] Schema probe lỗi, dùng fallback an toàn:', e.message);
-            const probe = { lower: false, country: false, industry: false, rank: false, flags: false };
+            const probe = { lower: false, country: false, industry: false, rank: false, flags: false, groupRep: false, priority: false };
             schemaProbeCache = { at: Date.now(), probe };
             return probe;
         } finally {
@@ -377,18 +381,20 @@ async function refreshSchemaProbe(adsCol) {
 // tự) phải khớp nguyên từ, cụm dài khớp chuỗi con — cùng quy tắc với
 // classifyIndustry sau fix boundary 03/11.
 const INDUSTRY_FALLBACK_KEYWORDS = {
-    beauty_health: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc'],
+    beauty_health: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'thực phẩm bảo vệ sức khỏe', 'viên uống', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc', 'sữa tắm', 'nước hoa', 'son môi', 'kem dưỡng', 'mặt nạ', 'kem đánh răng', 'bàn chải đánh răng', 'đồ dùng cá nhân'],
     electronics: ['điện thoại', 'iphone', 'samsung', 'laptop', 'macbook', 'tai nghe', 'airpods', 'đồng hồ thông minh', 'smartwatch', 'apple watch', 'máy tính bảng', 'ipad', 'loa bluetooth', 'camera', 'flycam', 'sạc dự phòng', 'bàn phím', 'chuột gaming', 'phụ kiện điện thoại'],
-    fashion: ['thời trang', 'quần áo', 'giày', 'túi', 'đồng hồ', 'fashion', 'wear', 'váy', 'đầm', 'áo dài', 'sneaker', 'dép', 'quần jean', 'áo khoác', 'túi xách', 'giày dép'],
-    home_living: ['nội thất', 'sofa', 'bàn ghế', 'đèn', 'chăn ga', 'gối', 'rèm', 'vệ sinh', 'làm sạch', 'tẩy rửa', 'nước giặt', 'nước rửa chén', 'lau nhà', 'hút bụi', 'máy lọc nước', 'máy lọc không khí', 'đồ gia dụng', 'nhà bếp', 'xoong', 'chảo'],
-    food_beverage: ['nhà hàng', 'quán ăn', 'đồ ăn', 'thực phẩm', 'bánh', 'kẹo', 'cà phê', 'trà sữa', 'đồ uống', 'yến sào', 'hải sản', 'đặc sản', 'ăn vặt', 'thịt bò', 'gạo'],
+    fashion: ['thời trang', 'quần áo', 'giày', 'túi', 'đồng hồ', 'fashion', 'wear', 'váy', 'đầm', 'áo dài', 'sneaker', 'dép', 'quần jean', 'áo khoác', 'túi xách', 'giày dép', 'mũ', 'khăn choàng', 'thắt lưng', 'kính râm', 'trang sức', 'vòng cổ', 'nhẫn', 'bông tai', 'đồ lót', 'đồ ngủ'],
+    home_living: ['nội thất', 'sofa', 'bàn ghế', 'đèn', 'chăn ga', 'gối', 'rèm', 'vệ sinh', 'làm sạch', 'tẩy rửa', 'nước giặt', 'nước rửa chén', 'lau nhà', 'hút bụi', 'máy lọc nước', 'máy lọc không khí', 'đồ gia dụng', 'nhà bếp', 'xoong', 'chảo', 'gia dụng', 'đồ trang trí', 'trang trí', 'decor', 'tranh treo tường', 'gương trang trí', 'thảm trải', 'nến thơm', 'lọ hoa', 'nồi', 'bình giữ nhiệt', 'hộp đựng', 'dụng cụ nhà bếp', 'kệ', 'giá treo'],
+    food_beverage: ['nhà hàng', 'quán ăn', 'đồ ăn', 'thực phẩm', 'bánh', 'kẹo', 'cà phê', 'trà sữa', 'đồ uống', 'yến sào', 'hải sản', 'đặc sản', 'ăn vặt', 'thịt bò', 'gạo', 'mật ong', 'hạt dinh dưỡng', 'gia vị', 'nước mắm', 'trà'],
+    toys: ['đồ chơi', 'đồ chơi trẻ em', 'lego', 'mô hình', 'búp bê', 'gấu bông', 'xe đồ chơi', 'xếp hình', 'thú nhồi bông', 'robot đồ chơi', 'đồ chơi giáo dục', 'bộ xếp hình'],
+    plants: ['hạt giống', 'cây giống', 'cây cảnh', 'cây ăn quả', 'giống cây', 'hạt rau', 'phân bón', 'chậu cây', 'cây trồng', 'rau giống', 'hoa giống'],
     real_estate: ['bất động sản', 'nhà đất', 'căn hộ', 'chung cư', 'đất nền', 'biệt thự', 'nhà phố', 'shophouse', 'cho thuê nhà', 'bán nhà', 'dự án căn hộ'],
     finance: ['tài chính', 'đầu tư', 'crypto', 'forex', 'bank', 'ngân hàng', 'chứng khoán', 'cổ phiếu', 'vay vốn', 'vay tiền', 'bảo hiểm', 'tín dụng', 'coin', 'bitcoin', 'trading', 'lãi suất', 'thẻ tín dụng'],
     education: ['khóa học', 'học tiếng anh', 'đào tạo', 'tuyển sinh', 'luyện thi', 'ielts', 'toeic', 'học online', 'gia sư', 'du học', 'kỹ năng'],
     automotive: ['ô tô', 'xe hơi', 'xe máy', 'xe điện', 'phụ kiện ô tô', 'độ xe', 'lốp xe', 'bảo dưỡng xe', 'mua bán xe', 'xe tải'],
     pets: ['thú cưng', 'thức ăn cho chó', 'thức ăn cho mèo', 'cát mèo', 'phụ kiện thú cưng', 'spa thú cưng', 'chó', 'mèo'],
     travel: ['du lịch', 'tour', 'vé máy bay', 'khách sạn', 'resort', 'nghỉ dưỡng', 'combo du lịch', 'visa', 'hộ chiếu', 'vé tham quan'],
-    entertainment: ['game', 'trò chơi', 'phim', 'ca nhạc', 'concert', 'vé xem phim', 'truyện', 'livestream', 'giải trí', 'pubg', 'liên quân', 'nạp game'],
+    entertainment: ['game', 'trò chơi', 'phim', 'ca nhạc', 'concert', 'vé xem phim', 'truyện', 'livestream', 'giải trí', 'pubg', 'liên quân', 'nạp game', 'truyện tranh', 'tiểu thuyết', 'webtoon', 'manhwa', 'manga', 'anime', 'hoạt hình', 'truyền hình', 'gameshow', 'chương trình truyền hình', 'show truyền hình', 'phim hoạt hình', 'phim bộ', 'phim lẻ', 'esports', 'streamer', 'ngôn tình', 'xem phim', 'đọc truyện', 'thể thao điện tử', 'game thủ'],
     gambling: ['casino', 'cá cược', 'cá độ', 'nhà cái', 'tài xỉu', 'xóc đĩa', 'bắn cá', 'nổ hũ', 'lô đề', 'đánh bài', 'poker'],
 };
 function industryFallbackRegex(value) {
@@ -579,7 +585,7 @@ function stripViDiacritics(s) {
 // match operator AND (đủ mọi token) — loại kết quả trúng 1 token lẻ
 // ("Đà Nẵng", "Đa năng" khi tìm "Thực phẩm chức năng").
 // strict=false: OR như cũ, chỉ dùng fallback khi strict trả về 0 hit.
-function buildTextSearchQuery(keyword, strict) {
+function buildTextSearchQuery(keyword, strict, dedupeEs) {
     const kw = String(keyword).trim();
     const kwAscii = stripViDiacritics(kw);
     const variants = kwAscii !== kw ? [kw, kwAscii] : [kw];
@@ -603,7 +609,53 @@ function buildTextSearchQuery(keyword, strict) {
             );
         }
     }
+    if (dedupeEs) {
+        // Lọc đại diện nhóm ngay trong ES: total + thứ hạng + phân trang
+        // giữ chính xác. Chỉ bật khi probe mapping ES đã có field này.
+        return { bool: { filter: [{ term: { is_group_rep: true } }], should, minimum_should_match: 1 } };
+    }
     return { bool: { should, minimum_should_match: 1 } };
+}
+
+// Dedupe list: mặc định BẬT — list chỉ hiện 1 ad gốc mỗi nhóm duplicate
+// (cùng page + cùng text, do analyzer gom sẵn). Tắt bằng ?dedupe=0 để
+// xem tất cả bản sao. Áp dụng cho cả đường Mongo lẫn ES; khi field nhóm
+// chưa có trên doc (analyzer cũ) thì bỏ lọc và báo fallback, không trả rỗng.
+function dedupeEnabled(q) {
+    const v = q.dedupe;
+    if (v === undefined) return true;
+    return !(v === '0' || v === 'false' || v === 'no' || v === 'off');
+}
+
+// Probe mapping ES (cache 5 phút): field is_group_rep chỉ có sau khi
+// analyzer bản mới sync ES lần đầu. Chưa có thì KHÔNG lọc ở ES — doc cũ
+// thiếu field sẽ bị term filter loại hết, làm text search mất kết quả.
+// Khi đó lọc ở Mongo sau khi lấy ID từ ES (over-fetch lớn hơn) + cờ
+// dedupe_fallback trong response.
+const ES_DEDUPE_PROBE_TTL_MS = 5 * 60 * 1000;
+let esDedupeProbeCache = { at: 0, available: false };
+let esDedupeProbeInFlight = null;
+async function refreshEsDedupeProbe(esClient) {
+    const now = Date.now();
+    if (now - esDedupeProbeCache.at < ES_DEDUPE_PROBE_TTL_MS) return esDedupeProbeCache.available;
+    if (esDedupeProbeInFlight) return esDedupeProbeInFlight;
+    esDedupeProbeInFlight = (async () => {
+        try {
+            const mapping = await esClient.indices.getMapping({ index: 'fb_ads_analyzer' });
+            const first = Object.values(mapping || {})[0];
+            const props = first?.mappings?.properties || mapping?.mappings?.properties || {};
+            const available = Boolean(props.is_group_rep);
+            esDedupeProbeCache = { at: Date.now(), available };
+            return available;
+        } catch (e) {
+            console.warn('[Search API] ES mapping probe lỗi, không lọc dedupe ở ES:', e.message);
+            esDedupeProbeCache = { at: Date.now(), available: false };
+            return false;
+        } finally {
+            esDedupeProbeInFlight = null;
+        }
+    })();
+    return esDedupeProbeInFlight;
 }
 
 // Các field sort được phép (dùng chung cho handler + resolveSearchSort).
@@ -650,13 +702,22 @@ function resolveSearchSort(presets, q, opts) {
     const hasCreativeRank = !opts || opts.hasCreativeRank !== false;
     const presetList = normalizePresetNames(presets);
     const hasPreset = presetList.length > 0;
+    const hasPresetPriority = opts && opts.hasPresetPriority === true;
     const presetSort = resolvePresetSort(presets, q.sort_by !== undefined);
     const normalizedField = q.sort_by !== undefined ? normalizeSortField(q.sort_by) : null;
     const requestedSort = presetSort ? presetSort.field : (normalizedField || 'score');
     const requestedOrder = presetSort ? presetSort.order : normalizeSortOrder(q.sort_order);
     const safeSortField = ALLOWED_SORT_FIELDS.has(String(requestedSort)) ? String(requestedSort) : 'score';
-    if (hasPreset && hasCreativeRank && productFirstEnabled(q)) {
-        return { sortOptions: { creative_rank: 1, [safeSortField]: requestedOrder }, rankFirst: true };
+    if (hasPreset && (hasCreativeRank || hasPresetPriority) && productFirstEnabled(q)) {
+        // Ưu tiên preset trước: preset_priority (sản phẩm lên trước,
+        // giải trí xuống sau), rồi creative_rank, rồi sort của preset.
+        // Chỉ đưa key nào probe đã xác nhận có trên doc vào sort để
+        // không làm preset trả rỗng khi analyzer chưa chạy lại.
+        const sortOptions = {};
+        if (hasPresetPriority) sortOptions.preset_priority = 1;
+        if (hasCreativeRank) sortOptions.creative_rank = 1;
+        sortOptions[safeSortField] = requestedOrder;
+        return { sortOptions, rankFirst: true };
     }
     return { sortOptions: { [safeSortField]: requestedOrder }, rankFirst: false };
 }
@@ -754,6 +815,72 @@ function resolvePresetSort(presets, hasExplicitSortBy) {
  * Khởi tạo API Server (Đã gỡ bỏ Kafka)
  * @param {import('mongodb').Db} dbInstance 
  */
+
+// ===== ADS TƯƠNG TỰ: TẦNG FALLBACK (module-level để test được) =====
+// Tầng theo thứ tự liên quan giảm dần: cùng domain -> cùng page -> cùng
+// industry -> mọi ad khác. Mỗi tầng đều loại ad trùng text với ad gốc
+// (duplicate theo normalized_text). Tầng cuối đảm bảo mục similar không
+// bao giờ trống khi collection còn ad khác; nếu mọi ad còn lại đều
+// trùng text thì fillSimilarAds dùng phương án cuối: lấy cả ad trùng
+// text, chỉ loại chính ad gốc.
+function similarDupTextOf(ad) {
+    return String(ad.normalized_text || ad.text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function buildSimilarTiers(sourceAd, adId) {
+    const base = { ad_archive_id: { $ne: adId } };
+    const dupText = similarDupTextOf(sourceAd);
+    const noDup = dupText ? { normalized_text: { $ne: dupText } } : {};
+    const tiers = [];
+    if (sourceAd.domain) tiers.push({ ...base, domain: sourceAd.domain, ...noDup });
+    if (sourceAd.page_name) tiers.push({ ...base, page_name: sourceAd.page_name, ...noDup });
+    if (sourceAd.industry) tiers.push({ ...base, industry: sourceAd.industry, ...noDup });
+    tiers.push({ ...base, ...noDup });
+    return tiers;
+}
+
+// Gom đủ (page * limit) ad từ các tầng theo thứ tự, khử trùng theo
+// ad_archive_id, rồi cắt đúng cửa sổ trang. col là collection Mongo
+// (hoặc fake collection trong test) có find().project().sort().limit().
+async function fillSimilarAds(col, tiers, page, limit, projection) {
+    const seen = new Set();
+    const picked = [];
+    const need = page * limit;
+    // Mỗi tầng sau phải loại cả ID đã lấy ở tầng trước: nếu không, tầng
+    // sau trả lại đúng những ad điểm cao đã thấy, limit bị tiêu hết mà
+    // không thêm được ad mới (lỗi đã bắt bằng test mock).
+    const sourceId = tiers[0]?.ad_archive_id?.$ne;
+    for (const query of tiers) {
+        if (picked.length >= need) break;
+        const exclude = [...seen];
+        if (sourceId !== undefined) exclude.push(String(sourceId));
+        const baseEx = query.ad_archive_id && typeof query.ad_archive_id === 'object' ? query.ad_archive_id : {};
+        const q = { ...query, ad_archive_id: { ...baseEx, $nin: exclude } };
+        const docs = await col.find(q)
+            .project(projection)
+            .sort({ score: -1 })
+            .limit(need - picked.length)
+            .toArray();
+        for (const d of docs) {
+            const key = String(d.ad_archive_id || d._id);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            picked.push(d);
+        }
+    }
+    // Phương án cuối: vẫn trống (mọi ad còn lại đều trùng text) thì lấy
+    // ad trùng text luôn, chỉ loại chính ad gốc.
+    if (!picked.length && tiers.length) {
+        const docs = await col.find({ ad_archive_id: tiers[0].ad_archive_id })
+            .project(projection)
+            .sort({ score: -1 })
+            .limit(need)
+            .toArray();
+        for (const d of docs) picked.push(d);
+    }
+    return picked.slice((page - 1) * limit, page * limit);
+}
+
 function initSearchServer(dbInstance) {
     const esClient = new Client({ node: process.env.ELASTICSEARCH_URL || 'http://localhost:9200' });
     const ELASTIC_INDEX = 'fb_ads_analyzer';
@@ -777,8 +904,9 @@ function initSearchServer(dbInstance) {
     app.use(checkSpecialHeader);
 
     // ===== ADS TƯƠNG TỰ (dùng chung cho detail + endpoint /similar) =====
-    // Ưu tiên cùng Domain (khớp chính xác, dùng được index domain_score),
-    // nếu không có domain thì cùng Page (khớp chính xác, index page_score).
+    // Tầng similar (xem buildSimilarTiers ở module-level): cùng Domain
+    // (khớp chính xác, index domain_score) -> cùng Page (index page_score)
+    // -> cùng industry -> mọi ad khác, tầng nào cũng loại duplicate.
     // Không dùng regex ở đây để tránh quét toàn collection như vụ page_name.
     // LOẠI DUPLICATE: ad tương tự phải KHÁC text chuẩn hóa của ad gốc.
     // Đây đúng định nghĩa duplicate mà analyzer dùng để tính
@@ -791,44 +919,19 @@ function initSearchServer(dbInstance) {
     // trong cùng domain/page, lọc theo normalized_text sẽ loại được
     // chúng. Ad cùng hình nhưng khác text thì KHÔNG bị tính là duplicate
     // theo định nghĩa này nên vẫn được giữ lại.
-    function duplicateTextOf(ad) {
-        return String(ad.normalized_text || ad.text || '').toLowerCase().replace(/\s+/g, ' ').trim();
-    }
     const SIMILAR_PROJECTION = {
         ad_archive_id: 1, ad_library_url: 1, page_name: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1,
         trending_score: 1, estimated_spend_usd: 1, start_date: 1, duplicates_count: 1, duration_days: 1,
-        industry: 1, thumbnail_r2: 1, thumbnail_local: 1, images: { $slice: 1 }, videos: { $slice: 1 }
+        industry: 1, duplicate_group_size: 1, thumbnail_r2: 1, thumbnail_local: 1, images: { $slice: 1 }, videos: { $slice: 1 }
     };
 
-    function buildSimilarQuery(sourceAd, adId) {
-        const query = { ad_archive_id: { $ne: adId } };
-        if (sourceAd.domain) {
-            query.domain = sourceAd.domain;
-        } else if (sourceAd.page_name) {
-            query.page_name = sourceAd.page_name;
-        } else {
-            return null; // Không đủ cơ sở để tìm tương tự
-        }
-        // Loại ad có cùng normalized_text với ad gốc (duplicate), trừ
-        // chính ad gốc đã loại ở trên. Doc thiếu field normalized_text
-        // sẽ lọt qua $ne — field này do crawler ghi và analyzer giữ qua
-        // spread nên bình thường luôn có.
-        const dupText = duplicateTextOf(sourceAd);
-        if (dupText) query.normalized_text = { $ne: dupText };
-        return query;
-    }
-
     async function fetchSimilarAds(sourceAd, adId, page, limit) {
-        const query = buildSimilarQuery(sourceAd, adId);
-        if (!query) return { similarAds: [], total: 0, pages: 0, has_more: false };
-        const total = await adsCol.countDocuments(query);
-        const similarAds = await adsCol.find(query)
-            .project(SIMILAR_PROJECTION)
-            .sort({ score: -1 })
-            .skip((page - 1) * limit)
-            .limit(limit)
-            .toArray();
-        return { similarAds, total, pages: Math.ceil(total / limit), has_more: page * limit < total };
+        const tiers = buildSimilarTiers(sourceAd, adId);
+        const unionQuery = tiers.length === 1 ? tiers[0] : { $or: tiers };
+        const total = await adsCol.countDocuments(unionQuery);
+        const similarAds = await fillSimilarAds(adsCol, tiers, page, limit, SIMILAR_PROJECTION);
+        const effectiveTotal = total === 0 && similarAds.length ? similarAds.length : total;
+        return { similarAds, total: effectiveTotal, pages: Math.ceil(effectiveTotal / limit), has_more: page * limit < effectiveTotal };
     }
 
     /**
@@ -849,6 +952,9 @@ function initSearchServer(dbInstance) {
             // đã có trên doc chưa — chưa có thì dùng fallback field gốc.
             const q = normalizeQueryParams(req.query);
             const schema = await refreshSchemaProbe(adsCol);
+            const dedupeOn = dedupeEnabled(q);
+            const esDedupeAvailable = dedupeOn ? await refreshEsDedupeProbe(esClient) : false;
+            let dedupeFallback = null; // 'schema' | 'mongo': dedupe bật nhưng chưa lọc được ở tầng đó
             const {
                 text,
                 country,
@@ -875,6 +981,8 @@ function initSearchServer(dbInstance) {
             const query = {};
             let esRank = null; // thứ hạng ES, dùng sort theo relevance khi không có sort_by tường minh
             let searchFallback = null; // 'mongo' khi ES lỗi/0-hit và phải lọc bằng Mongo
+            let esIdsFetched = 0; // số ID ES trả (để phát hiện trang thiếu dòng khi dedupe qua Mongo)
+            let esIdsCapped = false;
 
             // 1. SEARCH TEXT (Elasticsearch, fallback Mongo khi ES lỗi/0-hit)
             // Chất lượng: match_phrase (cụm đúng thứ tự) + match operator AND (đủ
@@ -889,7 +997,10 @@ function initSearchServer(dbInstance) {
                 if (keyword) {
                     let esIds = null;
                     try {
-                        const esLimit = Math.min(Math.max(page * limit * 5, 100), 5000);
+                        // Dedupe qua Mongo (mapping ES chưa có field): over-fetch
+                        // gấp đôi để trang ít bị thiếu dòng sau khi lọc đại diện.
+                        const esMultiplier = (dedupeOn && !esDedupeAvailable) ? 10 : 5;
+                        const esLimit = Math.min(Math.max(page * limit * esMultiplier, 100), 5000);
                         const esParams = {
                             index: ELASTIC_INDEX,
                             _source: ['ad_archive_id'],
@@ -897,10 +1008,10 @@ function initSearchServer(dbInstance) {
                             track_total_hits: false
                         };
 
-                        let esResponse = await esClient.search({ ...esParams, query: buildTextSearchQuery(keyword, true) });
+                        let esResponse = await esClient.search({ ...esParams, query: buildTextSearchQuery(keyword, true, esDedupeAvailable) });
                         let hits = esResponse.hits?.hits || [];
                         if (!hits.length) {
-                            esResponse = await esClient.search({ ...esParams, query: buildTextSearchQuery(keyword, false) });
+                            esResponse = await esClient.search({ ...esParams, query: buildTextSearchQuery(keyword, false, esDedupeAvailable) });
                             hits = esResponse.hits?.hits || [];
                         }
 
@@ -912,6 +1023,8 @@ function initSearchServer(dbInstance) {
                     }
                     if (esIds && esIds.length) {
                         esRank = new Map(esIds.map((id, i) => [id, i]));
+                        esIdsFetched = esIds.length;
+                        esIdsCapped = esIds.length >= esLimit;
                         query.ad_archive_id = { $in: esIds };
                     } else {
                         // ES 0 hit hoặc lỗi: regex Mongo (chậm, nhưng đúng).
@@ -996,6 +1109,14 @@ function initSearchServer(dbInstance) {
             const industryCond = buildIndustryCondition(industry, schema);
             const industryValues = normalizeIndustryValues(industry);
             const andConds = [...presetConds];
+            // Dedupe: chỉ hiện ad đại diện mỗi nhóm (analyzer ghi sẵn).
+            // Field nhóm chưa có (analyzer cũ) thì không lọc, báo
+            // fallback — list vẫn chạy, chỉ chưa gom nhóm.
+            if (dedupeOn) {
+                if (schema.groupRep) andConds.push({ is_group_rep: true });
+                else dedupeFallback = 'schema';
+            }
+            if (dedupeOn && esRank && !esDedupeAvailable && schema.groupRep) dedupeFallback = 'mongo';
             if (industryCond) andConds.push(industryCond);
             if (scaling_level) {
                 const scalingCond = buildScalingCondition(scaling_level);
@@ -1004,8 +1125,11 @@ function initSearchServer(dbInstance) {
             // Sort theo rank chỉ có nghĩa khi doc đã có creative_rank
             // (probe rank=false -> bỏ rank, không thêm điều kiện $exists
             // làm preset trả rỗng như bản cũ khi analyzer chưa chạy lại).
-            const sortInfo = resolveSearchSort(filter, q, { hasCreativeRank: schema.rank });
-            if (sortInfo.rankFirst) andConds.push({ creative_rank: { $exists: true } });
+            const sortInfo = resolveSearchSort(filter, q, { hasCreativeRank: schema.rank, hasPresetPriority: schema.priority });
+            if (sortInfo.rankFirst) {
+                if ('preset_priority' in sortInfo.sortOptions) andConds.push({ preset_priority: { $exists: true } });
+                if ('creative_rank' in sortInfo.sortOptions) andConds.push({ creative_rank: { $exists: true } });
+            }
             if (andConds.length) query.$and = [...(query.$and || []), ...andConds];
 
             // Đếm: countDocuments trên query chậm (regex/$or) có thể vượt
@@ -1031,7 +1155,7 @@ function initSearchServer(dbInstance) {
                     start_date: 1, seen_count: 1, score: 1, level: 1, trending_score: 1, scaling_score: 1,
                     estimated_spend_usd: 1, estimated_spend_min_usd: 1, estimated_spend_max_usd: 1,
                     estimated_spend: 1, estimated_reach: 1, estimated_reach_min: 1, estimated_reach_max: 1,
-                    duplicates_count: 1, duration_days: 1, cpm_used: 1, filter_signals: 1, industry: 1, creative_kind: 1, creative_rank: 1, thumbnail_r2: 1,
+                    duplicates_count: 1, duration_days: 1, cpm_used: 1, filter_signals: 1, industry: 1, creative_kind: 1, creative_rank: 1, thumbnail_r2: 1, duplicate_group_key: 1, duplicate_group_size: 1, is_group_rep: 1, preset_priority: 1,
                     scaling_level: 1, funnel: 1, analyzed_at: 1,
                     thumbnail_local: 1, is_active: 1, images: { $slice: 1 }, videos: { $slice: 1 }
                 })
@@ -1040,8 +1164,9 @@ function initSearchServer(dbInstance) {
             // Khi search text mà user không chọn sort_by: giữ thứ hạng relevance
             // của ES thay vì để analyzer score quyết định thứ tự.
             if (esRank && q.sort_by === undefined) {
+                const priorityFirst = sortInfo.rankFirst && 'preset_priority' in sortInfo.sortOptions;
                 if (sortInfo.rankFirst) {
-                    results.sort((a, b) => ((a.creative_rank ?? 1) - (b.creative_rank ?? 1)) || ((esRank.get(String(a.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER) - (esRank.get(String(b.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER)));
+                    results.sort((a, b) => (priorityFirst ? (a.preset_priority ?? 1) - (b.preset_priority ?? 1) : 0) || ((a.creative_rank ?? 1) - (b.creative_rank ?? 1)) || ((esRank.get(String(a.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER) - (esRank.get(String(b.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER)));
                 } else {
                     results.sort((a, b) => (esRank.get(String(a.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER) - (esRank.get(String(b.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER));
                 }
@@ -1065,6 +1190,7 @@ function initSearchServer(dbInstance) {
                     funnel: funnel ? normalizeFunnelValues(funnel) : [],
                     sort_by: sortInfo.sortOptions,
                     product_first: productFirstEnabled(q),
+                    dedupe: dedupeOn,
                 },
                 schema_fallback: {
                     lower_fields: !schema.lower,
@@ -1072,8 +1198,12 @@ function initSearchServer(dbInstance) {
                     industry_field: !schema.industry,
                     preset_flags: !schema.flags,
                     creative_rank: !schema.rank,
+                    dedupe_group_fields: !schema.groupRep,
+                    dedupe_priority: !schema.priority,
                 },
                 ...(searchFallback ? { search_fallback: searchFallback } : {}),
+                ...(dedupeFallback ? { dedupe_fallback: dedupeFallback } : {}),
+                ...(dedupeOn && esRank && !esDedupeAvailable && esIdsCapped && results.length < limit ? { dedupe_partial: true } : {}),
                 ...(countTimeout ? { count_timeout: true } : {}),
                 pagination: { total, page, limit, pages: total === null ? null : Math.ceil(total / limit) },
                 data: results,
@@ -1093,7 +1223,10 @@ function initSearchServer(dbInstance) {
             const presets = {};
             for (const name of ['new_ads', 'ready_to_scale', 'weekly_winner']) {
                 const conds = buildPresetConditions(name, {}, { useFlags: schema.flags });
-                presets[name] = await adsCol.countDocuments(conds.length ? { $and: conds } : {});
+                const countQuery = conds.length ? { $and: conds } : {};
+                // Badge khớp list đã dedupe: chỉ đếm ad đại diện khi field nhóm đã có.
+                if (schema.groupRep) countQuery.is_group_rep = true;
+                presets[name] = await adsCol.countDocuments(countQuery);
             }
             return res.json({ success: true, data: { total, presets, defaults: FILTER_DEFAULTS, industries: INDUSTRIES, schema_fallback: { preset_flags: !schema.flags, industry_field: !schema.industry } } });
         } catch (error) {
@@ -1153,7 +1286,15 @@ function initSearchServer(dbInstance) {
                 similarPagination = { total: result.total, page: similarPage, limit: similarLimit, pages: result.pages, has_more: result.has_more };
             }
 
-            return res.json({ success: true, data: adDetail, similar_ads: similarAds, similar_pagination: similarPagination });
+            let duplicateGroup = null;
+            if (adDetail.duplicate_group_key) {
+                const groupAds = await adsCol.find({ duplicate_group_key: adDetail.duplicate_group_key, ad_archive_id: { $ne: adDetail.ad_archive_id } })
+                    .project({ ad_archive_id: 1, ad_library_url: 1, page_name: 1, text: { $substrCP: ['$text', 0, 150] }, score: 1, start_date: 1, thumbnail_r2: 1, images: { $slice: 1 } })
+                    .sort({ start_date: 1 }).limit(10).toArray();
+                duplicateGroup = { key: adDetail.duplicate_group_key, size: adDetail.duplicate_group_size || groupAds.length + 1, ads: groupAds };
+            }
+
+            return res.json({ success: true, data: adDetail, similar_ads: similarAds, similar_pagination: similarPagination, duplicate_group: duplicateGroup });
         } catch (error) {
             return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
         }
@@ -1279,7 +1420,7 @@ function initSearchServer(dbInstance) {
     });
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, refreshEsDedupeProbe };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
