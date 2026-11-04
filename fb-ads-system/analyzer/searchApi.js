@@ -867,10 +867,12 @@ function similarDupTextOf(ad) {
 // Đếm tổng similar có giới hạn thời gian: union $or trên toàn collection
 // có thể quét rất lâu (tầng global khớp gần hết 388k doc) làm treo cả
 // response detail/similar. Timeout thì trả null để caller dùng số đã lấy
-// được, không treo request.
+// được, không treo request. Mặc định 5s: route FE abort sau 10s
+// (AbortSignal.timeout(10000) trong app/api/ads/detail/[id]/route.ts),
+// nên đếm phải xong sớm hơn để cả response kịp về trước khi FE ngắt.
 async function countSimilarTotal(col, unionQuery, maxTimeMS) {
     try {
-        return await col.countDocuments(unionQuery, { maxTimeMS: maxTimeMS || 10000 });
+        return await col.countDocuments(unionQuery, { maxTimeMS: maxTimeMS || 5000 });
     } catch (err) {
         console.warn('[Search API] similar count timeout/lỗi, dùng số đã lấy:', err && err.message);
         return null;
