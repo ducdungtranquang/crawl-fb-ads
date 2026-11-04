@@ -1211,7 +1211,7 @@ function initSearchServer(dbInstance) {
                     ad_archive_id: 1, ad_library_url: 1, page_name: 1, page_like_count: 1, text: 1, link: 1, domain: 1,
                     start_date: 1, seen_count: 1, score: 1, level: 1, trending_score: 1, scaling_score: 1,
                     estimated_spend_usd: 1, estimated_spend_min_usd: 1, estimated_spend_max_usd: 1,
-                    estimated_spend: 1, estimated_reach: 1, estimated_reach_min: 1, estimated_reach_max: 1,
+                    estimated_spend: 1, estimated_spend_source: 1, estimated_spend_capped: 1, estimated_reach: 1, estimated_reach_min: 1, estimated_reach_max: 1,
                     duplicates_count: 1, duration_days: 1, cpm_used: 1, filter_signals: 1, industry: 1, creative_kind: 1, creative_rank: 1, thumbnail_r2: 1, duplicate_group_key: 1, duplicate_group_size: 1, is_group_rep: 1, preset_priority: 1,
                     scaling_level: 1, funnel: 1, analyzed_at: 1,
                     thumbnail_local: 1, is_active: 1, images: { $slice: 1 }, videos: { $slice: 1 }
