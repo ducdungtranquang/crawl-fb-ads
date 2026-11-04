@@ -120,11 +120,41 @@ const COUNTRY_NAME_MAP = {
 };
 const COUNTRY_CODE_TO_NAME = { vn: 'vietnam', us: 'united states', jp: 'japan', th: 'thailand', ph: 'philippines', my: 'malaysia', id: 'indonesia', sg: 'singapore', kr: 'korea', gb: 'united kingdom', de: 'germany', fr: 'france', ca: 'canada', au: 'australia', br: 'brazil', mx: 'mexico', ae: 'uae', tw: 'taiwan', hk: 'hong kong', cn: 'china', in: 'india', es: 'spain', it: 'italy', nl: 'netherlands', ru: 'russia', tr: 'turkey' };
 
+// Các dạng tên/bí danh có thể đã lưu trong countries_lower của doc cũ
+// (analyzer cũ ghi nguyên giá trị thô, vd 'usa', 'united states') — đảo
+// bảng tên để đường lọc nhanh khớp được cả dạng bí danh, không chỉ mã
+// ISO. Dạng có dấu ('việt nam') KHÔNG khớp ở đây; analyzer/migrate bản
+// mới chuẩn hóa countries_lower về mã ISO nên doc mới không cần.
+// Ngoại lệ: 'my' (từ 'Mỹ') KHÔNG đưa vào bí danh của 'us' — 'my' là mã
+// của Malaysia, đưa vào sẽ làm lọc US khớp nhầm doc Malaysia.
+const COUNTRY_ALIASES = {};
+for (const [aliasName, aliasCode] of Object.entries(COUNTRY_NAME_MAP)) {
+    if (aliasName === 'my' && aliasCode === 'us') continue;
+    (COUNTRY_ALIASES[aliasCode] = COUNTRY_ALIASES[aliasCode] || []).push(aliasName);
+}
+for (const [aliasCode, aliasName] of Object.entries(COUNTRY_CODE_TO_NAME)) {
+    (COUNTRY_ALIASES[aliasCode] = COUNTRY_ALIASES[aliasCode] || []).push(aliasName);
+}
+// Mọi giá trị countries_lower có thể tương ứng với 1 mã nước.
+function countryMatchValues(code) {
+    return [...new Set([code, ...(COUNTRY_ALIASES[code] || [])])];
+}
+
 function normalizeCountryCodes(countryParam) {
     const out = [];
     for (const raw of String(countryParam || '').split(',')) {
         const t = String(raw).trim();
         if (!t) continue;
+        // Mã ISO 2 chữ đúng dạng (vd 'MY') được ưu tiên trước bảng tên:
+        // 'MY' (Malaysia) mà đi qua bảng tên sẽ bị nuốt thành 'us' vì từ
+        // 'Mỹ' strip dấu cũng ra 'my'. 'Mỹ' viết hoa thành 'MỸ' (không
+        // khớp regex ASCII) nên vẫn rơi xuống bảng tên -> 'us' như cũ.
+        const upper = t.toUpperCase();
+        if (/^[A-Z]{2}$/.test(upper) && COUNTRY_CODE_TO_NAME[upper.toLowerCase()]) {
+            const isoCode = upper.toLowerCase();
+            if (!out.includes(isoCode)) out.push(isoCode);
+            continue;
+        }
         const key = normKey(t);
         const code = COUNTRY_NAME_MAP[key] || (/^[a-z]{2}$/.test(key) ? key : null);
         if (!code || code === 'all') continue;
@@ -456,7 +486,10 @@ function buildCountryCondition(countryParam, schema) {
     if (!codes.length) return null;
     const migrated = !schema || schema.migrated !== false;
     if (migrated) {
-        return codes.length === 1 ? { countries_lower: codes[0] } : { countries_lower: { $in: codes } };
+        // Khớp cả bí danh đã lưu ở doc cũ ('usa', 'united states', ...):
+        // vẫn dùng được index countries_lower, chỉ thêm giá trị $in.
+        const values = codes.flatMap(countryMatchValues);
+        return { countries_lower: { $in: values } };
     }
     const variants = [];
     for (const c of codes) {
@@ -831,6 +864,19 @@ function similarDupTextOf(ad) {
     return String(ad.normalized_text || ad.text || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+// Đếm tổng similar có giới hạn thời gian: union $or trên toàn collection
+// có thể quét rất lâu (tầng global khớp gần hết 388k doc) làm treo cả
+// response detail/similar. Timeout thì trả null để caller dùng số đã lấy
+// được, không treo request.
+async function countSimilarTotal(col, unionQuery, maxTimeMS) {
+    try {
+        return await col.countDocuments(unionQuery, { maxTimeMS: maxTimeMS || 10000 });
+    } catch (err) {
+        console.warn('[Search API] similar count timeout/lỗi, dùng số đã lấy:', err && err.message);
+        return null;
+    }
+}
+
 function buildSimilarTiers(sourceAd, adId) {
     const base = { ad_archive_id: { $ne: adId } };
     const dupText = similarDupTextOf(sourceAd);
@@ -932,9 +978,9 @@ function initSearchServer(dbInstance) {
     async function fetchSimilarAds(sourceAd, adId, page, limit) {
         const tiers = buildSimilarTiers(sourceAd, adId);
         const unionQuery = tiers.length === 1 ? tiers[0] : { $or: tiers };
-        const total = await adsCol.countDocuments(unionQuery);
         const similarAds = await fillSimilarAds(adsCol, tiers, page, limit, SIMILAR_PROJECTION);
-        const effectiveTotal = total === 0 && similarAds.length ? similarAds.length : total;
+        const total = await countSimilarTotal(adsCol, unionQuery);
+        const effectiveTotal = total === null ? similarAds.length : (total === 0 && similarAds.length ? similarAds.length : total);
         return { similarAds, total: effectiveTotal, pages: Math.ceil(effectiveTotal / limit), has_more: page * limit < effectiveTotal };
     }
 
@@ -1000,11 +1046,16 @@ function initSearchServer(dbInstance) {
                 const keyword = Array.isArray(text) ? text.map(x => String(x).trim()).filter(Boolean).join(" ") : String(text).trim();
                 if (keyword) {
                     let esIds = null;
+                    // NOTE 2026-11-04 (BUG-01): esLimit phải khai báo NGOÀI
+                    // khối try — trước đây `const esLimit` nằm trong try nên
+                    // dòng `esIds.length >= esLimit` ở ngoài try ném
+                    // ReferenceError, mọi text search có hit ES đều HTTP 500.
+                    let esLimit = 5000;
                     try {
                         // Dedupe qua Mongo (mapping ES chưa có field): over-fetch
                         // gấp đôi để trang ít bị thiếu dòng sau khi lọc đại diện.
                         const esMultiplier = (dedupeOn && !esDedupeAvailable) ? 10 : 5;
-                        const esLimit = Math.min(Math.max(page * limit * esMultiplier, 100), 5000);
+                        esLimit = Math.min(Math.max(page * limit * esMultiplier, 100), 5000);
                         const esParams = {
                             index: ELASTIC_INDEX,
                             _source: ['ad_archive_id'],
@@ -1153,7 +1204,7 @@ function initSearchServer(dbInstance) {
 
             const sortOptions = sortInfo.sortOptions;
 
-            const results = await adsCol.find(query)
+            let results = await adsCol.find(query)
                 .project({
                     ad_archive_id: 1, ad_library_url: 1, page_name: 1, page_like_count: 1, text: 1, link: 1, domain: 1,
                     start_date: 1, seen_count: 1, score: 1, level: 1, trending_score: 1, scaling_score: 1,
@@ -1174,6 +1225,21 @@ function initSearchServer(dbInstance) {
                 } else {
                     results.sort((a, b) => (esRank.get(String(a.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER) - (esRank.get(String(b.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER));
                 }
+            }
+
+            // Chốt chặn cuối: cùng ad_archive_id không được xuất hiện 2 lần
+            // trong 1 trang (doc trùng ID khác kiểu số/chuỗi, hoặc ES +
+            // Mongo hợp nhất lệch). Giữ bản đầu tiên theo thứ tự đã sort.
+            if (dedupeOn && results.length > 1) {
+                const seenIds = new Set();
+                results = results.filter((d) => {
+                    const rawId = d.ad_archive_id != null ? d.ad_archive_id : d._id;
+                    if (rawId == null) return true;
+                    const key = String(rawId);
+                    if (seenIds.has(key)) return false;
+                    seenIds.add(key);
+                    return true;
+                });
             }
 
             // Echo để FE debug: bộ lọc nào đã áp dụng thật, giá trị nào bị
@@ -1251,6 +1317,12 @@ function initSearchServer(dbInstance) {
         const sid = String(id);
         const byArchive = await adsCol.findOne({ ad_archive_id: sid });
         if (byArchive) return byArchive;
+        // Doc cũ có thể lưu ad_archive_id dạng số (analyzer cũ không ép
+        // String) — thử cả dạng số trước khi kết luận không tìm thấy.
+        if (/^\d+$/.test(sid)) {
+            const byNumeric = await adsCol.findOne({ ad_archive_id: Number(sid) });
+            if (byNumeric) return byNumeric;
+        }
         let ObjectId = null;
         try { ({ ObjectId } = require('mongodb')); } catch (_) { /* test env không có mongodb thật */ }
         if (ObjectId && /^[0-9a-fA-F]{24}$/.test(sid)) {
@@ -1424,7 +1496,7 @@ function initSearchServer(dbInstance) {
     });
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, refreshEsDedupeProbe };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, countSimilarTotal, refreshEsDedupeProbe };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry

@@ -31,6 +31,59 @@ function normalize(text) {
   return text?.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+// Bỏ dấu tiếng Việt (để chuẩn hóa mã nước, không đụng text gốc).
+function stripDiacritics(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D');
+}
+
+// Bảng tên nước -> mã ISO (đồng bộ COUNTRY_NAME_MAP trong searchApi.js;
+// đổi ở đây thì đổi cả bên kia). Khóa đã strip dấu + chữ thường.
+const COUNTRY_NAME_TO_CODE = {
+  'viet nam': 'vn', vietnam: 'vn', vn: 'vn',
+  'hoa ky': 'us', 'united states': 'us', usa: 'us', us: 'us',
+  my: 'us', // từ 'Mỹ' strip dấu — chỉ tới được đây khi raw KHÔNG phải mã 'MY' (mã ISO được ưu tiên ở dưới)
+  'nhat ban': 'jp', japan: 'jp', jp: 'jp',
+  'thai lan': 'th', thailand: 'th', th: 'th',
+  philippines: 'ph', 'phi lip pin': 'ph', ph: 'ph',
+  malaysia: 'my', 'ma lai xi a': 'my',
+  indonesia: 'id', 'in do ne xi a': 'id', id: 'id',
+  singapore: 'sg', 'xin ga po': 'sg', sg: 'sg',
+  'han quoc': 'kr', korea: 'kr', 'south korea': 'kr', kr: 'kr',
+  anh: 'gb', 'united kingdom': 'gb', uk: 'gb', gb: 'gb',
+  duc: 'de', germany: 'de', de: 'de',
+  phap: 'fr', france: 'fr', fr: 'fr',
+  canada: 'ca', ca: 'ca',
+  uc: 'au', australia: 'au', au: 'au',
+  brazil: 'br', br: 'br',
+  mexico: 'mx', mx: 'mx',
+  uae: 'ae', 'cac tieu vuong quoc a rap': 'ae', ae: 'ae',
+  'dai loan': 'tw', taiwan: 'tw', tw: 'tw',
+  'hong kong': 'hk', hk: 'hk',
+  'trung quoc': 'cn', china: 'cn', cn: 'cn',
+  'an do': 'in', india: 'in', in: 'in',
+  'tay ban nha': 'es', spain: 'es', es: 'es',
+  y: 'it', italy: 'it', it: 'it',
+  'ha lan': 'nl', netherlands: 'nl', nl: 'nl',
+  nga: 'ru', russia: 'ru', ru: 'ru',
+  'tho nhi ky': 'tr', turkey: 'tr', tr: 'tr',
+};
+const COUNTRY_CODES = new Set(Object.values(COUNTRY_NAME_TO_CODE));
+
+// Giá trị country thô (vd 'USA', 'United States', 'Việt Nam', 'MY') ->
+// mã ISO chữ thường ('us', 'vn', 'my'), hoặc null nếu không nhận ra /
+// là 'ALL' (mặc định "mọi nước" của crawler, không phải 1 nước).
+// Mã ISO 2 chữ đúng dạng được ưu tiên trước bảng tên để 'MY' (Malaysia)
+// không bị nuốt thành 'us' do 'Mỹ' strip dấu cũng ra 'my'.
+function canonicalizeCountryValue(raw) {
+  const t = String(raw == null ? '' : raw).trim();
+  if (!t) return null;
+  const upper = t.toUpperCase();
+  if (/^[A-Z]{2}$/.test(upper) && COUNTRY_CODES.has(upper.toLowerCase())) return upper.toLowerCase();
+  const key = stripDiacritics(t).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  if (!key || key === 'all') return null;
+  return COUNTRY_NAME_TO_CODE[key] || null;
+}
+
 function extractDomain(url) {
   try {
     return new URL(url).hostname.replace('www.', '');
@@ -315,13 +368,26 @@ function hashTextKey(s) {
 // first_seen); hòa thì ad_archive_id nhỏ hơn thắng để quyết định
 // deterministic dù thứ tự cursor đổi. Crawler không lưu page_id nên
 // dùng page_name làm khóa page (khớp với pageMap hiện có).
+// Text quá ngắn/chung chung (chỉ emoji, "sale", "shop now", ...) không
+// đủ định danh 1 creative: đếm trùng toàn cục theo text đó phình D lên
+// hàng chục nghìn (vd 45240 ad cùng 1 text chung -> spend nổ theo D*T).
+// Coi như không có text để đếm/gom nhóm: duplicates rơi về
+// collation_count/seen_count. Ngưỡng 8 ký tự chữ/số (đã ghi nhận).
+function identifiableTextLength(text) {
+  return String(text || '').replace(/[^\p{L}\p{N}]/gu, '').length;
+}
+function isGenericCreativeText(text) {
+  return identifiableTextLength(text) < 8;
+}
+
 function groupKeyFor(pageName, text) {
-  if (!text) return null;
+  if (!text || isGenericCreativeText(text)) return null;
   return hashTextKey(String(pageName || '').toLowerCase().trim() + '\n' + text);
 }
 
 function resolveGroupArchiveId(ad) {
-  return ad.ad_archive_id || ad.ad_id || ad.id || null;
+  const rawId = ad.ad_archive_id || ad.ad_id || ad.id || null;
+  return rawId ? String(rawId) : null;
 }
 
 function groupStartMsOf(ad) {
@@ -369,7 +435,7 @@ function countIntoMaps(maps, ad) {
   const pageName = ad.page_name || 'unknown';
 
   maps.pageMap[pageName] = (maps.pageMap[pageName] || 0) + 1;
-  if (text) {
+  if (text && !isGenericCreativeText(text)) {
     const k = hashTextKey(text);
     if (maps.textMap[k] === undefined) maps.textKeys = (maps.textKeys || 0) + 1;
     maps.textMap[k] = (maps.textMap[k] || 0) + 1; // text rỗng không đếm (tránh phình D)
@@ -417,7 +483,8 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     const text = ad.normalized_text || normalize(ad.text || '');
     const domain = extractDomain(ad.link);
     // Chuẩn hóa ID: crawler có thể lưu ad_id/id thay vì ad_archive_id
-    const archiveId = ad.ad_archive_id || ad.ad_id || ad.id || null;
+    const _rawArchiveId = ad.ad_archive_id || ad.ad_id || ad.id || null;
+    const archiveId = _rawArchiveId ? String(_rawArchiveId) : null; // ép String: doc cũ có ID dạng số, unique index vẫn cho lọt 2 doc cùng ID khác kiểu
     const detailSummary = summarizeDetailHistory(ad);
 
     const startDateMs = (ad.start_date ? ad.start_date * 1000 : ad.first_seen) || now;
@@ -427,7 +494,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     // GIẢ ĐỊNH: collation_count là kích thước nhóm TÍNH CẢ ad này.
     // Nếu crawler của bạn đếm collation_count chỉ tính sibling (không tính chính nó)
     // thì đổi thành (ad.collation_count + 1).
-    const dupFromText = text ? (textMap[hashTextKey(text)] || 0) : 0;
+    const dupFromText = text && !isGenericCreativeText(text) ? (textMap[hashTextKey(text)] || 0) : 0;
     const duplicatesCount = Math.max(1, Math.round(ad.collation_count || dupFromText || ad.seen_count || 1));
     // Gom nhóm duplicate (page + text): ad đại diện = ad chạy sớm nhất.
     // groupMap xây ở pass 1; thiếu entry (doc mới ngoài pass 1) thì coi
@@ -515,7 +582,15 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     const countryMentionsLower = (Array.isArray(ad.country_mentions) ? ad.country_mentions : [])
       .map((c) => String(c).trim().toLowerCase()).filter(Boolean);
     const latestCountryLower = String(detailSummary.latest_detail_country || '').trim().toLowerCase();
-    const countriesLower = [...new Set([...countryMentionsLower, ...(latestCountryLower ? [latestCountryLower] : [])])];
+    // countries_lower CHUẨN HÓA về mã ISO (vd 'USA'/'United States' ->
+    // 'us'): API lọc equality theo mã nên giá trị thô dạng tên không bao
+    // giờ khớp ('US' trả 0 dù doc có 'united states'). 'ALL' bị loại
+    // (không phải 1 nước). country_mentions_lower/
+    // latest_detail_country_lower giữ nguyên dạng thô cho đường fallback.
+    const countriesLower = [...new Set([
+      ...countryMentionsLower.map(canonicalizeCountryValue),
+      canonicalizeCountryValue(detailSummary.latest_detail_country),
+    ].filter(Boolean))];
     const industryValue = classifyIndustry(ad);
     const presetPriorityValue = presetPriority(industryValue, creativeKind);
     return {
@@ -602,7 +677,8 @@ async function updateAdsCollection(col, analyzedAds) {
   for (let s = 0; s < analyzedAds.length; s += 1000) {
     const ops = [];
     for (const ad of analyzedAds.slice(s, s + 1000)) {
-      const archiveId = ad.ad_archive_id || ad.ad_id || ad.id;
+      const _rawArchiveId = ad.ad_archive_id || ad.ad_id || ad.id;
+      const archiveId = _rawArchiveId ? String(_rawArchiveId) : null; // ép String (xem ghi chú ở pass 2)
       if (!archiveId) { skipped++; continue; } // thiếu ID thì bỏ qua (tránh gom nhầm khi upsert)
       const { _id, ...rest } = ad; // _id của DB crawler không mang sang (tránh lỗi immutable _id)
       ops.push({
@@ -955,4 +1031,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics };

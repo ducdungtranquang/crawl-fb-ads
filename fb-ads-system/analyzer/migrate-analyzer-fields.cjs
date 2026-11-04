@@ -90,6 +90,58 @@ function extractDomain(link) {
   } catch (_) { return ''; }
 }
 
+// Bỏ dấu tiếng Việt (để chuẩn hóa mã nước, không đụng text gốc).
+function stripDiacritics(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D');
+}
+
+// Bảng tên nước -> mã ISO (đồng bộ COUNTRY_NAME_TO_CODE trong analyzer.js
+// và COUNTRY_NAME_MAP trong searchApi.js; đổi ở đây thì đổi cả 2 bên kia).
+// Khóa đã strip dấu + chữ thường.
+const COUNTRY_NAME_TO_CODE = {
+  'viet nam': 'vn', vietnam: 'vn', vn: 'vn',
+  'hoa ky': 'us', 'united states': 'us', usa: 'us', us: 'us',
+  my: 'us', // từ 'Mỹ' strip dấu — chỉ tới được đây khi raw KHÔNG phải mã 'MY' (mã ISO được ưu tiên ở dưới)
+  'nhat ban': 'jp', japan: 'jp', jp: 'jp',
+  'thai lan': 'th', thailand: 'th', th: 'th',
+  philippines: 'ph', 'phi lip pin': 'ph', ph: 'ph',
+  malaysia: 'my', 'ma lai xi a': 'my',
+  indonesia: 'id', 'in do ne xi a': 'id', id: 'id',
+  singapore: 'sg', 'xin ga po': 'sg', sg: 'sg',
+  'han quoc': 'kr', korea: 'kr', 'south korea': 'kr', kr: 'kr',
+  anh: 'gb', 'united kingdom': 'gb', uk: 'gb', gb: 'gb',
+  duc: 'de', germany: 'de', de: 'de',
+  phap: 'fr', france: 'fr', fr: 'fr',
+  canada: 'ca', ca: 'ca',
+  uc: 'au', australia: 'au', au: 'au',
+  brazil: 'br', br: 'br',
+  mexico: 'mx', mx: 'mx',
+  uae: 'ae', 'cac tieu vuong quoc a rap': 'ae', ae: 'ae',
+  'dai loan': 'tw', taiwan: 'tw', tw: 'tw',
+  'hong kong': 'hk', hk: 'hk',
+  'trung quoc': 'cn', china: 'cn', cn: 'cn',
+  'an do': 'in', india: 'in', in: 'in',
+  'tay ban nha': 'es', spain: 'es', es: 'es',
+  y: 'it', italy: 'it', it: 'it',
+  'ha lan': 'nl', netherlands: 'nl', nl: 'nl',
+  nga: 'ru', russia: 'ru', ru: 'ru',
+  'tho nhi ky': 'tr', turkey: 'tr', tr: 'tr',
+};
+const COUNTRY_CODES = new Set(Object.values(COUNTRY_NAME_TO_CODE));
+
+// Giá trị country thô -> mã ISO chữ thường, hoặc null nếu không nhận ra /
+// là 'ALL'. Mã ISO 2 chữ đúng dạng được ưu tiên trước bảng tên để 'MY'
+// (Malaysia) không bị nuốt thành 'us' do 'Mỹ' strip dấu cũng ra 'my'.
+function canonicalizeCountryValue(raw) {
+  const t = String(raw == null ? '' : raw).trim();
+  if (!t) return null;
+  const upper = t.toUpperCase();
+  if (/^[A-Z]{2}$/.test(upper) && COUNTRY_CODES.has(upper.toLowerCase())) return upper.toLowerCase();
+  const key = stripDiacritics(t).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  if (!key || key === 'all') return null;
+  return COUNTRY_NAME_TO_CODE[key] || null;
+}
+
 // Tính các field mới cho 1 doc (pure — test được không cần DB).
 function computeFields(doc, nowMs) {
   const now = nowMs || Date.now();
@@ -98,7 +150,14 @@ function computeFields(doc, nowMs) {
     .map(c => String(c).trim().toLowerCase()).filter(Boolean);
   const latestCountry = doc.latest_detail_country || doc.last_country || 'ALL';
   const latestCountryLower = String(latestCountry).trim().toLowerCase();
-  const countriesLower = [...new Set([...countryMentionsLower, ...(latestCountryLower ? [latestCountryLower] : [])])];
+  // countries_lower CHUẨN HÓA về mã ISO (đồng bộ analyzer.js): giá trị
+  // thô dạng tên ('United States') không khớp lọc equality theo mã.
+  // 'ALL' bị loại. country_mentions_lower/latest_detail_country_lower
+  // giữ dạng thô cho đường fallback.
+  const countriesLower = [...new Set([
+    ...countryMentionsLower.map(canonicalizeCountryValue),
+    canonicalizeCountryValue(latestCountry),
+  ].filter(Boolean))];
   const lastSeen = typeof doc.last_seen === 'number' ? doc.last_seen : 0;
   const industry = classifyIndustry(doc);
   return {
@@ -195,4 +254,4 @@ if (require.main === module) {
   main().catch(e => { console.error(e); process.exit(1); });
 }
 
-module.exports = { computeFields, classifyIndustry, industryKeywordMatch, INDUSTRY_CATEGORIES, parseArgs, presetPriority: presetPriorityValue };
+module.exports = { computeFields, classifyIndustry, industryKeywordMatch, INDUSTRY_CATEGORIES, parseArgs, presetPriority: presetPriorityValue, canonicalizeCountryValue };
