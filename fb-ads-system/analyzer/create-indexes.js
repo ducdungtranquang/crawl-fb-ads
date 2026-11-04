@@ -98,6 +98,10 @@ const INDEXES = [
   { key: { scaling_level: 1, start_date: -1 }, name: 'idx_scaling_start_date' },
   { key: { estimated_spend: 1, start_date: -1 }, name: 'idx_spend_tier_start_date' },
   { key: { scaling_score: -1 }, name: 'idx_scaling_score' },
+  // Đếm + sort khi dedupe bật: is_group_rep đứng trước để countDocuments
+  // theo preset/trạng thái/spend không phải quét toàn collection.
+  { key: { is_group_rep: 1, last_seen: -1 }, name: 'idx_group_rep_last_seen' },
+  { key: { is_group_rep: 1, estimated_spend_usd: 1 }, name: 'idx_group_rep_spend' },
 ];
 
 const PRODUCT_INDEXES = [
