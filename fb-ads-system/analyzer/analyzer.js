@@ -84,6 +84,51 @@ function canonicalizeCountryValue(raw) {
   return COUNTRY_NAME_TO_CODE[key] || null;
 }
 
+// Suy luận nước dự phòng (2026-11-04): CHỈ dùng khi countries_lower RỖNG
+// (không có dữ liệu nước thật từ Meta). KHÔNG BAO GIỜ ghi đè dữ liệu thật:
+// ad đã có nhãn Meta (kể cả 'us' cho ad tiếng Việt nhắm kiều bào) giữ nguyên.
+// Suy ra 'vn' khi có tín hiệu tiếng Việt đủ mạnh:
+//   - domain .vn, hoặc giá tiền VND (số + ₫/đ/VNĐ),
+//   - hoặc >= 3 ký tự dấu đặc trưng tiếng Việt (dấu mũ/nón/móc/nặng mà
+//     tiếng Pháp/Tây Ban Nha không dùng: ắ ộ ự ả ...),
+//   - hoặc >= 1 ký tự dấu đặc trưng + >= 1 cụm từ bán hàng tiếng Việt,
+//   - hoặc >= 2 cụm từ bán hàng tiếng Việt khác nhau.
+// Kết quả suy luận luôn đánh dấu country_inferred=true để phân biệt với
+// nhãn Meta. migrate-analyzer-fields.cjs có bản copy giống hệt (dùng
+// normalizeText thay cho normalize): đổi quy tắc thì đổi cả 2 chỗ.
+const VIETNAMESE_MARK_CHARS = /[ăắằẳẵặấầẩẫậđếềểễệốồổỗộớờởỡợứừửữựảãạẻẽẹỉĩịỏõọủũụỷỹỵ]/g;
+const VIETNAMESE_MARKERS = [
+  'mua ngay', 'giam gia', 'freeship', 'mien phi van chuyen', 'giao hang',
+  'toan quoc', 'dat hang', 'lien he', 'chinh hang', 'bao hanh', 'gia chi',
+  'con hang', 'hotline', 'zalo', 'tiki', 'ship cod', 'kuyen mai', 'tu van',
+  'mien phi', 'dat lich', 'xem them', 'mua sam', 'thanh toan', 'nhan hang',
+  'uu dai', 'ho tro', 'cham soc', 'mua 1 tang 1', 'sale soc', 'tri mun',
+  'noi that', 'thoi trang', 'gia dung', 'suc khoe', 'lam dep',
+];
+const VND_PRICE_RE = /\d[\d.,]*\s*(₫|đ|vnđ|vnd)(?!\p{L})/iu;
+
+function inferCountryFromVietnamese(ad, domain) {
+  const rawText = normalize(
+    (ad.text || '') + ' ' + (ad.headline || '') + ' ' + (ad.description || '') + ' ' + (ad.page_name || '')
+  ) || '';
+  const dom = String(domain || ad.domain || extractDomain(ad.link) || '').toLowerCase();
+  if (dom.endsWith('.vn')) return 'vn';
+  if (VND_PRICE_RE.test(rawText)) return 'vn';
+  const marks = (rawText.match(VIETNAMESE_MARK_CHARS) || []).length;
+  if (marks >= 3) return 'vn';
+  const stripped = stripDiacritics(rawText).toLowerCase();
+  let hits = 0;
+  for (const m of VIETNAMESE_MARKERS) {
+    if (m.includes(' ')) {
+      if (stripped.includes(m)) hits++;
+    } else {
+      const esc = m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (new RegExp(`(^|[^\\p{L}\\p{N}])${esc}($|[^\\p{L}\\p{N}])`, 'u').test(stripped)) hits++;
+    }
+  }
+  if ((marks >= 1 && hits >= 1) || hits >= 2) return 'vn';
+  return null;
+}
 function extractDomain(url) {
   try {
     return new URL(url).hostname.replace('www.', '');
@@ -630,6 +675,13 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       ...countryMentionsLower.map(canonicalizeCountryValue),
       canonicalizeCountryValue(detailSummary.latest_detail_country),
     ].filter(Boolean))];
+    // Fallback suy luận (chỉ khi rỗng — không ghi đè nhãn Meta). Ghi dấu
+    // country_inferred để phân biệt với nhãn thật (xem inferCountryFromVietnamese).
+    let countryInferred = false;
+    if (countriesLower.length === 0 && inferCountryFromVietnamese(ad, domain) === 'vn') {
+      countriesLower.push('vn');
+      countryInferred = true;
+    }
     const industryValue = classifyIndustry(ad);
     const presetPriorityValue = presetPriority(industryValue, creativeKind);
     return {
@@ -701,6 +753,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       country_mentions_lower: countryMentionsLower,
       latest_detail_country_lower: latestCountryLower,
       countries_lower: countriesLower,
+      country_inferred: countryInferred,
       ...detailSummary,
       keyword_frequency: (Array.isArray(ad.keyword_mentions) ? ad.keyword_mentions : []).length,
       country_frequency: (Array.isArray(ad.country_mentions) ? ad.country_mentions : []).length
@@ -837,6 +890,7 @@ async function syncToElasticsearch(esClient, analyzedAds) {
       trending_score: ad.trending_score || 0,
       funnel: ad.funnel || '',
       industry: ad.industry || 'other',
+      country_inferred: ad.country_inferred === true,
       scaling_level: ad.scaling_level || ''
     }));
     if (!docs.length) continue;
@@ -1074,4 +1128,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese };

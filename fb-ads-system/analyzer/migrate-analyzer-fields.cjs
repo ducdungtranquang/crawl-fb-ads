@@ -7,6 +7,8 @@
  * Ghi các field searchApi đường nhanh cần mà doc cũ chưa có:
  *   page_name_lower, domain_lower,
  *   country_mentions_lower, latest_detail_country_lower, countries_lower,
+ *   country_inferred (true khi countries_lower do suy luận từ tiếng Việt
+ *   vì không có dữ liệu nước thật — đồng bộ analyzer.js),
  *   industry (phân loại lại bằng đúng bảng từ khóa của analyzer.js,
  *   với quy tắc khớp nguyên từ cho từ đơn — xem industryKeywordMatch),
  *   preset_priority (0 sản phẩm ưu tiên / 1 trung lập / 2 giải trí —
@@ -142,6 +144,44 @@ function canonicalizeCountryValue(raw) {
   return COUNTRY_NAME_TO_CODE[key] || null;
 }
 
+// Suy luận nước dự phòng (2026-11-04): bản copy giống hệt
+// inferCountryFromVietnamese trong analyzer.js (dùng normalizeText thay
+// cho normalize) — đổi quy tắc thì đổi cả 2 chỗ. CHỈ dùng khi
+// countries_lower RỖNG; không bao giờ ghi đè dữ liệu Meta thật.
+const VIETNAMESE_MARK_CHARS = /[ăắằẳẵặấầẩẫậđếềểễệốồổỗộớờởỡợứừửữựảãạẻẽẹỉĩịỏõọủũụỷỹỵ]/g;
+const VIETNAMESE_MARKERS = [
+  'mua ngay', 'giam gia', 'freeship', 'mien phi van chuyen', 'giao hang',
+  'toan quoc', 'dat hang', 'lien he', 'chinh hang', 'bao hanh', 'gia chi',
+  'con hang', 'hotline', 'zalo', 'tiki', 'ship cod', 'kuyen mai', 'tu van',
+  'mien phi', 'dat lich', 'xem them', 'mua sam', 'thanh toan', 'nhan hang',
+  'uu dai', 'ho tro', 'cham soc', 'mua 1 tang 1', 'sale soc', 'tri mun',
+  'noi that', 'thoi trang', 'gia dung', 'suc khoe', 'lam dep',
+];
+const VND_PRICE_RE = /\d[\d.,]*\s*(₫|đ|vnđ|vnd)(?!\p{L})/iu;
+
+function inferCountryFromVietnamese(ad, domain) {
+  const rawText = normalizeText(
+    (ad.text || '') + ' ' + (ad.headline || '') + ' ' + (ad.description || '') + ' ' + (ad.page_name || '')
+  ) || '';
+  const dom = String(domain || ad.domain || extractDomain(ad.link) || '').toLowerCase();
+  if (dom.endsWith('.vn')) return 'vn';
+  if (VND_PRICE_RE.test(rawText)) return 'vn';
+  const marks = (rawText.match(VIETNAMESE_MARK_CHARS) || []).length;
+  if (marks >= 3) return 'vn';
+  const stripped = stripDiacritics(rawText).toLowerCase();
+  let hits = 0;
+  for (const m of VIETNAMESE_MARKERS) {
+    if (m.includes(' ')) {
+      if (stripped.includes(m)) hits++;
+    } else {
+      const esc = m.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (new RegExp(`(^|[^\\p{L}\\p{N}])${esc}($|[^\\p{L}\\p{N}])`, 'u').test(stripped)) hits++;
+    }
+  }
+  if ((marks >= 1 && hits >= 1) || hits >= 2) return 'vn';
+  return null;
+}
+
 // Tính các field mới cho 1 doc (pure — test được không cần DB).
 function computeFields(doc, nowMs) {
   const now = nowMs || Date.now();
@@ -158,6 +198,13 @@ function computeFields(doc, nowMs) {
     ...countryMentionsLower.map(canonicalizeCountryValue),
     canonicalizeCountryValue(latestCountry),
   ].filter(Boolean))];
+  // Fallback suy luận (đồng bộ analyzer.js): chỉ khi rỗng — không ghi đè
+  // nhãn Meta. Ghi dấu country_inferred để phân biệt với nhãn thật.
+  let countryInferred = false;
+  if (countriesLower.length === 0 && inferCountryFromVietnamese(doc, domain) === 'vn') {
+    countriesLower.push('vn');
+    countryInferred = true;
+  }
   const lastSeen = typeof doc.last_seen === 'number' ? doc.last_seen : 0;
   const industry = classifyIndustry(doc);
   return {
@@ -166,6 +213,7 @@ function computeFields(doc, nowMs) {
     country_mentions_lower: countryMentionsLower,
     latest_detail_country_lower: latestCountryLower,
     countries_lower: countriesLower,
+    country_inferred: countryInferred,
     industry,
     preset_priority: presetPriorityValue(industry, doc.creative_rank),
     is_active: lastSeen > 0 && (now - lastSeen) <= ACTIVE_WINDOW_MS,
@@ -194,12 +242,15 @@ async function main() {
   try {
     const col = client.db(DB_NAME).collection(COL_NAME);
     const total = await col.estimatedDocumentCount();
-    // Doc cần migration: thiếu ÍT NHẤT 1 field mới.
+    // Doc cần migration: thiếu ÍT NHẤT 1 field mới, HOẶC countries_lower
+    // rỗng (analyzer bản PR #7 ghi [] cho ad không có dữ liệu nước — coi
+    // như thiếu để suy luận lấp đầy; nhãn Meta đã có thì không động vào).
     const filter = {
       $or: [
         { page_name_lower: { $exists: false } },
         { domain_lower: { $exists: false } },
         { countries_lower: { $exists: false } },
+        { countries_lower: { $size: 0 } },
         { industry: { $exists: false } },
         { preset_priority: { $exists: false } },
         { is_active: { $exists: false } },
@@ -208,7 +259,7 @@ async function main() {
     const needing = await col.countDocuments(filter);
     console.log(`Collection: ${DB_NAME}.${COL_NAME} — tổng ~${total} docs, cần migration: ${needing} docs${args.dryRun ? ' (DRY-RUN, không ghi)' : ''}${args.limit ? `, giới hạn ${args.limit}` : ''}.`);
     const cursor = col.find(filter, {
-      projection: { ad_archive_id: 1, page_name: 1, domain: 1, link: 1, text: 1, headline: 1, country_mentions: 1, latest_detail_country: 1, last_country: 1, last_seen: 1, creative_rank: 1 },
+      projection: { ad_archive_id: 1, page_name: 1, domain: 1, link: 1, text: 1, headline: 1, description: 1, country_mentions: 1, latest_detail_country: 1, last_country: 1, last_seen: 1, creative_rank: 1 },
       noCursorTimeout: true,
     }).batchSize(200);
     let scanned = 0, updated = 0, ops = [];
@@ -229,6 +280,12 @@ async function main() {
         const set = {};
         for (const [k, v] of Object.entries(fields)) {
           if (doc[k] === undefined) set[k] = v;
+        }
+        // Ngoại lệ: countries_lower rỗng được coi như thiếu — cho phép
+        // suy luận lấp đầy, nhưng không ghi đè nhãn Meta đã có.
+        if (Array.isArray(doc.countries_lower) && doc.countries_lower.length === 0 && fields.countries_lower.length > 0) {
+          set.countries_lower = fields.countries_lower;
+          set.country_inferred = fields.country_inferred;
         }
         if (Object.keys(set).length) {
           ops.push({ updateOne: { filter: { _id: doc._id }, update: { $set: set } } });
@@ -254,4 +311,4 @@ if (require.main === module) {
   main().catch(e => { console.error(e); process.exit(1); });
 }
 
-module.exports = { computeFields, classifyIndustry, industryKeywordMatch, INDUSTRY_CATEGORIES, parseArgs, presetPriority: presetPriorityValue, canonicalizeCountryValue };
+module.exports = { computeFields, classifyIndustry, industryKeywordMatch, INDUSTRY_CATEGORIES, parseArgs, presetPriority: presetPriorityValue, canonicalizeCountryValue, inferCountryFromVietnamese };
