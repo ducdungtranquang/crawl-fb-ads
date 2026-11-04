@@ -244,9 +244,31 @@ function detectFunnel(ad) {
  * 🎯 ƯỚC TÍNH CHI PHÍ (SPEND) VÀ SỐ LƯỢT TIẾP CẬN (REACH)
  * Áp dụng mô hình toán học Ads Spy tối ưu
  */
-function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1) {
-  const T = Math.max(1, Math.round(durationDays));
-  const D = Math.max(1, Math.round(duplicatesCount || ad.seen_count || 1));
+// Trần ước tính chi tiêu (2026-11-04, chống số phi lý):
+// - D (bản sao) tối đa 30: vượt quá là re-upload theo thời gian, không
+//   phải hàng chục nghìn bản sao chạy đồng thời cùng đốt ngân sách.
+// - T (số ngày) tối đa 365: quá 1 năm thì start_date/first_seen đã cũ,
+//   không còn là chi tiêu liên tục.
+// - Trần tuyệt đối theo quy mô Page: min(500k, max(5k, 1k × số ad của Page)).
+//   Page chỉ có vài ad không thể có 1 ad đốt hàng trăm nghìn đô.
+// - Tuổi dùng số ngày THỰC (phân số, tối thiểu 0,05 ngày ≈ 1,2 giờ) thay vì
+//   làm tròn lên 1: các ad mới lên trong cùng 1 ngày không còn ra cùng
+//   một bộ ba $35 / 1,7k / 1 bản sao.
+// Các hằng số điều chỉnh được tại SPEND_MODEL_CAPS. Công thức gốc
+// (D × T × bBase × mInd × fT) và các tier giữ nguyên.
+const SPEND_MODEL_CAPS = {
+  maxCopies: 30,
+  maxDays: 365,
+  minAgeDays: 0.05,
+  spendFloorUsd: 1,
+  absoluteMaxUsd: 500000,
+  perPageAdCapUsd: 1000,
+  minPageCapUsd: 5000,
+};
+
+function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1, pageAdsCount = 1) {
+  const T = Math.min(SPEND_MODEL_CAPS.maxDays, Math.max(SPEND_MODEL_CAPS.minAgeDays, durationDays));
+  const D = Math.min(SPEND_MODEL_CAPS.maxCopies, Math.max(1, Math.round(duplicatesCount || ad.seen_count || 1)));
 
   // 1. Xác định CPM theo khu vực Địa lý
   const countries = Array.isArray(ad.country_mentions) && ad.country_mentions.length > 0
@@ -291,13 +313,25 @@ function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1) {
   // 4. Tính toán Ngân sách Chi tiêu — trả về KHOẢNG (min–max) thay vì 1 số điểm.
   // Khoảng phản ánh độ bất định lớn nhất của mô hình: việc xếp tier (bBase).
   // min = tier dưới, max = tier trên; ở tier biên thì nhân 0.5 / 1.5.
-  const spendFor = (b) => Math.max(D * T * b * mInd * fT, 1.0 * T); // Tối thiểu $1/ngày
-  const estimatedSpend = spendFor(bBase);
+  const spendFor = (b) => Math.max(D * T * b * mInd * fT, SPEND_MODEL_CAPS.spendFloorUsd); // Tối thiểu $1 tuyệt đối
+  let estimatedSpend = spendFor(bBase);
   const tierIdx = TIERS.indexOf(bBase);
   const bLow = tierIdx > 0 ? TIERS[tierIdx - 1] : bBase * 0.5;
   const bHigh = tierIdx < TIERS.length - 1 ? TIERS[tierIdx + 1] : bBase * 1.5;
-  const spendMin = Math.min(estimatedSpend, spendFor(bLow));
-  const spendMax = Math.max(estimatedSpend, spendFor(bHigh));
+  let spendMin = Math.min(estimatedSpend, spendFor(bLow));
+  let spendMax = Math.max(estimatedSpend, spendFor(bHigh));
+
+  // Trần theo quy mô Page (áp TRƯỚC khi suy reach, để reach cũng bị chặn theo).
+  const pageCap = Math.min(
+    SPEND_MODEL_CAPS.absoluteMaxUsd,
+    Math.max(SPEND_MODEL_CAPS.minPageCapUsd, SPEND_MODEL_CAPS.perPageAdCapUsd * Math.max(1, pageAdsCount || 1))
+  );
+  const spendCapped = spendMax > pageCap;
+  if (spendCapped) {
+    estimatedSpend = Math.min(estimatedSpend, pageCap);
+    spendMin = Math.min(spendMin, pageCap);
+    spendMax = Math.min(spendMax, pageCap);
+  }
 
   // 5. Tính toán Số lượt tiếp cận (kéo theo khoảng của spend)
   const frequency = 1.15;
@@ -317,6 +351,8 @@ function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1) {
     estimated_reach_min: reachFor(spendMin),
     estimated_reach_max: reachFor(spendMax),
     estimated_spend: spendLevel,
+    estimated_spend_source: 'model',
+    estimated_spend_capped: spendCapped,
     cpm_used: cpm
   };
 }
@@ -489,6 +525,9 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
 
     const startDateMs = (ad.start_date ? ad.start_date * 1000 : ad.first_seen) || now;
     const durationDays = Math.max(1, (now - startDateMs) / (1000 * 3600 * 24));
+    // Tuổi thực (phân số) chỉ dùng cho ước tính spend: ad mới lên vài giờ
+    // không bị làm tròn thành 1 ngày như durationDays (dùng cho score/preset).
+    const ageDaysRaw = (now - startDateMs) / (1000 * 3600 * 24);
     // Duplicates: ưu tiên collation_count của Meta (nhóm creative do Meta gom),
     // fallback về đếm trùng text tuyệt đối, rồi seen_count.
     // GIẢ ĐỊNH: collation_count là kích thước nhóm TÍNH CẢ ad này.
@@ -501,7 +540,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     // là nhóm riêng để không ẩn nhầm.
     const groupInfo = selectGroupInfo(groupMap, ad, text, archiveId);
 
-    const spendReachData = estimateSpendAndReach(ad, durationDays, duplicatesCount);
+    const spendReachData = estimateSpendAndReach(ad, ageDaysRaw, duplicatesCount, pageMap[ad.page_name] || 0);
 
     let score = 0;
     const pageAds = pageMap[ad.page_name] || 0;
@@ -616,6 +655,8 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       estimated_reach_min: spendReachData.estimated_reach_min,
       estimated_reach_max: spendReachData.estimated_reach_max,
       estimated_spend: spendReachData.estimated_spend,
+      estimated_spend_source: spendReachData.estimated_spend_source,
+      estimated_spend_capped: spendReachData.estimated_spend_capped,
       cpm_used: spendReachData.cpm_used,
       // Tín hiệu thô để sau này build bộ lọc "Quảng cáo mới lên",
       // "Ready to Scale", "Đang chạy mạnh". Ngưỡng chỉ là gợi ý,
@@ -785,6 +826,8 @@ async function syncToElasticsearch(esClient, analyzedAds) {
       estimated_reach_min: ad.estimated_reach_min || 0,
       estimated_reach_max: ad.estimated_reach_max || 0,
       estimated_spend: ad.estimated_spend || '',
+      estimated_spend_source: ad.estimated_spend_source || 'model',
+      estimated_spend_capped: ad.estimated_spend_capped === true,
       duplicates_count: ad.duplicates_count || 1,
       duplicate_group_size: ad.duplicate_group_size || 1,
       is_group_rep: ad.is_group_rep !== false,
@@ -1031,4 +1074,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS };
