@@ -233,11 +233,18 @@ function parseActiveParam(v) {
 // chứng 01/11). Analyzer bản cũ KHÔNG ghi field is_active nên lọc bằng
 // is_active trực tiếp luôn trả 0; dùng last_seen thì đúng cả trước và sau
 // khi analyzer ghi field (cùng quy tắc 7 ngày, xem analyzer.js).
+// Inactive CHỈ dùng last_seen < cutoff (không kèm nhánh $exists:false):
+// nhánh đó bắt Mongo quét toàn collection để chứng minh field vắng mặt
+// nên đếm inactive không bao giờ xong (~70s). Bất biến dựa vào: crawler
+// + analyzer luôn ghi last_seen cho mọi doc (saveAdAndDetailDirectly ghi
+// first_seen/last_seen khi insert; analyzer spread giữ lại). KIỂM CHỨNG
+// trước khi deploy: countDocuments({last_seen: {$exists: false}}) phải
+// bằng 0; nếu > 0 thì giữ nhánh $or cũ và backfill last_seen trước.
 const ACTIVE_WINDOW_MS = 7 * 24 * 3600 * 1000;
 function buildActiveCondition(activeBool) {
     const cutoff = Date.now() - ACTIVE_WINDOW_MS;
     if (activeBool === true) return { last_seen: { $gte: cutoff } };
-    return { $or: [{ last_seen: { $lt: cutoff } }, { last_seen: { $exists: false } }] };
+    return { last_seen: { $lt: cutoff } };
 }
 
 // Ngày: nhận ISO (2026-10-27), MM/DD/YYYY, hoặc epoch giây/ms (số thuần).
@@ -530,12 +537,13 @@ function buildLevelCondition(levelParam) {
     return { level: { $in: uniq.map(w => new RegExp(escapeRegExp(w), 'i')) } };
 }
 
-// Điều kiện scaling_level: DB chỉ có 3 giá trị ('🚀 SCALING HARD',
-// '⚡ SCALING', 'NORMAL'), FE có 4 nhãn. Map: SCALING HARD -> đúng giá
-// trị đó; 'cao' -> scaling_score >= 6 (gồm SCALING + SCALING HARD);
-// 'trung bình' -> NORMAL; 'thấp' -> NORMAL + scaling_score <= 0. FE nên
-// gửi giá trị chuẩn (SCALING HARD / SCALING / NORMAL) để khỏi phải map
-// (xem FE brief). Nhiều giá trị -> $or.
+// Điều kiện scaling_level: DB chỉ có 3 giá trị chuẩn ('🚀 SCALING HARD',
+// '⚡ SCALING', 'NORMAL') do analyzer ghi. Map thẳng sang giá trị chuẩn
+// (equality) thay vì regex 'i' — regex không phân biệt hoa thường KHÔNG
+// dùng được index nên đếm/tìm scaling trước đây quét toàn collection
+// (~50s, đếm không xong). Giá trị đã chuẩn hóa nên equality cho cùng tập
+// kết quả với dữ liệu chuẩn; nhãn lạ chưa map vẫn giữ regex ở nhánh cuối.
+// Nhiều giá trị -> $or.
 function buildScalingCondition(scalingParam) {
     const branches = [];
     for (const raw of String(scalingParam || '').split(',')) {
@@ -543,17 +551,15 @@ function buildScalingCondition(scalingParam) {
         if (!t) continue;
         const key = normKey(t.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, ''));
         if (key === 'scaling hard' || key === 'rat cao' || key === 'very high') {
-            branches.push({ scaling_level: new RegExp(escapeRegExp('SCALING HARD'), 'i') });
+            branches.push({ scaling_level: '🚀 SCALING HARD' });
         } else if (key === 'scaling') {
-            branches.push({ scaling_level: /^⚡ SCALING$/i });
+            branches.push({ scaling_level: '⚡ SCALING' });
         } else if (key === 'cao' || key === 'high') {
             branches.push({ scaling_score: { $gte: 6 } });
-        } else if (key === 'trung binh' || key === 'medium' || key === 'trung') {
-            branches.push({ scaling_level: new RegExp(escapeRegExp('NORMAL'), 'i') });
+        } else if (key === 'trung binh' || key === 'medium' || key === 'trung' || key === 'binh thuong' || key === 'normal') {
+            branches.push({ scaling_level: 'NORMAL' });
         } else if (key === 'thap' || key === 'low') {
-            branches.push({ scaling_level: new RegExp(escapeRegExp('NORMAL'), 'i'), scaling_score: { $lte: 0 } });
-        } else if (key === 'normal') {
-            branches.push({ scaling_level: new RegExp(escapeRegExp('NORMAL'), 'i') });
+            branches.push({ scaling_level: 'NORMAL', scaling_score: { $lte: 0 } });
         } else {
             branches.push({ scaling_level: new RegExp(escapeRegExp(t), 'i') });
         }
