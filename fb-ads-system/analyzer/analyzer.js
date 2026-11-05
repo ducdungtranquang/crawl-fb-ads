@@ -1050,6 +1050,10 @@ async function main() {
         { key: { 'filter_signals.is_new_ad': 1, preset_priority: 1, start_date: -1 }, name: "idx_new_ad_priority" },
         { key: { 'filter_signals.is_ready_to_scale': 1, preset_priority: 1, scaling_score: -1 }, name: "idx_scale_priority" },
         { key: { 'filter_signals.is_weekly_winner': 1, preset_priority: 1, trending_score: -1 }, name: "idx_winner_priority" },
+        // 3 index dem preset + dedupe (da tao truc tiep tren VM 04/11/2026, ghi vao code de build lai khong mat).
+        { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, start_date: -1 }, name: "idx_new_ad_rep_priority" },
+        { key: { 'filter_signals.is_ready_to_scale': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, scaling_score: -1 }, name: "idx_scale_rep_rank" },
+        { key: { 'filter_signals.is_weekly_winner': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, trending_score: -1 }, name: "idx_winner_rep_rank" },
         { key: { page_name_lower: 1, score: -1 }, name: "idx_page_lower_score" },
         { key: { domain_lower: 1, score: -1 }, name: "idx_domain_lower_score" }
       ]);

@@ -45,6 +45,12 @@ const INDEXES = [
   { key: { 'filter_signals.is_new_ad': 1, preset_priority: 1, start_date: -1 }, name: 'idx_new_ad_priority' },
   { key: { 'filter_signals.is_ready_to_scale': 1, preset_priority: 1, scaling_score: -1 }, name: 'idx_scale_priority' },
   { key: { 'filter_signals.is_weekly_winner': 1, preset_priority: 1, trending_score: -1 }, name: 'idx_winner_priority' },
+  // Dem preset + dedupe (is_group_rep) trong 1 index - 3 index nay da
+  // tao truc tiep tren VM ngay 04/11/2026, ghi vao code de build lai
+  // tu dau khong mat.
+  { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, start_date: -1 }, name: 'idx_new_ad_rep_priority' },
+  { key: { 'filter_signals.is_ready_to_scale': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, scaling_score: -1 }, name: 'idx_scale_rep_rank' },
+  { key: { 'filter_signals.is_weekly_winner': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, trending_score: -1 }, name: 'idx_winner_rep_rank' },
   { key: { last_seen: -1 }, name: 'idx_last_seen' },
   { key: { duration_days: 1 }, name: 'idx_duration_days' },
   { key: { estimated_spend_usd: -1 }, name: 'spend_usd_sort' },

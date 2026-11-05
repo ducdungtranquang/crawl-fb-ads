@@ -759,6 +759,43 @@ function resolveSearchSort(presets, q, opts) {
     return { sortOptions: { [safeSortField]: requestedOrder }, rankFirst: false };
 }
 
+// Query ĐẾM: bỏ điều kiện $exists trên field rank (preset_priority /
+// creative_rank) khỏi bản sao của query — $exists chặn COUNT_SCAN nên đếm
+// phải FETCH toàn bộ doc khớp (đo thực tế trên VM: đếm new_ads có $exists
+// 12.2s, bỏ $exists 0.15s, cùng total 82.861). Chỉ bỏ đúng 2 field rank và
+// chỉ khi field đó có trong sortOptions (tức probe đã xác nhận field triển
+// khai — đúng trạng thái khiến $exists được thêm vào query). Mọi điều kiện
+// khác (kể cả $exists khác, $or, $and lồng) giữ nguyên; query gốc không
+// đổi nên danh sách trả về giữ nguyên điều kiện $exists. Sau 1 lượt
+// analyzer FULL mọi doc đều có cả 2 field nên total đếm == số dòng list;
+// doc cũ thiếu field (nếu còn) chỉ làm total cao hơn chút, không ảnh
+// hưởng danh sách. Không bao giờ trả về query rỗng: nếu lọc xong $and
+// rỗng thì giữ nguyên query gốc.
+function stripCountExistsConditions(query, sortOptions) {
+    if (!query || typeof query !== 'object' || Array.isArray(query)) return query;
+    const rankFields = [];
+    if (sortOptions && 'preset_priority' in sortOptions) rankFields.push('preset_priority');
+    if (sortOptions && 'creative_rank' in sortOptions) rankFields.push('creative_rank');
+    if (!rankFields.length) return query;
+    const isExistsTrue = (v) => !!v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 1 && v.$exists === true;
+    const isRankExists = (c) => {
+        if (!c || typeof c !== 'object' || Array.isArray(c)) return false;
+        const keys = Object.keys(c);
+        return keys.length === 1 && rankFields.includes(keys[0]) && isExistsTrue(c[keys[0]]);
+    };
+    let changed = false;
+    const out = { ...query };
+    if (Array.isArray(query.$and)) {
+        const rest = query.$and.filter((c) => !isRankExists(c));
+        if (rest.length === 0) return query;
+        if (rest.length !== query.$and.length) { out.$and = rest; changed = true; }
+    }
+    for (const f of rankFields) {
+        if (isExistsTrue(query[f])) { delete out[f]; changed = true; }
+    }
+    return changed ? out : query;
+}
+
 // Trả về mảng điều kiện Mongo cho preset (kết hợp AND với các filter khác).
 // presets: chuỗi 'new_ads,ready_to_scale' (chấp nhận alias new/scale/winner).
 // Đường nhanh: dùng cờ filter_signals.* tính sẵn bởi analyzer (1 field
@@ -1192,13 +1229,16 @@ function initSearchServer(dbInstance) {
             // Đếm: countDocuments trên query chậm (regex/$or) có thể vượt
             // timeout của proxy FE. Giới hạn 30s; hết giờ thì vẫn trả data
             // với total=null để FE hiện kết quả thay vì lỗi 500 (FE phải
-            // chịu được total=null, xem FE brief).
+            // chịu được total=null, xem FE brief). Query đếm bỏ $exists
+            // trên field rank (xem stripCountExistsConditions) để Mongo
+            // dùng COUNT_SCAN thay vì FETCH toàn bộ doc.
             let total = null;
             let countTimeout = false;
+            const countQuery = stripCountExistsConditions(query, sortInfo.sortOptions);
             try {
-                total = Object.keys(query).length === 0
+                total = Object.keys(countQuery).length === 0
                     ? await adsCol.estimatedDocumentCount()
-                    : await adsCol.countDocuments(query, { maxTimeMS: 30000 });
+                    : await adsCol.countDocuments(countQuery, { maxTimeMS: 30000 });
             } catch (countErr) {
                 console.warn('[Search API] countDocuments timeout/lỗi:', countErr.message);
                 countTimeout = true;
@@ -1498,7 +1538,7 @@ function initSearchServer(dbInstance) {
     });
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, countSimilarTotal, refreshEsDedupeProbe };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
