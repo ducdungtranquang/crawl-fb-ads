@@ -118,6 +118,12 @@ const INDEXES = [
   // theo preset/trạng thái/spend không phải quét toàn collection.
   { key: { is_group_rep: 1, last_seen: -1 }, name: 'idx_group_rep_last_seen' },
   { key: { is_group_rep: 1, estimated_spend_usd: 1 }, name: 'idx_group_rep_spend' },
+  // Fix retest 06/11: Inactive find (rep + last_seen + sort start_date)
+  // va combo new_ads+VN (flag + rep + country + sort) — thieu 2 index
+  // nay thi find phai FETCH toan bo doc cua filter (UI Inactive 0 the,
+  // combo 20-35s) du count da nhanh.
+  { key: { is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_group_rep_last_seen_start' },
+  { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, countries_lower: 1, start_date: -1 }, name: 'idx_new_ad_rep_country_start' },
 ];
 
 const PRODUCT_INDEXES = [

@@ -156,12 +156,22 @@ function normalizeCountryCodes(countryParam) {
             continue;
         }
         const key = normKey(t);
+        // 'Các nước khác' = mọi ad không phải Việt Nam (gồm cả ad chưa có
+        // nhãn nước): sentinel 'other', xử lý riêng ở buildCountryCondition.
+        if (['other', 'others', 'other countries', 'khac', 'cac nuoc khac', 'non vn', 'not vn', 'notvn'].includes(key)) {
+            if (!out.includes('other')) out.push('other');
+            continue;
+        }
         const code = COUNTRY_NAME_MAP[key] || (/^[a-z]{2}$/.test(key) ? key : null);
         if (!code || code === 'all') continue;
         if (!out.includes(code)) out.push(code);
     }
     return out;
 }
+
+// Bí danh tiếng Anh ngắn cho param industry gõ tay trên URL
+// (?industry=beauty): FE gửi giá trị chuẩn nên chỉ ảnh hưởng param gõ tay.
+const INDUSTRY_ALIASES = { beauty: 'beauty_health', home: 'home_living', food: 'food_beverage', realestate: 'real_estate', 'real estate': 'real_estate', auto: 'automotive', cars: 'automotive', pet: 'pets', game: 'entertainment', casino: 'gambling' };
 
 // Nhãn ngành FE gửi (label hiển thị hoặc slug) -> value chuẩn.
 function normalizeIndustryValues(industryParam) {
@@ -172,6 +182,8 @@ function normalizeIndustryValues(industryParam) {
         const lower = t.toLowerCase();
         if (INDUSTRY_VALUES.has(lower)) { if (!out.includes(lower)) out.push(lower); continue; }
         const key = normKey(t);
+        const alias = INDUSTRY_ALIASES[lower] || INDUSTRY_ALIASES[key];
+        if (alias && !out.includes(alias)) { out.push(alias); continue; }
         const hit = INDUSTRIES.find(i => {
             const lk = normKey(i.label);
             return lk === key || lk.startsWith(key) || key.startsWith(lk) || lk.includes(key);
@@ -491,6 +503,16 @@ function buildIndustryCondition(industryParam, schema) {
 function buildCountryCondition(countryParam, schema) {
     const codes = normalizeCountryCodes(countryParam);
     if (!codes.length) return null;
+    // 'other' = không phải Việt Nam: {countries_lower: {$ne: 'vn'}} khớp
+    // cả doc có nhãn nước khác VN lẫn doc chưa có nhãn nước (field rỗng
+    // hoặc thiếu — $ne khớp cả trường vắng mặt). Giả định: countries_lower
+    // đã chuẩn hóa ISO (migrate PR #7 + analyzer ghi ISO).
+    if (codes.includes('other')) {
+        const otherCond = { countries_lower: { $ne: 'vn' } };
+        const rest = codes.filter((c) => c !== 'other');
+        if (!rest.length) return otherCond;
+        return { $or: [otherCond, { countries_lower: { $in: rest.flatMap(countryMatchValues) } }] };
+    }
     const migrated = !schema || schema.migrated !== false;
     if (migrated) {
         // Khớp cả bí danh đã lưu ở doc cũ ('usa', 'united states', ...):
