@@ -1004,6 +1004,7 @@ function initSearchServer(dbInstance) {
 
     const adsCol = dbInstance.collection('analyzed_ads');
     const productsCol = dbInstance.collection('products');
+    const winnersCol = dbInstance.collection('product_winners_daily');
 
     const imageStoragePath = path.join(__dirname, '..', '..', 'storage', 'images');
     if (!fs.existsSync(imageStoragePath)) {
@@ -1512,13 +1513,8 @@ function initSearchServer(dbInstance) {
      */
     app.get('/api/products/search', async (req, res) => {
         try {
-            const { domain, min_product_score, min_winning_ads, min_total_ads, sort_by = 'product_score', sort_order = -1 } = req.query;
-            const query = {};
-
-            if (domain) query.domain = new RegExp(`^${escapeRegExp(String(domain).trim())}$`, 'i');
-            if (min_product_score) query.product_score = { $gte: parseInt(min_product_score, 10) };
-            if (min_winning_ads) query.winning_ads = { $gte: parseInt(min_winning_ads, 10) };
-            if (min_total_ads) query.total_ads = { $gte: parseInt(min_total_ads, 10) };
+            const { sort_by = 'product_score', sort_order = -1 } = req.query;
+            const query = buildProductsSearchQuery(req.query);
 
             const page = parseInt(req.query.page, 10) || 1;
             const limit = parseInt(req.query.limit, 10) || 50;
@@ -1530,6 +1526,44 @@ function initSearchServer(dbInstance) {
                 .skip(skip).limit(limit).toArray();
 
             return res.json({ success: true, pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data: results });
+        } catch (error) {
+            return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
+        }
+    });
+
+    /**
+     * 🟢 API 5b: MONTHLY WINNERS — sản phẩm thắng của tháng (xếp theo số
+     * ngày thắng rồi tổng product_score) + top 1 mỗi ngày trong tháng.
+     * Snapshot hàng ngày do analyzer ghi vào product_winners_daily (top 30
+     * product/ngày, chạy lần đầu ở lượt FULL sau deploy — trước đó trả rỗng).
+     * ?month=YYYY-MM (mặc định tháng hiện tại) hoặc ?day=YYYY-MM-DD để lấy
+     * winners của 1 ngày (theo rank).
+     */
+    app.get('/api/products/monthly-winners', async (req, res) => {
+        try {
+            const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+            const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+            const skip = (page - 1) * limit;
+
+            const day = String(req.query.day || '').trim();
+            if (day) {
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ success: false, message: 'day phai co dang YYYY-MM-DD.' });
+                const total = await winnersCol.countDocuments({ date: day });
+                const results = await winnersCol.find({ date: day }).sort({ rank: 1 }).skip(skip).limit(limit).toArray();
+                return res.json({ success: true, mode: 'day', day, pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data: results });
+            }
+
+            const month = parseMonthParam(req.query.month);
+            if (!month) return res.status(400).json({ success: false, message: 'month phai co dang YYYY-MM.' });
+            const all = await winnersCol.aggregate(buildMonthlyWinnersPipeline(month)).toArray();
+            const total = all.length;
+            const data = all.slice(skip, skip + limit).map((d) => ({ domain: d._id, title: d.title, days_won: d.days_won, total_product_score: Number(d.total_product_score.toFixed(1)), total_winning_ads: d.total_winning_ads, best_rank: d.best_rank, latest_score: d.latest_score }));
+            // Top 1 mỗi ngày trong tháng (để FE vẽ "hàng win mỗi ngày").
+            const { start, end } = monthRange(month);
+            const dailyTop = await winnersCol.find({ date: { $gte: start, $lt: end } }).sort({ date: 1, rank: 1 }).project({ date: 1, domain: 1, title: 1, product_score: 1, rank: 1 }).toArray();
+            const daily_top = {};
+            for (const d of dailyTop) if (!daily_top[d.date]) daily_top[d.date] = { domain: d.domain, title: d.title, product_score: d.product_score };
+            return res.json({ success: true, mode: 'month', month, pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data, daily_top });
         } catch (error) {
             return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
         }
@@ -1548,7 +1582,7 @@ function initSearchServer(dbInstance) {
 
             const topAds = await adsCol.find({ domain: productInfo.domain })
                 .sort({ score: -1 }).limit(20)
-                .project({ ad_archive_id: 1, ad_library_url: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1, level: 1, estimated_spend_usd: 1, images: { $slice: 1 }, videos: { $slice: 1 } })
+                .project({ ad_archive_id: 1, ad_library_url: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1, level: 1, estimated_spend_usd: 1, thumbnail_r2: 1, start_date: 1, last_seen: 1, images: { $slice: 1 }, videos: { $slice: 1 } })
                 .toArray();
 
             return res.json({ success: true, data: { ...productInfo, top_ads: topAds } });
@@ -1566,7 +1600,53 @@ function initSearchServer(dbInstance) {
     });
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions };
+// Query cho /api/products/search: q khớp title hoặc domain (substring,
+// không phân biệt hoa thường); domain khớp chính xác; các min_* lọc số.
+// products chỉ ~50k doc nên regex substring ở đây chấp nhận được.
+function buildProductsSearchQuery(params) {
+    const query = {};
+    const q = String(params.q || '').trim();
+    if (q) {
+        const re = new RegExp(escapeRegExp(q), 'i');
+        query.$or = [{ title: re }, { domain: re }];
+    }
+    if (params.domain) query.domain = new RegExp(`^${escapeRegExp(String(params.domain).trim())}$`, 'i');
+    if (params.min_product_score) query.product_score = { $gte: parseInt(params.min_product_score, 10) };
+    if (params.min_winning_ads) query.winning_ads = { $gte: parseInt(params.min_winning_ads, 10) };
+    if (params.min_total_ads) query.total_ads = { $gte: parseInt(params.min_total_ads, 10) };
+    return query;
+}
+
+// Khoảng ngày của 1 tháng 'YYYY-MM': [ngày đầu tháng, ngày đầu tháng sau).
+function monthRange(month) {
+    const [y, mo] = month.split('-').map(Number);
+    const start = month + '-01';
+    const end = new Date(Date.UTC(y, mo, 1)).toISOString().slice(0, 10);
+    return { start, end };
+}
+
+// 'YYYY-MM'; mặc định tháng hiện tại (+07). Trả null nếu sai định dạng.
+function parseMonthParam(monthParam, nowMs = Date.now()) {
+    if (!monthParam) return new Date(nowMs + 7 * 60 * 60 * 1000).toISOString().slice(0, 7);
+    const m = String(monthParam).trim();
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(m)) return null;
+    return m;
+}
+
+// Pipeline gom monthly winners: theo domain, xếp theo số ngày thắng rồi
+// tổng product_score. $sort theo date trước $group để $last là snapshot
+// mới nhất của domain trong tháng.
+function buildMonthlyWinnersPipeline(month) {
+    const { start, end } = monthRange(month);
+    return [
+        { $match: { date: { $gte: start, $lt: end } } },
+        { $sort: { date: 1, rank: 1 } },
+        { $group: { _id: '$domain', title: { $last: '$title' }, days_won: { $sum: 1 }, total_product_score: { $sum: '$product_score' }, total_winning_ads: { $sum: '$winning_ads' }, best_rank: { $min: '$rank' }, latest_score: { $last: '$product_score' } } },
+        { $sort: { days_won: -1, total_product_score: -1 } },
+    ];
+}
+
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry

@@ -802,18 +802,72 @@ async function updateAdsCollection(col, analyzedAds) {
 
 // Gom số liệu products theo domain — chỉ giữ TỔNG, không giữ ad (nhẹ RAM,
 // gom xuyên suốt bao nhiêu batch cũng được, ghi 1 lần cuối vòng).
-function accumulateProductStats(map, analyzedAds) {
+// Ghi thêm dữ liệu cho trang product detail: title + landing + category lấy
+// từ ad có score cao nhất của domain, publication_date = start_date sớm
+// nhất, active_ads = số ad còn thấy trong 7 ngày.
+const PRODUCT_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+function accumulateProductStats(map, analyzedAds, nowMs = Date.now()) {
   for (const ad of analyzedAds) {
     if (!ad.domain) continue;
     let s = map[ad.domain];
-    if (!s) s = map[ad.domain] = { domain: ad.domain, totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, totalSpendUsd: 0 };
+    if (!s) s = map[ad.domain] = { domain: ad.domain, totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, totalSpendUsd: 0, activeAds: 0, firstStartDate: null, topAdScore: -Infinity, topAdHeadline: '', topAdText: '', topAdId: null, topAdLandingUrl: '', topAdIndustry: '' };
     s.totalAds++;
     s.pages.add(ad.page_name);
     s.totalScore += ad.score || 0;
     if (ad.level === '🔥 WINNER' || ad.level === '🏆 LEGEND') s.winningAdsCount++;
     s.totalSpendUsd += ad.estimated_spend_usd || 0;
+    if (ad.last_seen && (nowMs - ad.last_seen) <= PRODUCT_ACTIVE_WINDOW_MS) s.activeAds++;
+    if (typeof ad.start_date === 'number' && (s.firstStartDate === null || ad.start_date < s.firstStartDate)) s.firstStartDate = ad.start_date;
+    if ((ad.score || 0) > s.topAdScore) {
+      s.topAdScore = ad.score || 0;
+      s.topAdHeadline = (ad.headline || '').trim();
+      s.topAdText = (ad.text || '').trim();
+      s.topAdId = ad.ad_archive_id != null ? String(ad.ad_archive_id) : null;
+      s.topAdLandingUrl = ad.landing_url || ad.ad_library_url || '';
+      s.topAdIndustry = ad.industry || '';
+    }
   }
   return map;
+}
+
+// Title hiển thị của product: headline của ad top score; nếu rỗng thì cắt
+// text của ad đó (tối đa 120 ký tự). Không có cả hai -> '' (FE fallback
+// sang domain).
+function productTitleFor(s) {
+  if (s.topAdHeadline) return s.topAdHeadline;
+  if (s.topAdText) return s.topAdText.length > 120 ? s.topAdText.slice(0, 120) : s.topAdText;
+  return '';
+}
+
+// product_score = tổng score các ad + số page x 2 + số ad thắng x 5.
+function computeProductScore(s) {
+  const pages = s.pages.size;
+  return Number((s.totalScore + pages * 2 + s.winningAdsCount * 5).toFixed(1));
+}
+
+// Snapshot top 30 product thắng của ngày chạy (theo product_score, chỉ
+// tính product có >=1 ad thắng). Ghi đè theo ngày nên chạy lại cùng ngày
+// không tạo bản sao. Ngày tính theo +07 (giờ chạy analyzer 11h).
+const DAILY_WINNERS_LIMIT = 30;
+function dailyWinnersDateString(nowMs = Date.now()) {
+  return new Date(nowMs + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+function buildDailyWinners(map, dateStr, limit = DAILY_WINNERS_LIMIT) {
+  return Object.values(map)
+    .filter((s) => s.winningAdsCount > 0)
+    .map((s) => ({ domain: s.domain, title: productTitleFor(s), product_score: computeProductScore(s), winning_ads: s.winningAdsCount, total_ads: s.totalAds, total_pages: s.pages.size, total_spend_usd: Number(s.totalSpendUsd.toFixed(1)) }))
+    .sort((a, b) => b.product_score - a.product_score || b.winning_ads - a.winning_ads || a.domain.localeCompare(b.domain))
+    .slice(0, limit)
+    .map((w, i) => ({ date: dateStr, rank: i + 1, ...w }));
+}
+async function writeDailyWinnersSnapshot(db, map, nowMs = Date.now()) {
+  const dateStr = dailyWinnersDateString(nowMs);
+  const winners = buildDailyWinners(map, dateStr);
+  const col = db.collection('product_winners_daily');
+  await col.deleteMany({ date: dateStr });
+  if (winners.length) await col.insertMany(winners);
+  console.log(`🏆 [DB Daily Winners] ${dateStr}: ${winners.length} sản phẩm thắng.`);
+  return winners.length;
 }
 
 // Ghi map products đã gom đủ — $set toàn bộ (không $inc).
@@ -821,7 +875,7 @@ async function flushProductsCollection(db, map) {
   const col = db.collection('products');
   const bulk = Object.values(map).map(s => {
     const pages = s.pages.size;
-    const productScore = Number((s.totalScore + pages * 2 + s.winningAdsCount * 5).toFixed(1));
+    const productScore = computeProductScore(s);
     return {
       updateOne: {
         filter: { domain: s.domain },
@@ -833,7 +887,13 @@ async function flushProductsCollection(db, map) {
             total_pages: pages,
             total_score: Number(s.totalScore.toFixed(1)),
             winning_ads: s.winningAdsCount,
-            product_score: productScore
+            product_score: productScore,
+            title: productTitleFor(s),
+            top_ad_id: s.topAdId,
+            landing_url: s.topAdLandingUrl || null,
+            category: s.topAdIndustry || null,
+            publication_date: s.firstStartDate,
+            active_ads: s.activeAds
           }
         },
         upsert: true
@@ -1083,6 +1143,11 @@ async function main() {
         { key: { product_score: -1 }, name: "product_score_sort" }
       ]);
 
+      await ensureIndexes(analyzerDb.collection('product_winners_daily'), [
+        { key: { date: 1, rank: 1 }, name: "idx_winners_date_rank", unique: true },
+        { key: { domain: 1, date: -1 }, name: "idx_winners_domain_date" }
+      ]);
+
       await ensureIndexes(rawAdsCol, [
         { key: { last_seen: -1 }, name: "idx_crawler_last_seen" },
         { key: { first_seen: -1 }, name: "idx_crawler_first_seen" }
@@ -1132,6 +1197,13 @@ async function main() {
 
     // Products: ghi 1 lần duy nhất, đủ toàn bộ lượt quét
     await flushProductsCollection(analyzerDb, productStats);
+    // Snapshot top 30 product thắng của ngày (phục vụ monthly winner).
+    // Phụ trợ: lỗi ở đây chỉ cảnh báo, không làm fail cả lượt chạy.
+    try {
+      await writeDailyWinnersSnapshot(analyzerDb, productStats);
+    } catch (snapErr) {
+      console.error('⚠️ [DB Daily Winners] Không ghi được snapshot (bỏ qua):', snapErr.message);
+    }
 
     if (totalProcessed > 0) {
       console.log(`✅ [Analyzer] Hoàn thành! Đã phân tích an toàn tổng cộng ${totalProcessed} quảng cáo.`);
@@ -1152,4 +1224,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, dailyWinnersDateString, writeDailyWinnersSnapshot, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS };
