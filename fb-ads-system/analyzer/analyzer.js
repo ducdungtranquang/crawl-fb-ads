@@ -694,6 +694,8 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       duplicate_group_key: groupInfo.key,
       duplicate_group_size: groupInfo.size,
       is_group_rep: groupInfo.isRep,
+      image_keys: mediaKeys(ad.images),
+      video_keys: mediaKeys(ad.videos),
       page_ads_count: pageAds,
       domain_ads_count: domainAds,
       clones_count: clones,
@@ -798,6 +800,32 @@ async function updateAdsCollection(col, analyzedAds) {
   if (written) {
     console.log(`💾 [DB Ads] Đã cập nhật (Bulk Write) ${written} bản ghi.`);
   }
+}
+
+// Key ổn định của 1 media item: bỏ query/fragment của URL (oe/oh hết hạn
+// làm URL đổi nhưng file vẫn là 1) — cùng file re-sign vẫn chung 1 key.
+// Item có thể là string URL hoặc object {original_image_url|video_url|url|
+// image|src}. URL không parse được thì giữ nguyên chuỗi.
+function mediaItemUrl(item) {
+  if (!item) return null;
+  if (typeof item === 'string') return item.trim() || null;
+  return (item.original_image_url || item.video_url || item.url || item.image || item.src || null);
+}
+function mediaKey(url) {
+  const u = (url || '').trim();
+  if (!u) return null;
+  try {
+    const parsed = new URL(u);
+    return (parsed.origin + parsed.pathname).toLowerCase();
+  } catch { return u; }
+}
+function mediaKeys(media) {
+  const out = [];
+  for (const item of Array.isArray(media) ? media : []) {
+    const k = mediaKey(mediaItemUrl(item));
+    if (k && !out.includes(k)) out.push(k);
+  }
+  return out;
 }
 
 // Gom số liệu products theo domain — chỉ giữ TỔNG, không giữ ad (nhẹ RAM,
@@ -1134,6 +1162,8 @@ async function main() {
         // combo 20-35s) du count da nhanh.
         { key: { is_group_rep: 1, last_seen: -1, start_date: -1 }, name: "idx_group_rep_last_seen_start" },
         { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, countries_lower: 1, start_date: -1 }, name: "idx_new_ad_rep_country_start" },
+        { key: { image_keys: 1 }, name: "idx_image_keys" },
+        { key: { video_keys: 1 }, name: "idx_video_keys" },
         { key: { page_name_lower: 1, score: -1 }, name: "idx_page_lower_score" },
         { key: { domain_lower: 1, score: -1 }, name: "idx_domain_lower_score" }
       ]);
@@ -1224,4 +1254,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, dailyWinnersDateString, writeDailyWinnersSnapshot, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, dailyWinnersDateString, writeDailyWinnersSnapshot, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys };
