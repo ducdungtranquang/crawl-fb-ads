@@ -131,6 +131,13 @@ const PRODUCT_INDEXES = [
   { key: { product_score: -1 }, name: 'product_score_sort' },
 ];
 
+// Snapshot winners hàng ngày (analyzer ghi top 30 product/ngày).
+const WINNERS_COL = 'product_winners_daily';
+const WINNERS_INDEXES = [
+  { key: { date: 1, rank: 1 }, name: 'idx_winners_date_rank', unique: true },
+  { key: { domain: 1, date: -1 }, name: 'idx_winners_domain_date' },
+];
+
 async function ensureIndexes(col, specs, label) {
   const existing = await col.indexes();
   const existingKeys = new Set(existing.map(i => JSON.stringify(i.key)));
@@ -162,8 +169,9 @@ async function ensureIndexes(col, specs, label) {
   console.log(`Collection: ${DB_NAME}.${COL_NAME} — ${await col.estimatedDocumentCount()} docs (ước tính)`);
   const r1 = await ensureIndexes(col, INDEXES, COL_NAME);
   const r2 = await ensureIndexes(db.collection(PRODUCTS_COL), PRODUCT_INDEXES, PRODUCTS_COL);
+  const r3 = await ensureIndexes(db.collection(WINNERS_COL), WINNERS_INDEXES, WINNERS_COL);
   await client.close();
-  console.log(`DONE — analyzed_ads: tạo ${r1.created}, bỏ qua ${r1.skipped}, lỗi ${r1.failed}; products: tạo ${r2.created}, bỏ qua ${r2.skipped}, lỗi ${r2.failed}.`);
+  console.log(`DONE — analyzed_ads: tạo ${r1.created}, bỏ qua ${r1.skipped}, lỗi ${r1.failed}; products: tạo ${r2.created}, bỏ qua ${r2.skipped}, lỗi ${r2.failed}; winners: tạo ${r3.created}, bỏ qua ${r3.skipped}, lỗi ${r3.failed}.`);
   console.log('Tiếp theo: chạy migrate-analyzer-fields.cjs (hoặc 1 lượt analyzer) rồi pm2 restart ads-api, sau đó đo lại bằng explain.');
 })().catch(e => { console.error(e); process.exit(1); });
 
