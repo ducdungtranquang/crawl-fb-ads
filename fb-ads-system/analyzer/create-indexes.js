@@ -32,12 +32,19 @@ const COL_NAME = 'analyzed_ads';
 const PRODUCTS_COL = 'products';
 
 const INDEXES = [
+  // 2026-11-06: MongoDB tối đa 64 index/collection (tính cả _id) — DB đã
+  // chạm trần nên 4 index mới FAIL. Dọn 7 index thừa dưới đây (đều là
+  // tiền tố strict của 1 index dài hơn còn giữ — index dài phục vụ được
+  // mọi query của index ngắn): idx_score -> score_analyzed_sort,
+  // idx_start_date -> idx_new_ads, domain_filter -> idx_domain_score,
+  // idx_industry -> idx_industry_start_date, level_filter ->
+  // idx_level_start_date, idx_scaling_score -> idx_scaling_score_rep_start,
+  // idx_group_rep_last_seen -> idx_group_rep_last_seen_start. Drop tay
+  // bằng mongosh trước, rồi chạy lại file này để tạo 4 index mới.
   // Tra cứu theo ID (ES trả list ad_archive_id -> query $in + count).
   { key: { ad_archive_id: 1 }, name: 'idx_ad_archive_id' },
   // Sort mặc định / không lọc.
-  { key: { score: -1 }, name: 'idx_score' },
   { key: { score: -1, analyzed_at: -1 }, name: 'score_analyzed_sort' },
-  { key: { start_date: -1 }, name: 'idx_start_date' },
   // Gom nhóm duplicate (dedupe) + ưu tiên preset (sản phẩm lên trước).
   { key: { duplicate_group_key: 1 }, name: 'idx_group_key' },
   { key: { is_group_rep: 1, start_date: -1 }, name: 'idx_group_rep_start_date' },
@@ -88,7 +95,6 @@ const INDEXES = [
   { key: { domain_lower: 1, score: -1 }, name: 'idx_domain_lower_score' },
   // Similar ads + product detail: cùng domain/page, sort score.
   { key: { domain: 1, score: -1 }, name: 'idx_domain_score' },
-  { key: { domain: 1 }, name: 'domain_filter' },
   { key: { page_name: 1, score: -1 }, name: 'idx_page_score' },
   // Lọc page_name/domain theo field gốc (giữ lại cho match chính xác;
   // đường chính nay là *_lower ở trên).
@@ -102,21 +108,18 @@ const INDEXES = [
   { key: { country_mentions_lower: 1, start_date: -1 }, name: 'idx_country_mentions_lower_start_date' },
   { key: { latest_detail_country_lower: 1, start_date: -1 }, name: 'idx_latest_country_lower_start_date' },
   // Lọc ngành nghề.
-  { key: { industry: 1 }, name: 'idx_industry' },
   { key: { industry: 1, start_date: -1 }, name: 'idx_industry_start_date' },
   { key: { industry: 1, score: -1 }, name: 'idx_industry_score' },
   // Lọc trạng thái (is_active do analyzer ghi; API fallback last_seen).
   { key: { is_active: 1, start_date: -1 }, name: 'idx_is_active_start_date' },
   // Lọc level / funnel / scaling / nhóm chi tiêu.
-  { key: { level: 1 }, name: 'level_filter' },
   { key: { level: 1, start_date: -1 }, name: 'idx_level_start_date' },
   { key: { funnel: 1, start_date: -1 }, name: 'idx_funnel_start_date' },
   { key: { scaling_level: 1, start_date: -1 }, name: 'idx_scaling_start_date' },
   { key: { estimated_spend: 1, start_date: -1 }, name: 'idx_spend_tier_start_date' },
-  { key: { scaling_score: -1 }, name: 'idx_scaling_score' },
+  { key: { is_group_rep: 1, estimated_spend_usd: 1 }, name: 'idx_group_rep_spend' },
   // Đếm + sort khi dedupe bật: is_group_rep đứng trước để countDocuments
   // theo preset/trạng thái/spend không phải quét toàn collection.
-  { key: { is_group_rep: 1, last_seen: -1 }, name: 'idx_group_rep_last_seen' },
   { key: { is_group_rep: 1, estimated_spend_usd: 1 }, name: 'idx_group_rep_spend' },
   // Fix retest 06/11: Inactive find (rep + last_seen + sort start_date)
   // va combo new_ads+VN (flag + rep + country + sort) — thieu 2 index
@@ -142,7 +145,19 @@ const WINNERS_INDEXES = [
 ];
 
 async function ensureIndexes(col, specs, label) {
-  const existing = await col.indexes();
+  // Collection chưa tồn tại (vd product_winners_daily trước lượt FULL đầu
+  // tiên): listIndexes ném NamespaceNotFound (code 26). Coi như chưa có
+  // index nào — createIndex sẽ tạo luôn collection. Không để crash cả lượt.
+  let existing = [];
+  try {
+    existing = await col.indexes();
+  } catch (e) {
+    if (e && e.code === 26) {
+      console.log(`... ${label} chưa có collection, sẽ tạo mới cùng index.`);
+    } else {
+      throw e;
+    }
+  }
   const existingKeys = new Set(existing.map(i => JSON.stringify(i.key)));
   let created = 0, skipped = 0, failed = 0;
   for (const ix of specs) {
