@@ -124,6 +124,9 @@ const INDEXES = [
   // combo 20-35s) du count da nhanh.
   { key: { is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_group_rep_last_seen_start' },
   { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, countries_lower: 1, start_date: -1 }, name: 'idx_new_ad_rep_country_start' },
+  // Đếm media usage: cùng file re-sign vẫn chung image_keys/video_keys.
+  { key: { image_keys: 1 }, name: 'idx_image_keys' },
+  { key: { video_keys: 1 }, name: 'idx_video_keys' },
 ];
 
 const PRODUCT_INDEXES = [

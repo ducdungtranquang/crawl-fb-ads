@@ -948,19 +948,43 @@ function buildSimilarTiers(sourceAd, adId) {
     const base = { ad_archive_id: { $ne: adId } };
     const dupText = similarDupTextOf(sourceAd);
     const noDup = dupText ? { normalized_text: { $ne: dupText } } : {};
+    // Chỉ lấy 1 ad cho mỗi creative: is_group_rep != false (true, hoặc
+    // thiếu field ở doc cũ) — doc is_group_rep=false là bản sao đã biết.
+    // Nhóm của chính ad gốc cũng loại hẳn: xem detail của 1 bản sao thì
+    // rep của nó cũng là cùng 1 creative, không được hiện lại.
+    const repOnly = { is_group_rep: { $ne: false } };
+    const noOwnGroup = sourceAd.duplicate_group_key ? { duplicate_group_key: { $ne: sourceAd.duplicate_group_key } } : {};
     const tiers = [];
-    if (sourceAd.domain) tiers.push({ ...base, domain: sourceAd.domain, ...noDup });
-    if (sourceAd.page_name) tiers.push({ ...base, page_name: sourceAd.page_name, ...noDup });
-    if (sourceAd.industry) tiers.push({ ...base, industry: sourceAd.industry, ...noDup });
-    tiers.push({ ...base, ...noDup });
+    if (sourceAd.domain) tiers.push({ ...base, domain: sourceAd.domain, ...noDup, ...repOnly, ...noOwnGroup });
+    if (sourceAd.page_name) tiers.push({ ...base, page_name: sourceAd.page_name, ...noDup, ...repOnly, ...noOwnGroup });
+    if (sourceAd.industry) tiers.push({ ...base, industry: sourceAd.industry, ...noDup, ...repOnly, ...noOwnGroup });
+    tiers.push({ ...base, ...noDup, ...repOnly, ...noOwnGroup });
     return tiers;
 }
 
+// Đếm số ad dùng chung ảnh/video đầu tiên của 1 ad (theo image_keys /
+// video_keys đã chuẩn hóa ở analyzer — cùng file re-sign vẫn chung key).
+// Đếm GỒM chính ad đó. Lỗi thì trả {} chứ không làm hỏng detail.
+async function countMediaUsage(col, ad) {
+    const out = {};
+    try {
+        const imgKey = Array.isArray(ad.image_keys) && ad.image_keys[0];
+        if (imgKey) out.image = { key: imgKey, ads_count: await col.countDocuments({ image_keys: imgKey }) };
+        const vidKey = Array.isArray(ad.video_keys) && ad.video_keys[0];
+        if (vidKey) out.video = { key: vidKey, ads_count: await col.countDocuments({ video_keys: vidKey }) };
+    } catch (err) {
+        console.warn('[Search API] media usage lỗi:', err && err.message);
+    }
+    return out;
+}
+
 // Gom đủ (page * limit) ad từ các tầng theo thứ tự, khử trùng theo
-// ad_archive_id, rồi cắt đúng cửa sổ trang. col là collection Mongo
-// (hoặc fake collection trong test) có find().project().sort().limit().
+// ad_archive_id VÀ duplicate_group_key, rồi cắt đúng cửa sổ trang. col là
+// collection Mongo (hoặc fake collection trong test) có
+// find().project().sort().limit().
 async function fillSimilarAds(col, tiers, page, limit, projection) {
     const seen = new Set();
+    const seenGroups = new Set();
     const picked = [];
     const need = page * limit;
     // Mỗi tầng sau phải loại cả ID đã lấy ở tầng trước: nếu không, tầng
@@ -981,20 +1005,19 @@ async function fillSimilarAds(col, tiers, page, limit, projection) {
         for (const d of docs) {
             const key = String(d.ad_archive_id || d._id);
             if (seen.has(key)) continue;
+            // Phòng thủ tầng 2: 2 ad cùng duplicate_group_key là cùng 1
+            // creative — chỉ giữ ad đầu tiên (điểm cao nhất do sort).
+            const gk = d.duplicate_group_key;
+            if (gk != null && gk !== '') {
+                if (seenGroups.has(gk)) continue;
+                seenGroups.add(gk);
+            }
             seen.add(key);
             picked.push(d);
         }
     }
-    // Phương án cuối: vẫn trống (mọi ad còn lại đều trùng text) thì lấy
-    // ad trùng text luôn, chỉ loại chính ad gốc.
-    if (!picked.length && tiers.length) {
-        const docs = await col.find({ ad_archive_id: tiers[0].ad_archive_id })
-            .project(projection)
-            .sort({ score: -1 })
-            .limit(need)
-            .toArray();
-        for (const d of docs) picked.push(d);
-    }
+    // KHÔNG còn phương án cuối lấy ad trùng text: similar thiếu thì trả
+    // ít hơn (hoặc rỗng) chứ không hiện duplicate (quyết định 06/11).
     return picked.slice((page - 1) * limit, page * limit);
 }
 
@@ -1040,7 +1063,7 @@ function initSearchServer(dbInstance) {
     const SIMILAR_PROJECTION = {
         ad_archive_id: 1, ad_library_url: 1, page_name: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1,
         trending_score: 1, estimated_spend_usd: 1, start_date: 1, duplicates_count: 1, duration_days: 1,
-        industry: 1, duplicate_group_size: 1, thumbnail_r2: 1, thumbnail_local: 1, images: { $slice: 1 }, videos: { $slice: 1 }
+        industry: 1, duplicate_group_size: 1, duplicate_group_key: 1, thumbnail_r2: 1, thumbnail_local: 1, images: { $slice: 1 }, videos: { $slice: 1 }
     };
 
     async function fetchSimilarAds(sourceAd, adId, page, limit) {
@@ -1420,6 +1443,7 @@ function initSearchServer(dbInstance) {
             const adDetail = await findAdById(adId);
             if (!adDetail) return res.status(404).json({ success: false, message: `Không tìm thấy ID: ${adId}` });
 
+            const mediaUsage = await countMediaUsage(adsCol, adDetail);
             const includeSimilar = req.query.include_similar !== 'false' && req.query.include_similar !== '0';
             const similarLimit = req.query.similar_limit === undefined
                 ? 10
@@ -1441,7 +1465,7 @@ function initSearchServer(dbInstance) {
                 duplicateGroup = { key: adDetail.duplicate_group_key, size: adDetail.duplicate_group_size || groupAds.length + 1, ads: groupAds };
             }
 
-            return res.json({ success: true, data: adDetail, similar_ads: similarAds, similar_pagination: similarPagination, duplicate_group: duplicateGroup });
+            return res.json({ success: true, data: adDetail, media_usage: mediaUsage, similar_ads: similarAds, similar_pagination: similarPagination, duplicate_group: duplicateGroup });
         } catch (error) {
             return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
         }
@@ -1646,7 +1670,7 @@ function buildMonthlyWinnersPipeline(month) {
     ];
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
