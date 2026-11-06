@@ -1106,9 +1106,6 @@ async function main() {
         { key: { score: -1, analyzed_at: -1 }, name: "score_analyzed_sort" },
         { key: { estimated_spend_usd: -1 }, name: "spend_usd_sort" },
         { key: { estimated_reach: -1 }, name: "reach_sort" },
-        { key: { domain: 1 }, name: "domain_filter" },
-        { key: { level: 1 }, name: "level_filter" },
-        { key: { industry: 1 }, name: "idx_industry" },
         { key: { trending_score: -1 }, name: "trending_sort" },
         { key: { duration_days: 1 }, name: "idx_duration_days" },
         { key: { last_seen: -1 }, name: "idx_last_seen" },
@@ -1131,7 +1128,6 @@ async function main() {
         { key: { funnel: 1, start_date: -1 }, name: "idx_funnel_start_date" },
         { key: { scaling_level: 1, start_date: -1 }, name: "idx_scaling_start_date" },
         { key: { estimated_spend: 1, start_date: -1 }, name: "idx_spend_tier_start_date" },
-        { key: { start_date: -1 }, name: "idx_start_date" },
         { key: { duplicate_group_key: 1 }, name: "idx_group_key" },
         { key: { is_group_rep: 1, start_date: -1 }, name: "idx_group_rep_start_date" },
         { key: { preset_priority: 1, creative_rank: 1, start_date: -1 }, name: "idx_preset_priority" },
@@ -1154,7 +1150,6 @@ async function main() {
         { key: { countries_lower: 1, is_group_rep: 1, start_date: -1 }, name: "idx_countries_rep_start" },
         // 2 index dem/sort khi dedupe bat (truoc day chi co trong
         // create-indexes.js, analyzer FULL khong tu tao).
-        { key: { is_group_rep: 1, last_seen: -1 }, name: "idx_group_rep_last_seen" },
         { key: { is_group_rep: 1, estimated_spend_usd: 1 }, name: "idx_group_rep_spend" },
         // Fix retest 06/11: Inactive find (rep + last_seen + sort start_date)
         // va combo new_ads+VN (flag + rep + country + sort) — thieu 2 index
