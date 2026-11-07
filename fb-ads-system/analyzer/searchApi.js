@@ -253,6 +253,23 @@ function parseActiveParam(v) {
 // trước khi deploy: countDocuments({last_seen: {$exists: false}}) phải
 // bằng 0; nếu > 0 thì giữ nhánh $or cũ và backfill last_seen trước.
 const ACTIVE_WINDOW_MS = 7 * 24 * 3600 * 1000;
+
+// Ad chạy > 35 ngày thì KHÔNG tính là "đang vít mạnh" nữa (analyzer chặn
+// điểm scaling lưu trữ ở 11; xem cappedScalingScore bên analyzer.js).
+// Guard ở API cho filter có hiệu lực ngay trước lượt FULL: duration_days
+// là số ngày chạy (PR #18 ghi run-length; doc cũ là tuổi stale — chặn
+// thừa ad cũ cũng đúng vì ad cũ không còn "đang" vít nữa).
+const SCALING_HARD_MAX_RUN_DAYS = 35;
+
+// Ad chết cũ (không thấy > 30 ngày) là vô giá trị: ẩn khỏi mọi list
+// (search, similar, page ads) + số đếm preset. Dùng last_seen thay vì cờ
+// is_active vì cờ có thể cũ; last_seen mới là sự thật (analyzer/crawler
+// luôn ghi last_seen cho mọi doc — đã kiểm chứng missing = 0).
+const STALE_AD_MAX_AGE_DAYS = 30;
+const STALE_AD_MAX_AGE_MS = STALE_AD_MAX_AGE_DAYS * 24 * 3600 * 1000;
+function buildFreshAdCondition(nowMs = Date.now()) {
+    return { last_seen: { $gte: nowMs - STALE_AD_MAX_AGE_MS } };
+}
 function buildActiveCondition(activeBool) {
     const cutoff = Date.now() - ACTIVE_WINDOW_MS;
     if (activeBool === true) return { last_seen: { $gte: cutoff } };
@@ -573,7 +590,10 @@ function buildScalingCondition(scalingParam) {
         if (!t) continue;
         const key = normKey(t.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, ''));
         if (key === 'scaling hard' || key === 'rat cao' || key === 'very high') {
-            branches.push({ scaling_level: '🚀 SCALING HARD' });
+            // Chỉ tính "đang vít mạnh" khi ad chạy <= 35 ngày (xem
+            // SCALING_HARD_MAX_RUN_DAYS): ad chạy lâu có điểm scaling tích
+            // lũy cao dù hiện tại chỉ chạy lai rai.
+            branches.push({ $and: [{ scaling_level: '🚀 SCALING HARD' }, { duration_days: { $lte: SCALING_HARD_MAX_RUN_DAYS } }] });
         } else if (key === 'scaling') {
             branches.push({ scaling_level: '⚡ SCALING' });
         } else if (key === 'cao' || key === 'high') {
@@ -1006,6 +1026,12 @@ function buildSimilarCountQuery(tiers) {
         if (t.page_name !== undefined) b.page_name = t.page_name;
         if (t.industry !== undefined) b.industry = t.industry;
         if (t.is_group_rep !== undefined) b.is_group_rep = t.is_group_rep;
+        // Giữ cả điều kiện ad tươi (last_seen): total phải khớp list đã
+        // loại ad chết cũ, không thì total phình (nhánh global đếm cả ad
+        // chết). Nhánh industry có thể FETCH (không có compound index
+        // industry+last_seen) nhưng count có timeout 5s + fallback về số
+        // đã lấy nên không treo.
+        if (t.last_seen !== undefined) b.last_seen = t.last_seen;
         if (Object.keys(b).length) branches.push(b);
     }
     if (!branches.length) return null;
@@ -1021,7 +1047,7 @@ async function countSimilarTotal(col, unionQuery, maxTimeMS) {
     }
 }
 
-function buildSimilarTiers(sourceAd, adId) {
+function buildSimilarTiers(sourceAd, adId, nowMs = Date.now()) {
     const base = { ad_archive_id: { $ne: adId } };
     const dupText = similarDupTextOf(sourceAd);
     // $exists: true là bắt buộc: $ne khớp cả doc THIẾU normalized_text.
@@ -1032,11 +1058,14 @@ function buildSimilarTiers(sourceAd, adId) {
     // rep của nó cũng là cùng 1 creative, không được hiện lại.
     const repOnly = { is_group_rep: { $ne: false } };
     const noOwnGroup = sourceAd.duplicate_group_key ? { duplicate_group_key: { $ne: sourceAd.duplicate_group_key } } : {};
+    // Ad chết cũ (last_seen > 30 ngày) không vào similar: ảnh hết hạn,
+    // vô giá trị dù điểm cao.
+    const freshOnly = buildFreshAdCondition(nowMs);
     const tiers = [];
-    if (sourceAd.domain) tiers.push({ ...base, domain: sourceAd.domain, ...noDup, ...repOnly, ...noOwnGroup });
-    if (sourceAd.page_name) tiers.push({ ...base, page_name: sourceAd.page_name, ...noDup, ...repOnly, ...noOwnGroup });
-    if (sourceAd.industry) tiers.push({ ...base, industry: sourceAd.industry, ...noDup, ...repOnly, ...noOwnGroup });
-    tiers.push({ ...base, ...noDup, ...repOnly, ...noOwnGroup });
+    if (sourceAd.domain) tiers.push({ ...base, domain: sourceAd.domain, ...noDup, ...repOnly, ...noOwnGroup, ...freshOnly });
+    if (sourceAd.page_name) tiers.push({ ...base, page_name: sourceAd.page_name, ...noDup, ...repOnly, ...noOwnGroup, ...freshOnly });
+    if (sourceAd.industry) tiers.push({ ...base, industry: sourceAd.industry, ...noDup, ...repOnly, ...noOwnGroup, ...freshOnly });
+    tiers.push({ ...base, ...noDup, ...repOnly, ...noOwnGroup, ...freshOnly });
     return tiers;
 }
 
@@ -1401,6 +1430,10 @@ function initSearchServer(dbInstance) {
                 if (schema.groupRep) andConds.push({ is_group_rep: true });
                 else dedupeFallback = 'schema';
             }
+            // Ad chết cũ (last_seen > 30 ngày) là vô giá trị: ẩn khỏi
+            // mọi list search + đếm (total khớp list). Dùng last_seen thay
+            // vì cờ is_active vì cờ có thể cũ.
+            andConds.push(buildFreshAdCondition());
             if (dedupeOn && esRank && !esDedupeAvailable && schema.groupRep) dedupeFallback = 'mongo';
             if (industryCond) andConds.push(industryCond);
             if (scaling_level) {
@@ -1523,11 +1556,15 @@ function initSearchServer(dbInstance) {
     app.get('/api/ads/filter-stats', async (req, res) => {
         try {
             const schema = await refreshSchemaProbe(adsCol);
-            const total = await adsCol.estimatedDocumentCount();
+            // Total + badge preset chỉ đếm ad tươi (last_seen <= 30 ngày)
+            // để khớp với list đã ẩn ad chết cũ; total cũ dùng
+            // estimatedDocumentCount đếm cả ad chết nên lệch với list.
+            const freshCond = buildFreshAdCondition();
+            const total = await adsCol.countDocuments(freshCond);
             const presets = {};
             for (const name of ['new_ads', 'ready_to_scale', 'weekly_winner']) {
                 const conds = buildPresetConditions(name, {}, { useFlags: schema.flags });
-                const countQuery = conds.length ? { $and: conds } : {};
+                const countQuery = conds.length ? { $and: [...conds, freshCond] } : { ...freshCond };
                 // Badge khớp list đã dedupe: chỉ đếm ad đại diện khi field nhóm đã có.
                 if (schema.groupRep) countQuery.is_group_rep = true;
                 presets[name] = await adsCol.countDocuments(countQuery);
@@ -1663,6 +1700,10 @@ function initSearchServer(dbInstance) {
                     ? { $nin: [excludeId, Number(excludeId)] }
                     : { $ne: excludeId };
             }
+            // Ad chết cũ (last_seen > 30 ngày) không hiện trong list page
+            // nữa (ảnh hết hạn, vô giá trị) — cả count lẫn list dùng chung
+            // query này nên total khớp số creative tươi thật.
+            Object.assign(query, buildFreshAdCondition());
             const total = await adsCol.countDocuments(query);
 
             const ads = await adsCol.find(query)
@@ -1828,7 +1869,7 @@ function buildMonthlyWinnersPipeline(month) {
     ];
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry

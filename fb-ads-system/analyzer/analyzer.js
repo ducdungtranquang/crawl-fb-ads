@@ -201,6 +201,22 @@ function calcGrowthFallback(ad) {
   return ad.seen_count / ageHours;
 }
 
+// Ad chạy > 35 ngày thì KHÔNG tính là "đang vít mạnh" nữa: điểm scaling
+// tích lũy cả lịch sử (smooth trung bình toàn history, seen_count tổng,
+// fallback seen/age) vẫn cao dù hiện tại chỉ chạy lai rai. Chặn điểm
+// scaling LƯU TRỮ ở 11 (dưới ngưỡng SCALING HARD = 12) để cả filter
+// scaling_level lẫn sort scaling_score đều loại ad cũ. Tổng score KHÔNG
+// đổi (score dùng scalingScore gốc) — chỉ chặn field scaling lưu trữ.
+const SCALING_HARD_MAX_RUN_DAYS = 35;
+const SCALING_HARD_MAX_SCORE = 11;
+function cappedScalingScore(scalingScore, runDaysRounded) {
+  return runDaysRounded > SCALING_HARD_MAX_RUN_DAYS ? Math.min(scalingScore, SCALING_HARD_MAX_SCORE) : scalingScore;
+}
+function scalingLevelFor(scalingScore, runDaysRounded) {
+  const s = cappedScalingScore(scalingScore, runDaysRounded);
+  return s >= 12 ? '🚀 SCALING HARD' : s >= 6 ? '⚡ SCALING' : 'NORMAL';
+}
+
 // ===== PHÂN LOẠI NGÀNH NGHỀ =====
 // value: mã chuẩn lưu trong field `industry` (API lọc theo đó, FE map theo
 // value). PHẢI KHỚP với INDUSTRIES trong searchApi.js — đổi value ở đây thì
@@ -739,6 +755,10 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     const lastSeenMs = ad.last_seen || 0;
     const runDaysRaw = lastSeenMs > startDateMs ? (lastSeenMs - startDateMs) / (1000 * 3600 * 24) : durationDays;
     const runDaysRounded = Math.max(1, Math.round(runDaysRaw));
+    // Điểm scaling HIỆN TẠI (đã chặn ad chạy > 35 ngày): dùng cho field
+    // scaling_score/scaling_level lưu trữ. Tổng score ở trên vẫn dùng
+    // scalingScore gốc.
+    const scalingScoreCurrent = cappedScalingScore(scalingScore, runDaysRounded);
     // Cờ preset tính sẵn (xem PRESET_THRESHOLDS): API lọc theo 1 field
     // boolean có index thay vì $or + nhiều range → đếm/lọc nhanh.
     const durationRounded = Math.round(durationDays);
@@ -797,7 +817,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       domain_ads_count: domainAds,
       clones_count: clones,
       level: score >= 50 ? '🏆 LEGEND' : score >= 30 ? '🔥 WINNER' : score >= 15 ? '⚡ POTENTIAL' : 'REGULAR',
-      scaling_score: scalingScore,
+      scaling_score: scalingScoreCurrent,
       trending_score: trendingScore,
       estimated_spend_usd: spendReachData.estimated_spend_usd,
       estimated_spend_min_usd: spendReachData.estimated_spend_min_usd,
@@ -825,7 +845,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
         duplicates_count: duplicatesCount,
         page_ads_count: pageAds,
         domain_ads_count: domainAds,
-        scaling_score: scalingScore,
+        scaling_score: scalingScoreCurrent,
         trending_score: trendingScore,
         burst,
         delta,
@@ -833,7 +853,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
         spend_min_usd: spendReachData.estimated_spend_min_usd,
         spend_max_usd: spendReachData.estimated_spend_max_usd
       },
-      scaling_level: scalingScore >= 12 ? '🚀 SCALING HARD' : scalingScore >= 6 ? '⚡ SCALING' : 'NORMAL',
+      scaling_level: scalingLevelFor(scalingScore, runDaysRounded),
       delta,
       smooth_delta: smooth,
       burst,
@@ -1347,4 +1367,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, dailyWinnersDateString, writeDailyWinnersSnapshot, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, dailyWinnersDateString, writeDailyWinnersSnapshot, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
