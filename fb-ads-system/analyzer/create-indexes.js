@@ -55,9 +55,17 @@ const INDEXES = [
   // Dem preset + dedupe (is_group_rep) trong 1 index - 3 index nay da
   // tao truc tiep tren VM ngay 04/11/2026, ghi vao code de build lai
   // tu dau khong mat.
-  { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, start_date: -1 }, name: 'idx_new_ad_rep_priority' },
-  { key: { 'filter_signals.is_ready_to_scale': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, scaling_score: -1 }, name: 'idx_scale_rep_rank' },
-  { key: { 'filter_signals.is_weekly_winner': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, trending_score: -1 }, name: 'idx_winner_rep_rank' },
+  // Combo preset + industry/country (PR #19): dem preset+nganh/nuoc
+  // truoc day phai FETCH toan bo doc cua preset de kiem tra industry /
+  // countries_lower (khong co trong index cu) — scale+beauty ~10k doc
+  // beo, winner+VN thi planner de chon nham index country (144k doc).
+  // Index rong hon giu nguyen thu tu sort cu (flag, rep, preset_priority,
+  // creative_rank) de preset don le khong cham lai, them industry +
+  // countries_lower + sort field cua preset/FE (start_date) de dem/loc/
+  // sort deu doc duoc tu index. Thay the 3 index cu (drop tay tren DB).
+  { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1 }, name: 'idx_new_ad_rep_combo' },
+  { key: { 'filter_signals.is_ready_to_scale': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1, scaling_score: -1 }, name: 'idx_scale_rep_combo' },
+  { key: { 'filter_signals.is_weekly_winner': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1, trending_score: -1 }, name: 'idx_winner_rep_combo' },
   // Index dem/tim cham 05/11: filter + is_group_rep + sort — khong co
   // is_group_rep o giua, Mongo phai FETCH toan bo doc cua filter de loc
   // dai dien (nganh Khac 145k doc -> dem khong xong).
@@ -117,7 +125,6 @@ const INDEXES = [
   { key: { funnel: 1, start_date: -1 }, name: 'idx_funnel_start_date' },
   { key: { scaling_level: 1, start_date: -1 }, name: 'idx_scaling_start_date' },
   { key: { estimated_spend: 1, start_date: -1 }, name: 'idx_spend_tier_start_date' },
-  { key: { is_group_rep: 1, estimated_spend_usd: 1 }, name: 'idx_group_rep_spend' },
   // Đếm + sort khi dedupe bật: is_group_rep đứng trước để countDocuments
   // theo preset/trạng thái/spend không phải quét toàn collection.
   { key: { is_group_rep: 1, estimated_spend_usd: 1 }, name: 'idx_group_rep_spend' },
