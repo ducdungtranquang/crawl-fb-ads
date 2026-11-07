@@ -36,6 +36,42 @@ function stripDiacritics(s) {
   return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D');
 }
 
+// Bỏ URL + SĐT + dòng địa chỉ khỏi text trước khi gom nhóm/phân loại
+// (PR #18). Cùng 1
+// creative chạy ở nhiều showroom chỉ khác link đăng ký/địa chỉ/SĐT ở
+// cuối text (vd 4 ad Kingsport "Tâm lý chung cha mẹ lớn tuổi..." khác
+// nhau mỗi dòng địa chỉ + SĐT, retest 07/11) — không strip thì mỗi bản
+// thành 1 nhóm riêng, list + similar hiện trùng creative. Dòng
+// "Địa chỉ: ..." bị bỏ từ đó đến hết text (địa chỉ luôn nằm cuối text
+// liên hệ). Nhãn trước SĐT ("điện thoại:", "hotline:") cũng bỏ cùng
+// số, nếu không nhãn đó vẫn kéo ad ghế massage sang ngành electronics.
+// Regex số điện thoại
+// cố tình hẹp (bắt đầu 0/+84 hoặc (0xxx), 9-10 chữ số, cho phép
+// khoảng trắng/dấu chấm/gạch giữa các số) để giá tiền ("5.490.000",
+// "199.000đ") không bị strip nhầm.
+const PHONE_LABEL = '(?:điện thoại|hotline|sđt|tel\\.?|liên hệ)';
+const URL_RE = /https?:\/\/\S+|www\.\S+/gi;
+const PHONE_RE = new RegExp(
+  `(?:${PHONE_LABEL}\\s*:?\\s*)?(?:\\+84|0)(?:[\\s.()-]*\\d){9,10}` +
+  `|(?:${PHONE_LABEL}\\s*:?\\s*)?\\(\\d{3,4}\\)[\\s.]*\\d{3,4}[\\s.]*\\d{3,4}`, 'gi');
+function stripUrlsAndPhones(text) {
+  return String(text || '')
+    .replace(URL_RE, ' ')
+    .replace(/địa chỉ\s*:?.*$/i, ' ')
+    .replace(PHONE_RE, ' ');
+}
+
+// Text chuẩn để gom nhóm duplicate: strip URL/SĐT rồi chỉ lấy 300 ký
+// tự đầu. Cùng creative khác nhau mỗi chi tiết cuối (địa chỉ/SĐT/link
+// showroom) vẫn chung 1 nhóm; 300 ký tự (~50 từ) đủ dài để 2 creative
+// khác nhau khó trùng prefix ngẫu nhiên. Chỉ dùng cho GROUP KEY +
+// đếm trùng text, không thay text hiển thị.
+const GROUP_TEXT_PREFIX_LEN = 300;
+function canonicalGroupText(text) {
+  const cleaned = stripUrlsAndPhones(text).replace(/\s+/g, ' ').trim();
+  return cleaned.slice(0, GROUP_TEXT_PREFIX_LEN);
+}
+
 // Bảng tên nước -> mã ISO (đồng bộ COUNTRY_NAME_MAP trong searchApi.js;
 // đổi ở đây thì đổi cả bên kia). Khóa đã strip dấu + chữ thường.
 const COUNTRY_NAME_TO_CODE = {
@@ -169,13 +205,18 @@ function calcGrowthFallback(ad) {
 // value: mã chuẩn lưu trong field `industry` (API lọc theo đó, FE map theo
 // value). PHẢI KHỚP với INDUSTRIES trong searchApi.js — đổi value ở đây thì
 // đổi cả bên kia. keywords: cụm từ đã normalize (chữ thường, giữ dấu) để
-// phân loại từ text + headline. Thứ tự mảng = thứ tự ưu tiên khi ad khớp
-// nhiều ngành (khớp trước thắng). Bảng này KHÔNG dùng cho hệ số spend
+// phân loại từ text + headline. Từ PR #18: CHẤM ĐIỂM thay vì khớp-trước-
+// thắng — mỗi ngành cộng điểm (cụm nhiều từ = 2, từ đơn = 1), ngành điểm
+// cao nhất thắng, hòa thì thứ tự mảng quyết định (beauty_health vẫn
+// trước food_beverage nên "thực phẩm chức năng" hòa 2-2 vẫn về Làm đẹp).
+// Khớp-trước-thắng cũ gán sai hàng loạt: "trà sữa" có chữ "kem" nên về
+// Làm đẹp, "ghế massage" có chữ "thời trang" nên về Fashion (retest
+// 07/11). Bảng này KHÔNG dùng cho hệ số spend
 // (mInd) — mInd giữ nguyên 3 nhánh cũ trong estimateSpendAndReach để không
 // đổi số spend đã tính (vd: "thực phẩm chức năng" phân loại beauty_health
 // nhưng mInd vẫn 1.0 như cũ).
 const INDUSTRY_CATEGORIES = [
-  { value: 'beauty_health', keywords: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'thực phẩm bảo vệ sức khỏe', 'viên uống', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc', 'sữa tắm', 'nước hoa', 'son môi', 'kem dưỡng', 'mặt nạ', 'kem đánh răng', 'bàn chải đánh răng', 'đồ dùng cá nhân'] },
+  { value: 'beauty_health', keywords: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'thực phẩm bảo vệ sức khỏe', 'viên uống', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc', 'sữa tắm', 'nước hoa', 'son môi', 'kem dưỡng', 'mặt nạ', 'kem đánh răng', 'bàn chải đánh răng', 'đồ dùng cá nhân', 'ghế massage', 'máy massage', 'massage', 'máy chạy bộ', 'xe đạp tập', 'máy tập', 'yoga'] },
   { value: 'electronics', keywords: ['điện thoại', 'iphone', 'samsung', 'laptop', 'macbook', 'tai nghe', 'airpods', 'đồng hồ thông minh', 'smartwatch', 'apple watch', 'máy tính bảng', 'ipad', 'loa bluetooth', 'camera', 'flycam', 'sạc dự phòng', 'bàn phím', 'chuột gaming', 'phụ kiện điện thoại'] },
   { value: 'fashion', keywords: ['thời trang', 'quần áo', 'giày', 'túi', 'đồng hồ', 'fashion', 'wear', 'váy', 'đầm', 'áo dài', 'sneaker', 'dép', 'quần jean', 'áo khoác', 'túi xách', 'giày dép', 'mũ', 'khăn choàng', 'thắt lưng', 'kính râm', 'trang sức', 'vòng cổ', 'nhẫn', 'bông tai', 'đồ lót', 'đồ ngủ'] },
   { value: 'home_living', keywords: ['nội thất', 'sofa', 'bàn ghế', 'đèn', 'chăn ga', 'gối', 'rèm', 'vệ sinh', 'làm sạch', 'tẩy rửa', 'nước giặt', 'nước rửa chén', 'lau nhà', 'hút bụi', 'máy lọc nước', 'máy lọc không khí', 'đồ gia dụng', 'nhà bếp', 'xoong', 'chảo', 'gia dụng', 'đồ trang trí', 'trang trí', 'decor', 'tranh treo tường', 'gương trang trí', 'thảm trải', 'nến thơm', 'lọ hoa', 'nồi', 'bình giữ nhiệt', 'hộp đựng', 'dụng cụ nhà bếp', 'kệ', 'giá treo'] },
@@ -204,12 +245,49 @@ function industryKeywordMatch(fullText, keyword) {
   return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}($|[^\\p{L}\\p{N}])`, 'u').test(fullText);
 }
 
+// Khớp nguyên từ (ranh giới Unicode), dùng chung cho các veto: \b của
+// JS là ranh giới ASCII nên từ có dấu (vd "tuyển") cần mẫu này mới
+// không bắt nhầm từ chứa nó.
+function containsWholeWord(text, phrase) {
+  const esc = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^\\p{L}\\p{N}])${esc}($|[^\\p{L}\\p{N}])`, 'u').test(text);
+}
+
+// Veto trước khi chấm điểm (PR #18):
+// - Ad tuyển dụng không phải ad sản phẩm (không có ngành "việc làm"):
+//   "tuyển dụng nhân viên spa" bị gán Làm đẹp chỉ vì chữ "spa".
+const JOB_AD_WORDS = ['tuyển dụng', 'tuyển nhân viên', 'ứng tuyển', 'cần tuyển', 'tuyển gấp'];
+// - Chăn nuôi/thú y: "thuốc trị ho cho heo" chứa "thuốc" nhưng không
+//   phải Làm đẹp & Sức khỏe.
+const LIVESTOCK_WORDS = ['heo', 'lợn', 'gà', 'vịt', 'trâu', 'bò', 'dê', 'chăn nuôi', 'thú y', 'trang trại', 'thức ăn chăn nuôi'];
+// - "đầu tư cho sức khỏe" không phải Tài chính: finance chỉ được tính
+//   khi có từ khóa tài chính khác ngoài "đầu tư", hoặc không có ngữ
+//   cảnh sức khỏe/cơ thể.
+const HEALTH_CONTEXT_WORDS = ['sức khỏe', 'cơ thể', 'massage', 'thư giãn', 'làm đẹp', 'giảm cân'];
 function classifyIndustry(ad) {
   const fullText = normalize((ad.text || '') + ' ' + (ad.headline || ''));
+  // Strip URL + SĐT trước: "điện thoại: (0277) 6501 424" ở cuối ad ghế
+  // massage từng kéo cả ad sang electronics.
+  const cleanText = normalize(stripUrlsAndPhones(fullText));
+  if (JOB_AD_WORDS.some((w) => containsWholeWord(cleanText, w))) return 'other';
+  const hasLivestock = LIVESTOCK_WORDS.some((w) => containsWholeWord(cleanText, w));
+  const hasHealthContext = HEALTH_CONTEXT_WORDS.some((w) => containsWholeWord(cleanText, w));
+  let best = null;
+  let bestScore = 0;
   for (const cat of INDUSTRY_CATEGORIES) {
-    if (cat.keywords.some(k => industryKeywordMatch(fullText, k))) return cat.value;
+    let score = 0;
+    for (const k of cat.keywords) {
+      if (industryKeywordMatch(cleanText, k)) score += k.includes(' ') ? 2 : 1;
+    }
+    if (cat.value === 'beauty_health' && hasLivestock) score = 0;
+    if (cat.value === 'finance' && score > 0) {
+      const otherFinanceHit = cat.keywords.some((k) => k !== 'đầu tư' && industryKeywordMatch(cleanText, k));
+      if (!otherFinanceHit && industryKeywordMatch(cleanText, 'đầu tư') && hasHealthContext) score = 0;
+    }
+    // Dấu > (không phải >=): hòa thì ngành đứng trước trong mảng thắng.
+    if (score > bestScore) { bestScore = score; best = cat.value; }
   }
-  return 'other';
+  return bestScore > 0 ? best : 'other';
 }
 
 // ===== PHÂN LOẠI KIỂU CREATIVE (ƯU TIÊN MUA SẮM) =====
@@ -463,7 +541,12 @@ function isGenericCreativeText(text) {
 
 function groupKeyFor(pageName, text) {
   if (!text || isGenericCreativeText(text)) return null;
-  return hashTextKey(String(pageName || '').toLowerCase().trim() + '\n' + text);
+  // Nhóm theo text CHUẨN (strip URL/SĐT + 300 ký tự đầu): cùng creative
+  // khác nhau mỗi chi tiết cuối (địa chỉ/SĐT/link showroom) chung 1
+  // nhóm. Text chỉ còn URL sau khi strip -> canonical rỗng -> không gom.
+  const canonical = canonicalGroupText(text);
+  if (!canonical || isGenericCreativeText(canonical)) return null;
+  return hashTextKey(String(pageName || '').toLowerCase().trim() + '\n' + canonical);
 }
 
 function resolveGroupArchiveId(ad) {
@@ -517,7 +600,9 @@ function countIntoMaps(maps, ad) {
 
   maps.pageMap[pageName] = (maps.pageMap[pageName] || 0) + 1;
   if (text && !isGenericCreativeText(text)) {
-    const k = hashTextKey(text);
+    // Cùng khóa canonical với groupKeyFor: duplicates_count phải khớp
+    // kích thước nhóm (URL/SĐT cuối text không phải creative khác).
+    const k = hashTextKey(canonicalGroupText(text));
     if (maps.textMap[k] === undefined) maps.textKeys = (maps.textKeys || 0) + 1;
     maps.textMap[k] = (maps.textMap[k] || 0) + 1; // text rỗng không đếm (tránh phình D)
   }
@@ -578,7 +663,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     // GIẢ ĐỊNH: collation_count là kích thước nhóm TÍNH CẢ ad này.
     // Nếu crawler của bạn đếm collation_count chỉ tính sibling (không tính chính nó)
     // thì đổi thành (ad.collation_count + 1).
-    const dupFromText = text && !isGenericCreativeText(text) ? (textMap[hashTextKey(text)] || 0) : 0;
+    const dupFromText = text && !isGenericCreativeText(text) ? (textMap[hashTextKey(canonicalGroupText(text))] || 0) : 0;
     const duplicatesCount = Math.max(1, Math.round(ad.collation_count || dupFromText || ad.seen_count || 1));
     // Gom nhóm duplicate (page + text): ad đại diện = ad chạy sớm nhất.
     // groupMap xây ở pass 1; thiếu entry (doc mới ngoài pass 1) thì coi
@@ -642,17 +727,28 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     score = scalingScore * 1.2 + score + spendWeight + reachWeight + trendingScore * 0.5 + (detailSummary.detail_history_length * 0.5);
     score = Number(score.toFixed(1));
 
+    // Số ngày ad THỰC CHẠY (last_seen - start_date), khác với TUỔI
+    // (now - start_date): ad lên 8 ngày trước nhưng dừng sau 4 ngày thì
+    // chỉ chạy 4 ngày, không phải winner 7-9 ngày. Trước đây analyzer
+    // KHÔNG ghi duration_days (chỉ spread từ doc nguồn / tồn đọng từ
+    // bản cũ) nên số UI hiển thị ("X ngày chạy") lệch với cờ preset
+    // tính bằng tuổi — ad 4-5 ngày lọt vào Weekly Winner (retest
+    // 07/11). Từ bản này analyzer ghi duration_days = số ngày chạy,
+    // cờ winner/scale dùng số ngày chạy, cờ new vẫn dùng TUỔI (ad mới
+    // lên). last_seen thiếu/lệch thì fallback về tuổi.
+    const lastSeenMs = ad.last_seen || 0;
+    const runDaysRaw = lastSeenMs > startDateMs ? (lastSeenMs - startDateMs) / (1000 * 3600 * 24) : durationDays;
+    const runDaysRounded = Math.max(1, Math.round(runDaysRaw));
     // Cờ preset tính sẵn (xem PRESET_THRESHOLDS): API lọc theo 1 field
     // boolean có index thay vì $or + nhiều range → đếm/lọc nhanh.
-    // Dùng duration_days đã làm tròn để khớp đúng field API nhìn thấy.
     const durationRounded = Math.round(durationDays);
     const seenWithinWeek = recentMinutes <= PRESET_THRESHOLDS.winner_max_seen_age_days * 24 * 60;
     const isNewAd = durationRounded <= PRESET_THRESHOLDS.new_max_days;
-    const isReadyToScale = durationRounded >= PRESET_THRESHOLDS.scale_min_days
-      && durationRounded <= PRESET_THRESHOLDS.scale_max_days
+    const isReadyToScale = runDaysRounded >= PRESET_THRESHOLDS.scale_min_days
+      && runDaysRounded <= PRESET_THRESHOLDS.scale_max_days
       && duplicatesCount >= PRESET_THRESHOLDS.scale_min_duplicates;
-    const isWeeklyWinner = durationRounded >= PRESET_THRESHOLDS.winner_min_days
-      && (PRESET_THRESHOLDS.winner_max_days <= 0 || durationRounded <= PRESET_THRESHOLDS.winner_max_days)
+    const isWeeklyWinner = runDaysRounded >= PRESET_THRESHOLDS.winner_min_days
+      && (PRESET_THRESHOLDS.winner_max_days <= 0 || runDaysRounded <= PRESET_THRESHOLDS.winner_max_days)
       && duplicatesCount >= PRESET_THRESHOLDS.winner_min_duplicates
       && (score >= PRESET_THRESHOLDS.winner_min_score || trendingScore >= PRESET_THRESHOLDS.winner_min_trending)
       && seenWithinWeek;
@@ -690,6 +786,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       domain,
       ad_library_url: archiveId ? `https://www.facebook.com/ads/library/?id=${archiveId}` : null,
       score,
+      duration_days: runDaysRounded,
       duplicates_count: duplicatesCount,
       duplicate_group_key: groupInfo.key,
       duplicate_group_size: groupInfo.size,
@@ -717,6 +814,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       // chỉnh khi build filter thật.
       filter_signals: {
         age_days: Math.round(durationDays),
+        run_days: runDaysRounded,
         is_new: durationDays <= 7,
         recent_minutes: Math.round(recentMinutes),
         is_recently_seen: recentMinutes < 60,
@@ -1249,4 +1347,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, dailyWinnersDateString, writeDailyWinnersSnapshot, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, dailyWinnersDateString, writeDailyWinnersSnapshot, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys };
