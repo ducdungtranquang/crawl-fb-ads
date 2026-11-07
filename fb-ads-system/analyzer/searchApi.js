@@ -988,6 +988,30 @@ const SIMILAR_TEXT_PREFIX_LEN = 200;
 // được, không treo request. Mặc định 5s: route FE abort sau 10s
 // (AbortSignal.timeout(10000) trong app/api/ads/detail/[id]/route.ts),
 // nên đếm phải xong sớm hơn để cả response kịp về trước khi FE ngắt.
+// Query ĐẾM cho similar: chỉ giữ các điều kiện equality + is_group_rep
+// (đều có index) — BỎ $ne trên normalized_text / duplicate_group_key /
+// ad_archive_id. Các $ne đó không có index nên countDocuments phải FETCH
+// từng doc ứng viên để kiểm tra (tầng global ~337k rep -> nhiều giây),
+// trong khi total chỉ cần để phân trang. Đếm này hơi CAO hơn total thật
+// (cộng thêm các bản sao cùng text + nhóm của ad gốc + chính ad gốc —
+// thường chỉ vài doc); danh sách trả về vẫn khử trùng đúng bằng
+// fillSimilarAds. Khi fill đã cạn mọi tầng thì total lấy từ số đã lấy
+// (chính xác, xem fetchSimilarAds) nên lệch chỉ xảy ra ở trang còn đủ
+// limit.
+function buildSimilarCountQuery(tiers) {
+    const branches = [];
+    for (const t of tiers) {
+        const b = {};
+        if (t.domain !== undefined) b.domain = t.domain;
+        if (t.page_name !== undefined) b.page_name = t.page_name;
+        if (t.industry !== undefined) b.industry = t.industry;
+        if (t.is_group_rep !== undefined) b.is_group_rep = t.is_group_rep;
+        if (Object.keys(b).length) branches.push(b);
+    }
+    if (!branches.length) return null;
+    return branches.length === 1 ? branches[0] : { $or: branches };
+}
+
 async function countSimilarTotal(col, unionQuery, maxTimeMS) {
     try {
         return await col.countDocuments(unionQuery, { maxTimeMS: maxTimeMS || 5000 });
@@ -1023,9 +1047,15 @@ async function countMediaUsage(col, ad) {
     const out = {};
     try {
         const imgKey = Array.isArray(ad.image_keys) && ad.image_keys[0];
-        if (imgKey) out.image = { key: imgKey, ads_count: await col.countDocuments({ image_keys: imgKey }) };
         const vidKey = Array.isArray(ad.video_keys) && ad.video_keys[0];
-        if (vidKey) out.video = { key: vidKey, ads_count: await col.countDocuments({ video_keys: vidKey }) };
+        // 2 count chạy song song (trước đây tuần tự): mỗi count khi chưa
+        // có index là 1 lần quét collection, detail đỡ đợi gấp đôi.
+        const [imgCount, vidCount] = await Promise.all([
+            imgKey ? col.countDocuments({ image_keys: imgKey }) : Promise.resolve(null),
+            vidKey ? col.countDocuments({ video_keys: vidKey }) : Promise.resolve(null),
+        ]);
+        if (imgCount !== null) out.image = { key: imgKey, ads_count: imgCount };
+        if (vidCount !== null) out.video = { key: vidKey, ads_count: vidCount };
     } catch (err) {
         console.warn('[Search API] media usage lỗi:', err && err.message);
     }
@@ -1062,10 +1092,15 @@ async function fillSimilarAds(col, tiers, page, limit, projection, sourceDupText
         if (sourceId !== undefined) exclude.push(String(sourceId));
         const baseEx = query.ad_archive_id && typeof query.ad_archive_id === 'object' ? query.ad_archive_id : {};
         const q = { ...query, ad_archive_id: { ...baseEx, $nin: exclude } };
+        // Lay thua 5 doc moi tang: guard JS ben duoi (loai text trung /
+        // prefix trung) co the vut doc da fetch; lay dung need thi tang
+        // bi "lang phi" va fill roi xuong tang kem lien quan hon (vd.
+        // limit=2 ma doc dau tang page bi loai thi similar toan ad
+        // global). Thu them re (query da co index, chi them vai doc).
         const docs = await col.find(q)
             .project(projection)
             .sort({ score: -1 })
-            .limit(need - picked.length)
+            .limit(need - picked.length + 5)
             .toArray();
         for (const d of docs) {
             const key = String(d.ad_archive_id || d._id);
@@ -1149,10 +1184,20 @@ function initSearchServer(dbInstance) {
 
     async function fetchSimilarAds(sourceAd, adId, page, limit) {
         const tiers = buildSimilarTiers(sourceAd, adId);
-        const unionQuery = tiers.length === 1 ? tiers[0] : { $or: tiers };
         const similarAds = await fillSimilarAds(adsCol, tiers, page, limit, SIMILAR_PROJECTION, similarDupTextOf(sourceAd));
-        const total = await countSimilarTotal(adsCol, unionQuery);
-        const effectiveTotal = total === null ? similarAds.length : (total === 0 && similarAds.length ? similarAds.length : total);
+        let total;
+        if (similarAds.length < limit) {
+            // Fill đã cạn mọi tầng (số đã lấy < need) -> total chính xác
+            // bằng số ad tương tự thật, không cần đếm union (đắt).
+            total = (page - 1) * limit + similarAds.length;
+        } else {
+            // Còn đủ limit -> có thể còn trang sau: đếm bằng query rẻ
+            // (chỉ equality + is_group_rep, xem buildSimilarCountQuery).
+            const countQuery = buildSimilarCountQuery(tiers);
+            total = countQuery ? await countSimilarTotal(adsCol, countQuery) : null;
+            if (total === null) total = similarAds.length;
+        }
+        const effectiveTotal = total === 0 && similarAds.length ? similarAds.length : total;
         return { similarAds, total: effectiveTotal, pages: Math.ceil(effectiveTotal / limit), has_more: page * limit < effectiveTotal };
     }
 
@@ -1521,14 +1566,13 @@ function initSearchServer(dbInstance) {
     }
 
     /**
-     * 🟢 API 2: LẤY CHI TIẾT QUẢNG CÁO (kèm ads tương tự)
-     * Mặc định trả kèm 10 ads tương tự không phải duplicate (cùng domain,
-     * nếu không có domain thì cùng page, khác normalized_text của ad gốc,
-     * sort score giảm dần) trong `similar_ads` + phân trang
-     * trong `similar_pagination`. Muốn lấy thêm: gọi lại detail với
-     * ?similar_page=2 (và/hoặc ?similar_limit=N), hoặc gọi endpoint
-     * /api/ads/:id/similar?page=2. Tắt kèm similar: ?similar_limit=0
-     * hoặc ?include_similar=false. `data` giữ nguyên shape cũ.
+     * 🟢 API 2: LẤY CHI TIẾT QUẢNG CÁO (KHÔNG kèm similar mặc định)
+     * TÁCH similar khỏi detail (PR #19): detail mặc định chỉ trả `data` +
+     * `media_usage` + `duplicate_group` để mở nhanh; similar lấy riêng
+     * qua endpoint /api/ads/:id/similar (bất đồng bộ, không chặn modal).
+     * Muốn kèm similar trong 1 lần gọi: ?include_similar=true (limit
+     * từ ?similar_limit, mặc định 10, tối đa 20) hoặc
+     * ?similar_page=2 để lấy trang sau. `data` giữ nguyên shape cũ.
      */
     app.get('/api/ads/detail/:id', async (req, res) => {
         try {
@@ -1539,7 +1583,9 @@ function initSearchServer(dbInstance) {
             if (!adDetail) return res.status(404).json({ success: false, message: `Không tìm thấy ID: ${adId}` });
 
             const mediaUsage = await countMediaUsage(adsCol, adDetail);
-            const includeSimilar = req.query.include_similar !== 'false' && req.query.include_similar !== '0';
+            // Mặc định KHÔNG kèm similar (tách riêng để detail mở nhanh);
+            // chỉ kèm khi gọi tường minh ?include_similar=true (hoặc =1).
+            const includeSimilar = req.query.include_similar === 'true' || req.query.include_similar === '1';
             const similarLimit = req.query.similar_limit === undefined
                 ? 10
                 : Math.min(Math.max(parseInt(req.query.similar_limit, 10) || 0, 0), 20);
@@ -1602,8 +1648,21 @@ function initSearchServer(dbInstance) {
             const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
             const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
             const skip = (page - 1) * limit;
-
+            // Dedupe mặc định BẬT (như search): 1 creative chỉ hiện 1 lần
+            // — trước đây 20 slot đầu của Kingsport có 7× "{{product.brand}}"
+            // + 4× cùng creative, total 972 đếm cả bản sao nên số trang
+            // không khớp số creative thật. Tắt bằng ?dedupe=0.
+            const dedupeOn = req.query.dedupe !== '0' && req.query.dedupe !== 'false';
+            // Loại ad đang xem khỏi chính danh sách của page nó (modal
+            // detail truyền ?exclude=<ad_archive_id>).
+            const excludeId = req.query.exclude ? String(req.query.exclude).trim() : '';
             const query = { page_name: pageName };
+            if (dedupeOn) query.is_group_rep = true;
+            if (excludeId) {
+                query.ad_archive_id = /^\d+$/.test(excludeId)
+                    ? { $nin: [excludeId, Number(excludeId)] }
+                    : { $ne: excludeId };
+            }
             const total = await adsCol.countDocuments(query);
 
             const ads = await adsCol.find(query)
@@ -1612,14 +1671,18 @@ function initSearchServer(dbInstance) {
                     is_active: 1, start_date: 1, estimated_spend_usd: 1, estimated_reach: 1,
                     images: { $slice: 1 }, videos: { $slice: 1 }
                 })
-                .sort({ score: -1 })
+                // Active lên trước (ad đã dừng/không còn trong Library
+                // xuống sau — trước đây sort pure score nên 20 ad đầu của
+                // Kingsport toàn is_active=false), rồi score, rồi id để
+                // phân trang ổn định (score trùng nhau rất nhiều).
+                .sort({ is_active: -1, score: -1, ad_archive_id: 1 })
                 .skip(skip)
                 .limit(limit)
                 .toArray();
 
             return res.json({
                 success: true,
-                pagination: { total, page, limit, pages: Math.ceil(total / limit) },
+                pagination: { total, page, limit, pages: Math.ceil(total / limit), dedupe: dedupeOn },
                 data: ads
             });
         } catch (error) {
@@ -1765,7 +1828,7 @@ function buildMonthlyWinnersPipeline(month) {
     ];
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
