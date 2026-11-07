@@ -434,7 +434,7 @@ async function refreshSchemaProbe(adsCol) {
 // tự) phải khớp nguyên từ, cụm dài khớp chuỗi con — cùng quy tắc với
 // classifyIndustry sau fix boundary 03/11.
 const INDUSTRY_FALLBACK_KEYWORDS = {
-    beauty_health: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'thực phẩm bảo vệ sức khỏe', 'viên uống', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc', 'sữa tắm', 'nước hoa', 'son môi', 'kem dưỡng', 'mặt nạ', 'kem đánh răng', 'bàn chải đánh răng', 'đồ dùng cá nhân'],
+    beauty_health: ['mỹ phẩm', 'skincare', 'trị mụn', 'kem', 'serum', 'dược', 'thuốc', 'vitamin', 'beauty', 'health', 'thực phẩm chức năng', 'thực phẩm bảo vệ sức khỏe', 'viên uống', 'collagen', 'giảm cân', 'spa', 'làm đẹp', 'sữa rửa mặt', 'kem chống nắng', 'dầu gội', 'trị nám', 'mọc tóc', 'sữa tắm', 'nước hoa', 'son môi', 'kem dưỡng', 'mặt nạ', 'kem đánh răng', 'bàn chải đánh răng', 'đồ dùng cá nhân', 'ghế massage', 'máy massage', 'massage', 'máy chạy bộ', 'xe đạp tập', 'máy tập', 'yoga'],
     electronics: ['điện thoại', 'iphone', 'samsung', 'laptop', 'macbook', 'tai nghe', 'airpods', 'đồng hồ thông minh', 'smartwatch', 'apple watch', 'máy tính bảng', 'ipad', 'loa bluetooth', 'camera', 'flycam', 'sạc dự phòng', 'bàn phím', 'chuột gaming', 'phụ kiện điện thoại'],
     fashion: ['thời trang', 'quần áo', 'giày', 'túi', 'đồng hồ', 'fashion', 'wear', 'váy', 'đầm', 'áo dài', 'sneaker', 'dép', 'quần jean', 'áo khoác', 'túi xách', 'giày dép', 'mũ', 'khăn choàng', 'thắt lưng', 'kính râm', 'trang sức', 'vòng cổ', 'nhẫn', 'bông tai', 'đồ lót', 'đồ ngủ'],
     home_living: ['nội thất', 'sofa', 'bàn ghế', 'đèn', 'chăn ga', 'gối', 'rèm', 'vệ sinh', 'làm sạch', 'tẩy rửa', 'nước giặt', 'nước rửa chén', 'lau nhà', 'hút bụi', 'máy lọc nước', 'máy lọc không khí', 'đồ gia dụng', 'nhà bếp', 'xoong', 'chảo', 'gia dụng', 'đồ trang trí', 'trang trí', 'decor', 'tranh treo tường', 'gương trang trí', 'thảm trải', 'nến thơm', 'lọ hoa', 'nồi', 'bình giữ nhiệt', 'hộp đựng', 'dụng cụ nhà bếp', 'kệ', 'giá treo'],
@@ -641,9 +641,50 @@ function lowerPrefixRange(s) {
     return { $gte: v, $lt: v + '\uffff' };
 }
 
+// Lọc theo domain: khớp domain chính XÁC + mọi subdomain của nó.
+// Prefix range một mình KHÔNG đủ: nó chỉ khớp domain BẮT ĐẦU bằng chuỗi
+// nhập, nên tìm 'kingsport.vn' bỏ sót 'ghemassage.kingsport.vn' —
+// domain thật của ad 1470373528353715 (detail báo domain_ads_count 14
+// nhưng search domain=kingsport.vn trả total 0, retest 07/11).
+// Nhánh 2 là regex hậu tố '.\<domain>$' (đã escape, chỉ khớp cuối
+// chuỗi): bắt subdomain, không bắt 'fakekingsport.vn' hay
+// 'kingsport.vn.evil.com'. Nhánh prefix dùng được index domain_lower;
+// nhánh regex quét index (chấp nhận được cho query đã lọc). Chuẩn hóa
+// input: bỏ scheme, path, 'www.' đầu.
+function normalizeDomainInput(s) {
+    let d = String(s || '').trim().toLowerCase();
+    d = d.replace(/^https?:\/\//, '').split('/')[0];
+    d = d.replace(/^\.+/, '');
+    if (d.startsWith('www.')) d = d.slice(4);
+    return d;
+}
+
+function buildDomainCondition(domainParam, schema) {
+    const d = normalizeDomainInput(domainParam);
+    if (!d) return null;
+    const suffix = new RegExp(escapeRegExp('.' + d) + '$', 'i');
+    if (schema && schema.lower) {
+        return { $or: [{ domain_lower: lowerPrefixRange(d) }, { domain_lower: suffix }] };
+    }
+    return { $or: [{ domain: prefixRegex(d) }, { domain: suffix }] };
+}
+
 // Bỏ dấu tiếng Việt để bắt thêm trường hợp text đã strip dấu lúc index.
 function stripViDiacritics(s) {
     return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D');
+}
+
+// Giới hạn số ID lấy từ ES cho 1 text search. Sàn cũ 100 ID làm total
+// search text bị trần đúng 100 ("ghế massage" trả total 100 ở cả UI lẫn
+// API, retest 07/11) dù ES khớp nhiều hơn: total đếm từ countDocuments
+// trên $in: esIds nên không bao giờ vượt số ID lấy được. Sàn mới 1000
+// (trần 5000): đủ cho trang 1-10 ở limit 100, vẫn rẻ vì ES chỉ trả _id.
+// total thật của ES được đọc qua track_total_hits (xem handler) và báo
+// bằng cờ total_capped khi vẫn còn hit chưa lấy.
+const TEXT_SEARCH_LIMIT_FLOOR = 1000;
+const TEXT_SEARCH_LIMIT_MAX = 5000;
+function textSearchLimit(page, limit, multiplier) {
+    return Math.min(Math.max(page * limit * multiplier, TEXT_SEARCH_LIMIT_FLOOR), TEXT_SEARCH_LIMIT_MAX);
 }
 
 // Query text search cho ES. strict=true: match_phrase (cụm đúng thứ tự) +
@@ -921,13 +962,25 @@ function resolvePresetSort(presets, hasExplicitSortBy) {
 // ===== ADS TƯƠNG TỰ: TẦNG FALLBACK (module-level để test được) =====
 // Tầng theo thứ tự liên quan giảm dần: cùng domain -> cùng page -> cùng
 // industry -> mọi ad khác. Mỗi tầng đều loại ad trùng text với ad gốc
-// (duplicate theo normalized_text). Tầng cuối đảm bảo mục similar không
-// bao giờ trống khi collection còn ad khác; nếu mọi ad còn lại đều
-// trùng text thì fillSimilarAds dùng phương án cuối: lấy cả ad trùng
-// text, chỉ loại chính ad gốc.
+// (duplicate theo normalized_text). Từ PR #16: similar thiếu thì trả ít
+// hơn (hoặc rỗng) chứ KHÔNG lấp bằng ad trùng text nữa (quyết định
+// 06/11). Từ PR #18: $ne còn yêu cầu $exists — $ne ở Mongo khớp cả doc
+// THIẾU field, nên ad không có normalized_text từng lọt qua tầng lọc;
+// và fillSimilarAds khử trùng thêm theo text/prefix (xem dưới) để cùng
+// 1 creative chạy nhiều showroom (chỉ khác địa chỉ/SĐT cuối text) chỉ
+// hiện 1 lần.
 function similarDupTextOf(ad) {
     return String(ad.normalized_text || ad.text || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
+
+// Độ dài prefix text dùng khử trùng similar: 2 ad cùng 200 ký tự đầu
+// thì coi là cùng creative (địa chỉ/SĐT/link showroom nằm ở cuối text).
+// Chỉ áp dụng khi text dài hơn 200 ký tự; text ngắn hơn đã khử trùng
+// bằng full text. 200 ký tự (~35 từ) đủ dài để 2 creative khác nhau
+// khó trùng prefix ngẫu nhiên, nhưng đủ ngắn để bắt các bản showroom
+// có body chung ~200+ ký tự rồi mới rẽ sang địa chỉ riêng. Không giới
+// hạn theo page: cùng creative chạy ở nhiều page franchise vẫn phải gộp.
+const SIMILAR_TEXT_PREFIX_LEN = 200;
 
 // Đếm tổng similar có giới hạn thời gian: union $or trên toàn collection
 // có thể quét rất lâu (tầng global khớp gần hết 388k doc) làm treo cả
@@ -947,7 +1000,8 @@ async function countSimilarTotal(col, unionQuery, maxTimeMS) {
 function buildSimilarTiers(sourceAd, adId) {
     const base = { ad_archive_id: { $ne: adId } };
     const dupText = similarDupTextOf(sourceAd);
-    const noDup = dupText ? { normalized_text: { $ne: dupText } } : {};
+    // $exists: true là bắt buộc: $ne khớp cả doc THIẾU normalized_text.
+    const noDup = dupText ? { normalized_text: { $ne: dupText, $exists: true } } : {};
     // Chỉ lấy 1 ad cho mỗi creative: is_group_rep != false (true, hoặc
     // thiếu field ở doc cũ) — doc is_group_rep=false là bản sao đã biết.
     // Nhóm của chính ad gốc cũng loại hẳn: xem detail của 1 bản sao thì
@@ -982,15 +1036,26 @@ async function countMediaUsage(col, ad) {
 // ad_archive_id VÀ duplicate_group_key, rồi cắt đúng cửa sổ trang. col là
 // collection Mongo (hoặc fake collection trong test) có
 // find().project().sort().limit().
-async function fillSimilarAds(col, tiers, page, limit, projection) {
+// Khử trùng thêm theo TEXT (PR #18): tầng query chỉ loại text trùng
+// VỚI AD GỐC, không loại trùng nhau TRONG list — cùng 1 creative chạy
+// nhiều showroom chỉ khác địa chỉ/SĐT cuối text (khác group key vì
+// group key dùng full text) nên similar hiện 6× cùng creative (retest
+// 07/11: Kingsport "Tâm lý chung cha mẹ..." 6×/15). Vì vậy ở đây giữ
+// thêm seenTexts (full text) + seenPrefixes (300 ký tự đầu, chỉ khi
+// text dài hơn 300) và loại cả ad có text trùng ad gốc (phòng khi doc
+// thiếu normalized_text lọt qua $ne ở tầng query).
+async function fillSimilarAds(col, tiers, page, limit, projection, sourceDupText) {
     const seen = new Set();
     const seenGroups = new Set();
+    const seenTexts = new Set();
+    const seenPrefixes = new Set();
     const picked = [];
     const need = page * limit;
     // Mỗi tầng sau phải loại cả ID đã lấy ở tầng trước: nếu không, tầng
     // sau trả lại đúng những ad điểm cao đã thấy, limit bị tiêu hết mà
     // không thêm được ad mới (lỗi đã bắt bằng test mock).
     const sourceId = tiers[0]?.ad_archive_id?.$ne;
+    const sourceText = sourceDupText || tiers[0]?.normalized_text?.$ne || '';
     for (const query of tiers) {
         if (picked.length >= need) break;
         const exclude = [...seen];
@@ -1011,6 +1076,22 @@ async function fillSimilarAds(col, tiers, page, limit, projection) {
             if (gk != null && gk !== '') {
                 if (seenGroups.has(gk)) continue;
                 seenGroups.add(gk);
+            }
+            // Khử trùng theo text: cùng full text (kể cả khác page), hoặc
+            // cùng 300 ký tự đầu khi text dài (bản sao chỉ khác chi tiết
+            // cuối: địa chỉ/SĐT/link showroom). Text của chính ad gốc
+            // cũng loại ở đây (doc thiếu normalized_text lọt qua $ne).
+            const normText = similarDupTextOf(d);
+            const rawText = similarDupTextOf({ normalized_text: '', text: d.text });
+            if ((normText && normText === sourceText) || (rawText && rawText === sourceText)) continue;
+            if (normText) {
+                if (seenTexts.has(normText)) continue;
+                seenTexts.add(normText);
+                if (normText.length > SIMILAR_TEXT_PREFIX_LEN) {
+                    const prefixKey = normText.slice(0, SIMILAR_TEXT_PREFIX_LEN);
+                    if (seenPrefixes.has(prefixKey)) continue;
+                    seenPrefixes.add(prefixKey);
+                }
             }
             seen.add(key);
             picked.push(d);
@@ -1069,7 +1150,7 @@ function initSearchServer(dbInstance) {
     async function fetchSimilarAds(sourceAd, adId, page, limit) {
         const tiers = buildSimilarTiers(sourceAd, adId);
         const unionQuery = tiers.length === 1 ? tiers[0] : { $or: tiers };
-        const similarAds = await fillSimilarAds(adsCol, tiers, page, limit, SIMILAR_PROJECTION);
+        const similarAds = await fillSimilarAds(adsCol, tiers, page, limit, SIMILAR_PROJECTION, similarDupTextOf(sourceAd));
         const total = await countSimilarTotal(adsCol, unionQuery);
         const effectiveTotal = total === null ? similarAds.length : (total === 0 && similarAds.length ? similarAds.length : total);
         return { similarAds, total: effectiveTotal, pages: Math.ceil(effectiveTotal / limit), has_more: page * limit < effectiveTotal };
@@ -1124,6 +1205,7 @@ function initSearchServer(dbInstance) {
             let searchFallback = null; // 'mongo' khi ES lỗi/0-hit và phải lọc bằng Mongo
             let esIdsFetched = 0; // số ID ES trả (để phát hiện trang thiếu dòng khi dedupe qua Mongo)
             let esIdsCapped = false;
+            let esTotalHits = null; // total thật ES khớp (track_total_hits), null khi không qua ES
 
             // 1. SEARCH TEXT (Elasticsearch, fallback Mongo khi ES lỗi/0-hit)
             // Chất lượng: match_phrase (cụm đúng thứ tự) + match operator AND (đủ
@@ -1146,12 +1228,12 @@ function initSearchServer(dbInstance) {
                         // Dedupe qua Mongo (mapping ES chưa có field): over-fetch
                         // gấp đôi để trang ít bị thiếu dòng sau khi lọc đại diện.
                         const esMultiplier = (dedupeOn && !esDedupeAvailable) ? 10 : 5;
-                        esLimit = Math.min(Math.max(page * limit * esMultiplier, 100), 5000);
+                        esLimit = textSearchLimit(page, limit, esMultiplier);
                         const esParams = {
                             index: ELASTIC_INDEX,
                             _source: ['ad_archive_id'],
                             size: esLimit,
-                            track_total_hits: false
+                            track_total_hits: true
                         };
 
                         let esResponse = await esClient.search({ ...esParams, query: buildTextSearchQuery(keyword, true, esDedupeAvailable) });
@@ -1160,6 +1242,10 @@ function initSearchServer(dbInstance) {
                             esResponse = await esClient.search({ ...esParams, query: buildTextSearchQuery(keyword, false, esDedupeAvailable) });
                             hits = esResponse.hits?.hits || [];
                         }
+                        // Total thật ES khớp (để báo total_capped): hits.total
+                        // là {value, relation} ở ES 8, số ở bản cũ.
+                        const esTotal = esResponse.hits?.total;
+                        esTotalHits = typeof esTotal === 'number' ? esTotal : (esTotal?.value ?? null);
 
                         // _source thiếu ad_archive_id thì dùng _id của ES doc.
                         esIds = [...new Set(hits.map(hit => hit?._source?.ad_archive_id || hit?._id).filter(Boolean).map(String))];
@@ -1205,8 +1291,16 @@ function initSearchServer(dbInstance) {
                 else query.page_name = prefixRegex(page_name);
             }
             if (domain) {
-                if (schema.lower) query.domain_lower = lowerPrefixRange(domain);
-                else query.domain = prefixRegex(domain);
+                const domainCond = buildDomainCondition(domain, schema);
+                if (domainCond) {
+                    if (domainCond.$or && query.$or) {
+                        // Text fallback cũng dùng $or: gộp cả hai bằng $and
+                        // để không ghi đè nhau (cùng mẫu với country).
+                        const textOr = query.$or;
+                        delete query.$or;
+                        query.$and = [{ $or: textOr }, domainCond, ...(query.$and || [])];
+                    } else Object.assign(query, domainCond);
+                }
             }
             // is_active: analyzer cũ không ghi field này -> lọc bằng
             // last_seen trong 7 ngày (cùng quy tắc analyzer bản mới ghi).
@@ -1368,6 +1462,7 @@ function initSearchServer(dbInstance) {
                 ...(searchFallback ? { search_fallback: searchFallback } : {}),
                 ...(dedupeFallback ? { dedupe_fallback: dedupeFallback } : {}),
                 ...(dedupeOn && esRank && !esDedupeAvailable && esIdsCapped && results.length < limit ? { dedupe_partial: true } : {}),
+                ...(esTotalHits !== null && esTotalHits > esIdsFetched ? { total_capped: true } : {}),
                 ...(countTimeout ? { count_timeout: true } : {}),
                 pagination: { total, page, limit, pages: total === null ? null : Math.ceil(total / limit) },
                 data: results,
@@ -1670,7 +1765,7 @@ function buildMonthlyWinnersPipeline(month) {
     ];
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
