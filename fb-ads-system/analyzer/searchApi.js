@@ -1780,12 +1780,12 @@ function initSearchServer(dbInstance) {
             if (!month) return res.status(400).json({ success: false, message: 'month phai co dang YYYY-MM.' });
             const all = await winnersCol.aggregate(buildMonthlyWinnersPipeline(month)).toArray();
             const total = all.length;
-            const data = all.slice(skip, skip + limit).map((d) => ({ domain: d._id, title: d.title, days_won: d.days_won, total_product_score: Number(d.total_product_score.toFixed(1)), total_winning_ads: d.total_winning_ads, best_rank: d.best_rank, latest_score: d.latest_score }));
+            const data = all.slice(skip, skip + limit).map((d) => ({ product_key: d._id, domain: d.domain, landing_url: d.landing_url || null, category: d.category || null, title: d.title, days_won: d.days_won, total_product_score: Number(d.total_product_score.toFixed(1)), total_winning_ads: d.total_winning_ads, best_rank: d.best_rank, latest_score: d.latest_score }));
             // Top 1 mỗi ngày trong tháng (để FE vẽ "hàng win mỗi ngày").
             const { start, end } = monthRange(month);
             const dailyTop = await winnersCol.find({ date: { $gte: start, $lt: end }, domain: { $not: excludedProductDomainRegex() } }).sort({ date: 1, rank: 1 }).project({ date: 1, domain: 1, title: 1, product_score: 1, rank: 1 }).toArray();
             const daily_top = {};
-            for (const d of dailyTop) if (!daily_top[d.date]) daily_top[d.date] = { domain: d.domain, title: d.title, product_score: d.product_score };
+            for (const d of dailyTop) if (!daily_top[d.date]) daily_top[d.date] = { product_key: d.product_key || d.domain, domain: d.domain, landing_url: d.landing_url || null, category: d.category || null, title: d.title, product_score: d.product_score };
             return res.json({ success: true, mode: 'month', month, pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data, daily_top });
         } catch (error) {
             return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
@@ -1799,14 +1799,23 @@ function initSearchServer(dbInstance) {
         try {
             const { domain } = req.params;
             if (!domain) return res.status(400).json({ success: false, message: 'Domain is required.' });
-            if (isExcludedProductDomain(domain)) return res.status(404).json({ success: false, message: `Product not found.` });
+            // Tham so nay gio la product_key (landing URL da encode) hoac
+            // domain cu (tuong thich nguoc): thu product_key truoc.
+            let rawKey = String(domain).trim();
+            try { rawKey = decodeURIComponent(rawKey); } catch { /* giu nguyen */ }
+            if (isExcludedProductDomain(rawKey)) return res.status(404).json({ success: false, message: `Product not found.` });
 
-            const productInfo = await productsCol.findOne({ domain: new RegExp(`^${escapeRegExp(String(domain).trim())}$`, 'i') });
+            let productInfo = await productsCol.findOne({ product_key: rawKey });
+            if (!productInfo) productInfo = await productsCol.findOne({ domain: new RegExp(`^${escapeRegExp(rawKey)}$`, 'i') });
             if (!productInfo) return res.status(404).json({ success: false, message: `Product not found.` });
+            if (isExcludedProductDomain(productInfo.domain)) return res.status(404).json({ success: false, message: `Product not found.` });
 
-            const topAds = await adsCol.find({ domain: productInfo.domain })
+            const topAdsQuery = (productInfo.product_key && productInfo.product_key.startsWith('http'))
+                ? { product_key: productInfo.product_key }
+                : { domain: productInfo.domain };
+            const topAds = await adsCol.find(topAdsQuery)
                 .sort({ score: -1 }).limit(20)
-                .project({ ad_archive_id: 1, ad_library_url: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1, level: 1, estimated_spend_usd: 1, thumbnail_r2: 1, start_date: 1, last_seen: 1, images: { $slice: 1 }, videos: { $slice: 1 } })
+                .project({ ad_archive_id: 1, ad_library_url: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1, level: 1, estimated_spend_usd: 1, thumbnail_r2: 1, start_date: 1, last_seen: 1, product_key: 1, images: { $slice: 1 }, videos: { $slice: 1 } })
                 .toArray();
 
             return res.json({ success: true, data: { ...productInfo, top_ads: topAds } });
@@ -1866,9 +1875,16 @@ function buildProductsSearchQuery(params) {
     const q = String(params.q || '').trim();
     if (q) {
         const re = new RegExp(escapeRegExp(q), 'i');
-        query.$or = [{ title: re }, { domain: re }];
+        query.$or = [{ title: re }, { domain: re }, { landing_url: re }];
     }
     if (params.domain) query.domain = new RegExp(`^${escapeRegExp(String(params.domain).trim())}$`, 'i');
+    // Loc theo nganh hang: category tren doc product la industry code cua
+    // ad top score (beauty_health, electronics, fashion...). Gia tri la
+    // phai nam trong INDUSTRIES, neu khong thi bo qua (khong tra 0 oan).
+    if (params.industry) {
+        const ind = String(params.industry).trim().toLowerCase();
+        if (INDUSTRY_VALUES.has(ind)) query.category = ind;
+    }
     if (params.min_product_score) query.product_score = { $gte: parseInt(params.min_product_score, 10) };
     if (params.min_winning_ads) query.winning_ads = { $gte: parseInt(params.min_winning_ads, 10) };
     if (params.min_total_ads) query.total_ads = { $gte: parseInt(params.min_total_ads, 10) };
@@ -1901,7 +1917,7 @@ function buildMonthlyWinnersPipeline(month) {
     return [
         { $match: { date: { $gte: start, $lt: end }, domain: { $not: excludedProductDomainRegex() } } },
         { $sort: { date: 1, rank: 1 } },
-        { $group: { _id: '$domain', title: { $last: '$title' }, days_won: { $sum: 1 }, total_product_score: { $sum: '$product_score' }, total_winning_ads: { $sum: '$winning_ads' }, best_rank: { $min: '$rank' }, latest_score: { $last: '$product_score' } } },
+        { $group: { _id: { $ifNull: ['$product_key', '$domain'] }, domain: { $last: '$domain' }, landing_url: { $last: '$landing_url' }, category: { $last: '$category' }, title: { $last: '$title' }, days_won: { $sum: 1 }, total_product_score: { $sum: '$product_score' }, total_winning_ads: { $sum: '$winning_ads' }, best_rank: { $min: '$rank' }, latest_score: { $last: '$product_score' } } },
         { $sort: { days_won: -1, total_product_score: -1 } },
     ];
 }

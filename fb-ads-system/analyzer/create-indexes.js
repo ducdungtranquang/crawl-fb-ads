@@ -107,6 +107,8 @@ const INDEXES = [
   { key: { domain_lower: 1, score: -1 }, name: 'idx_domain_lower_score' },
   // Similar ads + product detail: cùng domain/page, sort score.
   { key: { domain: 1, score: -1 }, name: 'idx_domain_score' },
+  // PR #23: detail top_ads tim theo product_key (landing URL chuan hoa).
+  { key: { product_key: 1, score: -1 }, name: 'idx_product_key_score' },
   { key: { page_name: 1, score: -1 }, name: 'idx_page_score' },
   // Lọc page_name/domain theo field gốc (giữ lại cho match chính xác;
   // đường chính nay là *_lower ở trên).
@@ -143,8 +145,13 @@ const INDEXES = [
   { key: { video_keys: 1 }, name: 'idx_video_keys' },
 ];
 
+// PR #23: gom theo landing URL nen 1 domain co nhieu product — unique key
+// chuyen tu domain sang product_key. TRUOC KHI CHAY FILE NAY: drop index
+// unique cu tren products (mongosh):
+//   db.getSiblingDB('fb_ads_analyzer').getCollection('products').dropIndex('domain_unique');
 const PRODUCT_INDEXES = [
-  { key: { domain: 1 }, name: 'domain_unique', unique: true },
+  { key: { product_key: 1 }, name: 'product_key_unique', unique: true },
+  { key: { domain: 1 }, name: 'idx_products_domain' },
   { key: { product_score: -1 }, name: 'product_score_sort' },
 ];
 

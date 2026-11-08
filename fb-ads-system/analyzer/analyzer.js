@@ -804,6 +804,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       ...ad,
       ad_archive_id: archiveId,
       domain,
+      product_key: productKeyFor(ad, domain),
       ad_library_url: archiveId ? `https://www.facebook.com/ads/library/?id=${archiveId}` : null,
       score,
       duration_days: runDaysRounded,
@@ -985,13 +986,60 @@ function excludedProductDomainRegex() {
   return new RegExp('(^|\\.)(' + EXCLUDED_PRODUCT_DOMAINS.map(esc).join('|') + ')$', 'i');
 }
 
+// Param tracking loai khi chuan hoa landing URL (giua lai param dinh danh
+// san pham that, vd ?id= / ?product_id= / ?sku=).
+const LANDING_TRACKING_PARAMS = new Set(['fbclid', 'gclid', 'gbraid', 'wbraid', 'msclkid', 'igshid', 'mc_cid', 'mc_eid', '_ga', '_gl', 'vero_id', 'vero_conv', 'fb_action_ids', 'fb_source']);
+// Chuan hoa URL landing ve 1 dang duy nhat de gom nhom: https, bo www.,
+// bo #fragment, bo utm_* + param tracking, sap xep param con lai, bo '/'
+// cuoi (tru root). URL loi / khong phai http(s) -> ''.
+function normalizeLandingUrl(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  let u;
+  try { u = new URL(raw.trim()); } catch { return ''; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+  u.protocol = 'https:';
+  u.hostname = u.hostname.toLowerCase().replace(/^www\./, '');
+  const kept = [];
+  for (const [k, v] of u.searchParams.entries()) {
+    const lk = k.toLowerCase();
+    if (lk.startsWith('utm_') || LANDING_TRACKING_PARAMS.has(lk)) continue;
+    kept.push([k, v]);
+  }
+  kept.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+  u.search = kept.length ? '?' + kept.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&') : '';
+  u.hash = '';
+  if (u.pathname.length > 1) u.pathname = u.pathname.replace(/\/+$/, '');
+  return u.toString();
+}
+// Khoa gom nhom san pham: URL landing da chuan hoa NEU la trang cu the
+// (co path khac '/' hoac co query dinh danh san pham); trang chu /
+// khong co URL thi fallback 'domain:<domain>' (giu hanh vi cu cho ad
+// khong co link cu the). Vi du: 2 ad cung ghe-massage-g63 khac utm_
+// gom ve 1 product; kingsport.vn/ghe-massage-g63 va /ghe-massage-g79
+// la 2 product khac nhau; shopee.vn/product/397.../232... la 1 product
+// (nhung van bi blocklist PR #22 loai neu domain nam trong list).
+function productKeyFor(ad, domainOverride) {
+  if (!ad) return '';
+  const raw = ad.landing_url || ad.link || '';
+  const url = normalizeLandingUrl(raw);
+  const domain = String(domainOverride || ad.domain || extractDomain(raw) || '').toLowerCase();
+  if (url) {
+    let path = '', search = '';
+    try { const u = new URL(url); path = u.pathname; search = u.search; } catch { /* bo qua */ }
+    if ((path && path !== '/') || search) return url;
+  }
+  return domain ? 'domain:' + domain : '';
+}
+
 const PRODUCT_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 function accumulateProductStats(map, analyzedAds, nowMs = Date.now()) {
   for (const ad of analyzedAds) {
-    if (!ad.domain) continue;
-    if (isExcludedProductDomain(ad.domain)) continue;
-    let s = map[ad.domain];
-    if (!s) s = map[ad.domain] = { domain: ad.domain, totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, totalSpendUsd: 0, activeAds: 0, firstStartDate: null, topAdScore: -Infinity, topAdHeadline: '', topAdText: '', topAdId: null, topAdLandingUrl: '', topAdIndustry: '' };
+    const key = productKeyFor(ad);
+    if (!key) continue;
+    const domain = String(ad.domain || extractDomain(ad.landing_url || ad.link || '') || '').toLowerCase();
+    if (isExcludedProductDomain(domain)) continue;
+    let s = map[key];
+    if (!s) s = map[key] = { key, domain, landingUrl: key.startsWith('http') ? key : '', totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, totalSpendUsd: 0, activeAds: 0, firstStartDate: null, topAdScore: -Infinity, topAdHeadline: '', topAdText: '', topAdId: null, topAdLandingUrl: '', topAdIndustry: '' };
     s.totalAds++;
     s.pages.add(ad.page_name);
     s.totalScore += ad.score || 0;
@@ -1036,8 +1084,8 @@ function dailyWinnersDateString(nowMs = Date.now()) {
 function buildDailyWinners(map, dateStr, limit = DAILY_WINNERS_LIMIT) {
   return Object.values(map)
     .filter((s) => s.winningAdsCount > 0)
-    .map((s) => ({ domain: s.domain, title: productTitleFor(s), product_score: computeProductScore(s), winning_ads: s.winningAdsCount, total_ads: s.totalAds, total_pages: s.pages.size, total_spend_usd: Number(s.totalSpendUsd.toFixed(1)) }))
-    .sort((a, b) => b.product_score - a.product_score || b.winning_ads - a.winning_ads || a.domain.localeCompare(b.domain))
+    .map((s) => ({ product_key: s.key, domain: s.domain, landing_url: s.landingUrl || s.topAdLandingUrl || null, category: s.topAdIndustry || null, title: productTitleFor(s), product_score: computeProductScore(s), winning_ads: s.winningAdsCount, total_ads: s.totalAds, total_pages: s.pages.size, total_spend_usd: Number(s.totalSpendUsd.toFixed(1)) }))
+    .sort((a, b) => b.product_score - a.product_score || b.winning_ads - a.winning_ads || a.product_key.localeCompare(b.product_key))
     .slice(0, limit)
     .map((w, i) => ({ date: dateStr, rank: i + 1, ...w }));
 }
@@ -1059,10 +1107,12 @@ async function flushProductsCollection(db, map) {
     const productScore = computeProductScore(s);
     return {
       updateOne: {
-        filter: { domain: s.domain },
+        filter: { product_key: s.key },
         update: {
           $set: {
             updated_at: Date.now(),
+            product_key: s.key,
+            domain: s.domain,
             total_spend_usd: Number(s.totalSpendUsd.toFixed(1)),
             total_ads: s.totalAds,
             total_pages: pages,
@@ -1071,7 +1121,7 @@ async function flushProductsCollection(db, map) {
             product_score: productScore,
             title: productTitleFor(s),
             top_ad_id: s.topAdId,
-            landing_url: s.topAdLandingUrl || null,
+            landing_url: s.landingUrl || s.topAdLandingUrl || null,
             category: s.topAdIndustry || null,
             publication_date: s.firstStartDate,
             active_ads: s.activeAds
@@ -1084,8 +1134,13 @@ async function flushProductsCollection(db, map) {
 
   if (bulk.length) {
     await col.bulkWrite(bulk);
-    console.log(`🔥 [DB Products] Đã tổng hợp ${bulk.length} sản phẩm/domain.`);
+    console.log(`🔥 [DB Products] Đã tổng hợp ${bulk.length} sản phẩm (gom theo landing URL).`);
   }
+  // Don doc cu gom theo domain (khong co product_key) — neu khong, bang
+  // search se hien ca dong domain cu lan dong product moi. Chi chay 1
+  // lan co tac dung (FULL dau tien sau deploy); cac FULL sau tra ve 0.
+  const legacy = await col.deleteMany({ product_key: { $exists: false } });
+  if (legacy.deletedCount) console.log(`🧹 [DB Products] Đã xóa ${legacy.deletedCount} doc cũ gom theo domain.`);
 }
 
 async function updateProductsCollection(db, analyzedAds) {
@@ -1402,4 +1457,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, normalizeLandingUrl, productKeyFor, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
