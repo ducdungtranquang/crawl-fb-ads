@@ -951,10 +951,45 @@ function mediaKeys(media) {
 // Ghi thêm dữ liệu cho trang product detail: title + landing + category lấy
 // từ ad có score cao nhất của domain, publication_date = start_date sớm
 // nhất, active_ads = số ad còn thấy trong 7 ngày.
+// Domain san TMDT / mang xa hoi / video — khong tinh la "san pham" de dua
+// len bang winning products. Gom theo domain thi ca san gom thanh 1 product
+// (vd shopee.vn gom hang trieu mat hang) va diem tong de be dan, nen bang
+// toan hien ten san thay vi san pham cu the. Muon them/bot: sua list nay.
+// Giu dong bo voi EXCLUDED_PRODUCT_DOMAINS trong searchApi.js (cung list).
+const EXCLUDED_PRODUCT_DOMAINS = [
+  // San TMDT
+  'shopee.vn', 'shopee.com', 'shopee.ph', 'shopee.sg', 'shopee.com.my', 'shopee.co.th', 'shopee.co.id', 'shopee.com.br', 'shopee.tw', 'shopee.com.mx', 'shopee.cl',
+  'lazada.vn', 'lazada.com', 'lazada.com.my', 'lazada.sg', 'lazada.co.th', 'lazada.co.id', 'lazada.ph',
+  'tiki.vn', 'sendo.vn',
+  'alibaba.com', 'aliexpress.com', 'aliexpress.us', '1688.com', 'taobao.com', 'tmall.com', 'jd.com', 'dhgate.com',
+  'amazon.com', 'amazon.ca', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.com.au', 'amazon.in', 'amazon.co.jp', 'amazon.com.mx', 'amazon.com.br',
+  'ebay.com', 'etsy.com', 'walmart.com',
+  // Mang xa hoi / nhan tin / video
+  'facebook.com', 'fb.com', 'instagram.com', 'tiktok.com', 'youtube.com', 'messenger.com', 'whatsapp.com', 'zalo.me', 'telegram.org', 'twitter.com', 'x.com', 'pinterest.com', 'linkedin.com', 'snapchat.com', 'threads.net',
+];
+// true neu domain la (hoac la subdomain cua) 1 domain trong blocklist.
+// Khong phan biet hoa thuong, bo 'www.' dau. 'notshopee.vn' hay
+// 'shopee.vn.fake.com' -> false (chi khop dung domain hoac '.domain').
+function isExcludedProductDomain(domain) {
+  if (!domain || typeof domain !== 'string') return false;
+  const d = domain.trim().toLowerCase().replace(/^www\./, '');
+  if (!d) return false;
+  for (const base of EXCLUDED_PRODUCT_DOMAINS) {
+    if (d === base || d.endsWith('.' + base)) return true;
+  }
+  return false;
+}
+// Regex dung cho query Mongo ($not): khop dung isExcludedProductDomain.
+function excludedProductDomainRegex() {
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp('(^|\\.)(' + EXCLUDED_PRODUCT_DOMAINS.map(esc).join('|') + ')$', 'i');
+}
+
 const PRODUCT_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 function accumulateProductStats(map, analyzedAds, nowMs = Date.now()) {
   for (const ad of analyzedAds) {
     if (!ad.domain) continue;
+    if (isExcludedProductDomain(ad.domain)) continue;
     let s = map[ad.domain];
     if (!s) s = map[ad.domain] = { domain: ad.domain, totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, totalSpendUsd: 0, activeAds: 0, firstStartDate: null, topAdScore: -Infinity, topAdHeadline: '', topAdText: '', topAdId: null, topAdLandingUrl: '', topAdIndustry: '' };
     s.totalAds++;
@@ -1367,4 +1402,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, dailyWinnersDateString, writeDailyWinnersSnapshot, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
