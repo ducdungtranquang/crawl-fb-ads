@@ -1771,8 +1771,8 @@ function initSearchServer(dbInstance) {
             const day = String(req.query.day || '').trim();
             if (day) {
                 if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return res.status(400).json({ success: false, message: 'day phai co dang YYYY-MM-DD.' });
-                const total = await winnersCol.countDocuments({ date: day });
-                const results = await winnersCol.find({ date: day }).sort({ rank: 1 }).skip(skip).limit(limit).toArray();
+                const total = await winnersCol.countDocuments({ date: day, domain: { $not: excludedProductDomainRegex() } });
+                const results = await winnersCol.find({ date: day, domain: { $not: excludedProductDomainRegex() } }).sort({ rank: 1 }).skip(skip).limit(limit).toArray();
                 return res.json({ success: true, mode: 'day', day, pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data: results });
             }
 
@@ -1783,7 +1783,7 @@ function initSearchServer(dbInstance) {
             const data = all.slice(skip, skip + limit).map((d) => ({ domain: d._id, title: d.title, days_won: d.days_won, total_product_score: Number(d.total_product_score.toFixed(1)), total_winning_ads: d.total_winning_ads, best_rank: d.best_rank, latest_score: d.latest_score }));
             // Top 1 mỗi ngày trong tháng (để FE vẽ "hàng win mỗi ngày").
             const { start, end } = monthRange(month);
-            const dailyTop = await winnersCol.find({ date: { $gte: start, $lt: end } }).sort({ date: 1, rank: 1 }).project({ date: 1, domain: 1, title: 1, product_score: 1, rank: 1 }).toArray();
+            const dailyTop = await winnersCol.find({ date: { $gte: start, $lt: end }, domain: { $not: excludedProductDomainRegex() } }).sort({ date: 1, rank: 1 }).project({ date: 1, domain: 1, title: 1, product_score: 1, rank: 1 }).toArray();
             const daily_top = {};
             for (const d of dailyTop) if (!daily_top[d.date]) daily_top[d.date] = { domain: d.domain, title: d.title, product_score: d.product_score };
             return res.json({ success: true, mode: 'month', month, pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data, daily_top });
@@ -1799,6 +1799,7 @@ function initSearchServer(dbInstance) {
         try {
             const { domain } = req.params;
             if (!domain) return res.status(400).json({ success: false, message: 'Domain is required.' });
+            if (isExcludedProductDomain(domain)) return res.status(404).json({ success: false, message: `Product not found.` });
 
             const productInfo = await productsCol.findOne({ domain: new RegExp(`^${escapeRegExp(String(domain).trim())}$`, 'i') });
             if (!productInfo) return res.status(404).json({ success: false, message: `Product not found.` });
@@ -1823,6 +1824,40 @@ function initSearchServer(dbInstance) {
     });
 }
 
+// Domain san TMDT / mang xa hoi / video — khong tinh la "san pham" de dua
+// len bang winning products. Gom theo domain thi ca san gom thanh 1 product
+// (vd shopee.vn gom hang trieu mat hang) va diem tong de be dan, nen bang
+// toan hien ten san thay vi san pham cu the. Muon them/bot: sua list nay.
+// Giu dong bo voi EXCLUDED_PRODUCT_DOMAINS trong searchApi.js (cung list).
+const EXCLUDED_PRODUCT_DOMAINS = [
+  // San TMDT
+  'shopee.vn', 'shopee.com', 'shopee.ph', 'shopee.sg', 'shopee.com.my', 'shopee.co.th', 'shopee.co.id', 'shopee.com.br', 'shopee.tw', 'shopee.com.mx', 'shopee.cl',
+  'lazada.vn', 'lazada.com', 'lazada.com.my', 'lazada.sg', 'lazada.co.th', 'lazada.co.id', 'lazada.ph',
+  'tiki.vn', 'sendo.vn',
+  'alibaba.com', 'aliexpress.com', 'aliexpress.us', '1688.com', 'taobao.com', 'tmall.com', 'jd.com', 'dhgate.com',
+  'amazon.com', 'amazon.ca', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.com.au', 'amazon.in', 'amazon.co.jp', 'amazon.com.mx', 'amazon.com.br',
+  'ebay.com', 'etsy.com', 'walmart.com',
+  // Mang xa hoi / nhan tin / video
+  'facebook.com', 'fb.com', 'instagram.com', 'tiktok.com', 'youtube.com', 'messenger.com', 'whatsapp.com', 'zalo.me', 'telegram.org', 'twitter.com', 'x.com', 'pinterest.com', 'linkedin.com', 'snapchat.com', 'threads.net',
+];
+// true neu domain la (hoac la subdomain cua) 1 domain trong blocklist.
+// Khong phan biet hoa thuong, bo 'www.' dau. 'notshopee.vn' hay
+// 'shopee.vn.fake.com' -> false (chi khop dung domain hoac '.domain').
+function isExcludedProductDomain(domain) {
+  if (!domain || typeof domain !== 'string') return false;
+  const d = domain.trim().toLowerCase().replace(/^www\./, '');
+  if (!d) return false;
+  for (const base of EXCLUDED_PRODUCT_DOMAINS) {
+    if (d === base || d.endsWith('.' + base)) return true;
+  }
+  return false;
+}
+// Regex dung cho query Mongo ($not): khop dung isExcludedProductDomain.
+function excludedProductDomainRegex() {
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp('(^|\\.)(' + EXCLUDED_PRODUCT_DOMAINS.map(esc).join('|') + ')$', 'i');
+}
+
 // Query cho /api/products/search: q khớp title hoặc domain (substring,
 // không phân biệt hoa thường); domain khớp chính xác; các min_* lọc số.
 // products chỉ ~50k doc nên regex substring ở đây chấp nhận được.
@@ -1837,6 +1872,8 @@ function buildProductsSearchQuery(params) {
     if (params.min_product_score) query.product_score = { $gte: parseInt(params.min_product_score, 10) };
     if (params.min_winning_ads) query.winning_ads = { $gte: parseInt(params.min_winning_ads, 10) };
     if (params.min_total_ads) query.total_ads = { $gte: parseInt(params.min_total_ads, 10) };
+    // Loai san TMDT / mang xa hoi khoi ket qua (xem EXCLUDED_PRODUCT_DOMAINS).
+    query.$and = [...(query.$and || []), { domain: { $not: excludedProductDomainRegex() } }];
     return query;
 }
 
@@ -1862,14 +1899,14 @@ function parseMonthParam(monthParam, nowMs = Date.now()) {
 function buildMonthlyWinnersPipeline(month) {
     const { start, end } = monthRange(month);
     return [
-        { $match: { date: { $gte: start, $lt: end } } },
+        { $match: { date: { $gte: start, $lt: end }, domain: { $not: excludedProductDomainRegex() } } },
         { $sort: { date: 1, rank: 1 } },
         { $group: { _id: '$domain', title: { $last: '$title' }, days_won: { $sum: 1 }, total_product_score: { $sum: '$product_score' }, total_winning_ads: { $sum: '$winning_ads' }, best_rank: { $min: '$rank' }, latest_score: { $last: '$product_score' } } },
         { $sort: { days_won: -1, total_product_score: -1 } },
     ];
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
