@@ -63,19 +63,23 @@ const INDEXES = [
   // creative_rank) de preset don le khong cham lai, them industry +
   // countries_lower + sort field cua preset/FE (start_date) de dem/loc/
   // sort deu doc duoc tu index. Thay the 3 index cu (drop tay tren DB).
-  { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1 }, name: 'idx_new_ad_rep_combo' },
-  { key: { 'filter_signals.is_ready_to_scale': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1, scaling_score: -1 }, name: 'idx_scale_rep_combo' },
-  { key: { 'filter_signals.is_weekly_winner': 1, is_group_rep: 1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1, trending_score: -1 }, name: 'idx_winner_rep_combo' },
+  // 08/11/2026 (PR #20): dieu kien tuoi last_seen>=now-30d lam dem bi FETCH
+  // (new_ads/VN/OTHER/beauty timeout) vi last_seen khong co trong index.
+  // Chen last_seen ngay sau is_group_rep (truoc cac key sort/loc) de dem
+  // lai la COUNT_SCAN: equality prefix + range last_seen, khong FETCH doc.
+  { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, last_seen: -1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1 }, name: 'idx_new_ad_rep_combo' },
+  { key: { 'filter_signals.is_ready_to_scale': 1, is_group_rep: 1, last_seen: -1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1, scaling_score: -1 }, name: 'idx_scale_rep_combo' },
+  { key: { 'filter_signals.is_weekly_winner': 1, is_group_rep: 1, last_seen: -1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1, trending_score: -1 }, name: 'idx_winner_rep_combo' },
   // Index dem/tim cham 05/11: filter + is_group_rep + sort — khong co
   // is_group_rep o giua, Mongo phai FETCH toan bo doc cua filter de loc
   // dai dien (nganh Khac 145k doc -> dem khong xong).
-  { key: { industry: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_industry_rep_start' },
-  { key: { estimated_spend: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_spend_tier_rep_start' },
-  { key: { scaling_level: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_scaling_rep_start' },
+  { key: { industry: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_industry_rep_start' },
+  { key: { estimated_spend: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_spend_tier_rep_start' },
+  { key: { scaling_level: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_scaling_rep_start' },
   { key: { scaling_score: -1, is_group_rep: 1, start_date: -1 }, name: 'idx_scaling_score_rep_start' },
   { key: { domain_lower: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_domain_rep_start' },
   { key: { page_name_lower: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_page_rep_start' },
-  { key: { countries_lower: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_countries_rep_start' },
+  { key: { countries_lower: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_countries_rep_start' },
   { key: { last_seen: -1 }, name: 'idx_last_seen' },
   { key: { duration_days: 1 }, name: 'idx_duration_days' },
   { key: { estimated_spend_usd: -1 }, name: 'spend_usd_sort' },
