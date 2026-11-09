@@ -1047,6 +1047,31 @@ async function countSimilarTotal(col, unionQuery, maxTimeMS) {
     }
 }
 
+// ===== VIDEO PHASE 1 (redirect 302) =====
+// Chon URL video tot nhat cua ad: hd truoc, sd sau, roi video_url top-level.
+// Tra '' neu ad khong co video.
+function pickVideoUrl(ad, quality) {
+    if (!ad) return '';
+    const vids = Array.isArray(ad.videos) ? ad.videos : [];
+    const first = vids[0] || {};
+    const q = String(quality || 'hd').toLowerCase();
+    if (q === 'sd') return first.video_sd_url || first.video_hd_url || ad.video_url || '';
+    return first.video_hd_url || first.video_sd_url || ad.video_url || '';
+}
+
+// oe la Unix timestamp dang hex trong query (?oe=6AF61DB2). Tra true neu
+// oe co va con han so voi nowSec; khong co oe (URL khong het han theo
+// kieu fbcdn) thi coi nhu het han de redirect ve Ad Library cho an toan.
+function videoUrlFresh(url, nowSec) {
+    if (!url) return false;
+    let oe = null;
+    try {
+        const m = String(url).match(/[?&]oe=([0-9A-Fa-f]+)/);
+        if (m) oe = parseInt(m[1], 16);
+    } catch (_) { /* bo qua */ }
+    return !!(oe && oe > nowSec);
+}
+
 function buildSimilarTiers(sourceAd, adId, nowMs = Date.now()) {
     const base = { ad_archive_id: { $ne: adId } };
     const dupText = similarDupTextOf(sourceAd);
@@ -1065,7 +1090,10 @@ function buildSimilarTiers(sourceAd, adId, nowMs = Date.now()) {
     if (sourceAd.domain) tiers.push({ ...base, domain: sourceAd.domain, ...noDup, ...repOnly, ...noOwnGroup, ...freshOnly });
     if (sourceAd.page_name) tiers.push({ ...base, page_name: sourceAd.page_name, ...noDup, ...repOnly, ...noOwnGroup, ...freshOnly });
     if (sourceAd.industry) tiers.push({ ...base, industry: sourceAd.industry, ...noDup, ...repOnly, ...noOwnGroup, ...freshOnly });
-    tiers.push({ ...base, ...noDup, ...repOnly, ...noOwnGroup, ...freshOnly });
+    // KHONG co tang global (moi ad tuoi): tang do khop moi ad tuoi nen
+    // total dem $or = ca database (~254k) va list hien ad khong lien quan.
+    // Similar chi gom domain/page/industry; het 3 tang thi list ngan lai
+    // (total chinh xac), khong lap day bang ad ngau nhien.
     return tiers;
 }
 
@@ -1650,6 +1678,33 @@ function initSearchServer(dbInstance) {
     });
 
     /**
+     * 🟢 API: VIDEO (Phase 1 — redirect 302)
+     * Phát video qua link fbcdn đã lưu nếu token `oe` còn hạn, hết hạn thì
+     * chuyển về trang Ad Library. Không chạm Meta từ server, chỉ redirect
+     * nên không ảnh hưởng bot crawl. FE dùng làm <video src=".../video">.
+     * Chỉ phát được ad mới crawl gần đây (oe thường hết hạn trong giờ);
+     * ad cũ tự về Ad Library (giữ hành vi hiện tại). ?quality=hd|sd.
+     */
+    app.get('/api/ads/:id/video', async (req, res) => {
+        try {
+            const adId = req.params.id;
+            if (!adId) return res.status(400).json({ success: false, message: 'Missing ad archive id parameters.' });
+            const ad = await findAdById(adId);
+            const libUrl = (ad && ad.ad_library_url) || `https://www.facebook.com/ads/library/?id=${adId}`;
+            if (!ad) return res.redirect(302, libUrl);
+            const url = pickVideoUrl(ad, req.query.quality);
+            if (!url) return res.redirect(302, libUrl);
+            // oe la Unix timestamp dang hex trong query (?oe=6AF61DB2).
+            // Con han -> redirect toi fbcdn; het han -> Ad Library.
+            const nowSec = Math.floor(Date.now() / 1000);
+            if (videoUrlFresh(url, nowSec)) return res.redirect(302, url);
+            return res.redirect(302, libUrl);
+        } catch (error) {
+            return res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
+        }
+    });
+
+    /**
      * 🟢 API 3: QUẢNG CÁO TƯƠNG TỰ (SIMILAR ADS) - Tính năng Minea
      * Tìm các quảng cáo chung Domain hoặc chung Page để gợi ý, loại
      * ad có cùng normalized_text với ad gốc (duplicate).
@@ -1922,7 +1977,7 @@ function buildMonthlyWinnersPipeline(month) {
     ];
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry

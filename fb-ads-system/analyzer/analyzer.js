@@ -1356,6 +1356,7 @@ async function main() {
         { key: { domain_lower: 1, is_group_rep: 1, start_date: -1 }, name: "idx_domain_rep_start" },
         { key: { page_name_lower: 1, is_group_rep: 1, start_date: -1 }, name: "idx_page_rep_start" },
         { key: { countries_lower: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: "idx_countries_rep_start" },
+        { key: { is_group_rep: 1, last_seen: -1, countries_lower: 1, start_date: -1 }, name: "idx_other_rep_start" },
         // 2 index dem/sort khi dedupe bat (truoc day chi co trong
         // create-indexes.js, analyzer FULL khong tu tao).
         { key: { is_group_rep: 1, estimated_spend_usd: 1 }, name: "idx_group_rep_spend" },
