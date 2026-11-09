@@ -37,7 +37,7 @@ const STORAGE_PATH = path.join(__dirname, '..', '..', 'storage', 'images');
 
 const SEEN_THRESHOLD = 10 * 60 * 1000;
 const DETAIL_HISTORY_LIMIT = 200;
-const MAX_ADS_PER_KEYWORD = parseInt(process.env.MAX_ADS_PER_KEYWORD || '1400', 10);
+const MAX_ADS_PER_KEYWORD = parseInt(process.env.MAX_ADS_PER_KEYWORD || '700', 10);
 const MAX_SCROLLS_PER_KEYWORD = parseInt(process.env.MAX_SCROLLS_PER_KEYWORD || '60', 10);
 const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10);
 const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10);
@@ -174,6 +174,32 @@ async function downloadThumbnail(page, imageUrl, adId) {
     }
 }
 
+// Danh sach URL anh ung vien cho thumbnail, theo thu tu uu tien:
+// het anh (images) truoc, roi den anh preview cua video (video_preview_image_url).
+// Ad video-only (khong co images) truoc day bi thumbnail null vi chi lay images[0].
+function thumbnailCandidatesForAd(ad) {
+    const out = [];
+    const push = (u) => { if (u && typeof u === 'string' && !out.includes(u)) out.push(u); };
+    for (const img of Array.isArray(ad?.images) ? ad.images : []) {
+        push(img?.original_image_url || img?.url || (typeof img === 'string' ? img : null));
+    }
+    for (const v of Array.isArray(ad?.videos) ? ad.videos : []) {
+        push(v?.video_preview_image_url || v?.video_preview_url || null);
+    }
+    return out;
+}
+
+// Thu tung URL ung vien cho den khi co thumbnail (R2 hoac local).
+// Chi can 1 URL het han / timeout thi thu URL ke tiep, khong bo cuoc ngay.
+async function downloadThumbnailForAd(page, ad, adId) {
+    const candidates = thumbnailCandidatesForAd(ad);
+    for (const url of candidates) {
+        const thumb = await downloadThumbnail(page, url, adId);
+        if (thumb && (thumb.r2 || thumb.local)) return thumb;
+    }
+    return { local: null, r2: null };
+}
+
 async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyData = null) {
     const col = db.collection('ads');
     const now = Date.now();
@@ -183,9 +209,9 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
     let detailEntry = buildDetailEntry({ ...ad, domain }, keyword, transparencyData);
 
     if (!existing) {
-        const firstImage = ad.images && ad.images.length > 0 ? ad.images[0] : null;
         // [R2-THUMBNAIL] 3/4: thumb = { local, r2 } — ưu tiên URL R2, fallback file local.
-        const thumb = firstImage ? await downloadThumbnail(page, firstImage.original_image_url || firstImage.url, ad.ad_archive_id) : { local: null, r2: null };
+        // Thu het anh roi den preview video, thu tung URL cho den khi co thumb.
+        const thumb = await downloadThumbnailForAd(page, ad, ad.ad_archive_id);
 
         const newAdDoc = {
             ...ad,
@@ -230,6 +256,17 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
             historyToKeep.push(detailEntry);
         }
 
+        // [R2-THUMBNAIL] Ad cu thieu thumbnail (lan crawl dau URL het han /
+        // la ad video-only truoc khi co fallback preview) thi thu lay lai o
+        // lan crawl nay — khong de thieu vinh vien.
+        let thumbUpdate = {};
+        if (!existing.thumbnail_r2 && !existing.thumbnail_local) {
+            const thumb = await downloadThumbnailForAd(page, ad, ad.ad_archive_id);
+            if (thumb && (thumb.r2 || thumb.local)) {
+                thumbUpdate = { thumbnail_r2: thumb.r2, thumbnail_local: thumb.local };
+            }
+        }
+
         await col.updateOne(
             { ad_archive_id: ad.ad_archive_id },
             {
@@ -238,6 +275,7 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
                     seen_count: newCount,
                     collation_count: ad.collation_count || 1,
                     detail_history: historyToKeep.slice(-DETAIL_HISTORY_LIMIT),
+                    ...thumbUpdate,
                     ...(transparencyData ? { last_detail_seen_at: now } : {})
                 },
                 $addToSet: keyword ? { keyword_mentions: keyword } : {}
@@ -499,58 +537,100 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
     let context = await createBrowserContext(isDocker);
 
     const keywords = [
-        // Khoảng 150 CỤM 1 TỪ
-        'áo', 'quần', 'váy', 'đầm', 'giày', 'dép', 'mũ', 'nón', 'ví', 'túi', 
-        'balo', 'son', 'phấn', 'kem', 'da', 'mụn', 'nám', 'sẹo', 'tóc', 'môi', 
-        'mắt', 'mũi', 'trà', 'sữa', 'nước', 'bia', 'rượu', 'thịt', 'cá', 'rau', 
-        'cơm', 'bún', 'phở', 'bánh', 'kẹo', 'cam', 'táo', 'bàn', 'ghế', 'giường', 
-        'tủ', 'kệ', 'nệm', 'chăn', 'ga', 'gối', 'rèm', 'thảm', 'nồi', 'chảo', 
-        'bát', 'đũa', 'cốc', 'ly', 'dao', 'kéo', 'quạt', 'đèn', 'bếp', 'máy', 
-        'khoan', 'búa', 'vít', 'đinh', 'thép', 'sắt', 'nhôm', 'kính', 'gỗ', 'nhựa', 
-        'đá', 'gạch', 'xe', 'phanh', 'lốp', 'dầu', 'nhớt', 'gương', 'còi', 'khóa', 
-        'bạt', 'đất', 'nền', 'nhà', 'phố', 'xưởng', 'kho', 'vườn', 'hồ', 'sông', 
-        'biển', 'cát', 'sỏi', 'chó', 'mèo', 'gà', 'lợn', 'bò', 'chim', 'tôm', 
-        'cua', 'ốc', 'vàng', 'bạc', 'đồng', 'len', 'lụa', 'bông', 'vải', 'sợi', 
-        'chỉ', 'xốp', 'giấy', 'bìa', 'mực', 'rẻ', 'đẹp', 'bền', 'tốt', 'xịn', 
-        'mới', 'cũ', 'sang', 'hot', 'hit', 'trend', 'sale', 'sốc', 'giảm', 'giá', 
-        'free', 'ship', 'sỉ', 'lẻ', 'vay', 'app', 'web', 'game', 'sim', 'thẻ', 
-        'thuốc', 'lan', 'chậu', 'phân', 'giống', 'hoa', 'sách', 'bút',
-
-        // Khoảng 125 CỤM NHIỀU TỪ
-        'miễn phí vận chuyển', 'giảm giá sốc', 'xả kho', 'thanh lý', 'mua một tặng một', 
-        'nhận hàng thanh toán', 'kiểm tra hàng', 'freeship toàn quốc', 'bảo hành chính hãng', 
-        'hoàn tiền', 'cam kết chất lượng', 'siêu sale', 'giờ vàng', 'thực phẩm chức năng', 
-        'kem chống nắng', 'sữa rửa mặt', 'trị mụn tận gốc', 'trắng da tự nhiên', 'rụng tóc', 
-        'hói đầu', 'giảm cân an toàn', 'trà thảo mộc', 'đông y', 'thuốc nam', 'collagen', 
-        'tẩy tế bào chết', 'serum dưỡng da', 'bất động sản', 'nhà đất', 'chung cư', 'biệt thự', 
-        'liền kề', 'đất nền', 'cho thuê phòng', 'mặt bằng kinh doanh', 'thiết kế nội thất', 
-        'thi công trọn gói', 'sửa chữa nhà', 'chống thấm', 'trần thạch cao', 'sơn nước', 
-        'thời trang nữ', 'thời trang nam', 'đồ trẻ em', 'mẹ và bé', 'quần áo sơ sinh', 
-        'bỉm sữa', 'đồ chơi thông minh', 'xe đẩy trẻ em', 'thời trang công sở', 'đầm dự tiệc', 
-        'áo thun nam', 'quần jean', 'đồ lót', 'đồ ngủ', 'đồ gia dụng', 'thiết bị thông minh', 
-        'robot lau nhà', 'nồi chiên không dầu', 'máy lọc nước', 'máy lạnh', 'tủ lạnh', 'tivi', 
-        'máy giặt', 'bếp từ', 'máy xay sinh tố', 'chảo chống dính', 'đèn năng lượng mặt trời', 
-        'xuất khẩu lao động', 'du học', 'định cư', 'visa', 'tour du lịch', 'vé máy bay', 
-        'phòng khách sạn', 'homestay', 'resort', 'nhà hàng', 'tiệc cưới', 'sinh nhật', 
-        'hội nghị', 'team building', 'hải sản tươi sống', 'vay tiền nhanh', 'tín dụng', 
-        'mở thẻ', 'chứng khoán', 'đầu tư', 'học tiếng anh', 'giao tiếp', 'luyện thi ielts', 
-        'gia sư', 'khóa học online', 'marketing', 'lập trình', 'thiết kế đồ họa', 'content', 
-        'chạy ads', 'nha khoa', 'niềng răng', 'bọc răng sứ', 'nhổ răng khôn', 'tẩy trắng răng', 
-        'thẩm mỹ viện', 'cắt mí', 'nâng mũi', 'phun xăm', 'trị sẹo', 'gội đầu dưỡng sinh', 
-        'massage', 'spa làm đẹp', 'tiêm filler', 'botox', 'camera hành trình', 'phụ kiện ô tô', 
-        'đồ chơi xe hơi', 'màn hình android', 'dán phim cách nhiệt', 'bọc ghế da', 'phủ ceramic', 
-        'rửa xe', 'sửa chữa ô tô', 'bảo dưỡng xe', 'cứu hộ giao thông', 'phong thủy', 
-        'vòng trầm hương', 'tỳ hưu', 'sim số đẹp', 'sim phong thủy', 'tài lộc', 'may mắn', 
-        'bình an', 'tử vi', 'bói toán', 'xem ngày tốt', 'quà tặng doanh nghiệp', 'kỷ niệm chương',
-
-        // Thêm từ khóa mới (02/11/2026) — giữ nguyên toàn bộ từ khóa cũ phía trên
-        'mỹ phẩm', 'nước hoa', 'dầu gội', 'sữa tắm', 'đồng hồ', 'túi xách',
-        'dây chuyền', 'nhẫn', 'bông tai', 'sneaker', 'áo khoác', 'đồ bộ',
-        'kính mắt', 'khẩu trang', 'cà phê', 'trà sữa', 'yến sào', 'mật ong',
-        'đông trùng hạ thảo', 'tai nghe', 'ốp lưng', 'sạc dự phòng', 'máy hút bụi', 'nồi cơm điện',
-        'máy sấy tóc', 'tủ quần áo', 'đèn ngủ', 'sữa bột', 'xe đạp', 'xe máy',
-        'mã giảm giá', 'trả góp', 'tuyển sỉ', 'cộng tác viên', 'làm nail', 'triệt lông', 'thêm', 'hủy',
-        'nguy', 'xóa', 'ôi', 'đừng', 'không', 'cấm', 'bị', 'lừa', 'giả', 'fake'
+        // --- Gia dung & Nha cua ---
+        'nhà bếp', 'đồ nấu ăn', 'máy xay sinh tố', 'nồi chiên không dầu', 'máy pha cà phê',
+        'ấm siêu tốc', 'máy hút bụi', 'robot hút bụi', 'máy lọc không khí', 'máy tạo ẩm',
+        'quạt', 'máy sưởi', 'đèn', 'đèn led', 'nội thất',
+        'sofa', 'ghế', 'bàn', 'giường', 'nệm',
+        'chăn ga gối', 'rèm cửa', 'hộp đựng đồ', 'khay đựng', 'dụng cụ vệ sinh',
+        'cây lau nhà', 'chổi', 'nước giặt', 'khuôn làm bánh', 'thớt',
+        'bộ dao', 'nồi', 'chảo', 'bình nước', 'bình giữ nhiệt',
+        'hộp cơm', 'hộp đựng thức ăn', 'đồ dùng nhà bếp', 'đồ gia dụng', 'gia dụng',
+        'nhà thông minh', 'khóa cửa', 'camera an ninh', 'chuông cửa', 'vòi sen',
+        'vòi nước', 'phòng tắm', 'gương', 'thảm', 'thảm trải sàn',
+        'đồ trang trí', 'tranh treo tường', 'chậu cây', 'vườn', 'dụng cụ',
+        'máy khoan', 'hộp dụng cụ', 'thang', 'ổ cắm điện', 'pin',
+        'cục sạc', 'dây cáp',
+        // --- Da nang & Tien ich ---
+        'đa năng', 'đa công dụng', 'tất cả trong một', 'gấp gọn', 'cầm tay',
+        'di động', 'điều chỉnh được', 'tái sử dụng', 'chống nước', 'không dây',
+        'sạc lại được', 'nhỏ gọn', 'mini', 'đồ tiện ích', 'giá đỡ',
+        'chân đế', 'giá treo', 'ốp lưng', '2 trong 1', '3 trong 1',
+        'du lịch', 'ngoài trời',
+        // --- Hat giong & Lam vuon ---
+        'hạt giống', 'hạt giống cây trồng', 'hạt giống rau', 'hạt giống hoa', 'hạt giống thảo mộc',
+        'hạt giống trái cây', 'hạt giống làm vườn', 'hạt giống hữu cơ', 'hạt giống thuần chủng', 'trồng cây',
+        'làm vườn', 'chậu trồng cây', 'đất trồng', 'phân bón', 'nhà kính',
+        'thủy canh', 'mầm', 'bộ trồng cây', 'cây bonsai', 'sen đá',
+        'cây trong nhà',
+        // --- My pham & Lam dep ---
+        'mỹ phẩm', 'trang điểm', 'chăm sóc da', 'serum', 'kem dưỡng ẩm',
+        'kem chống nắng', 'son môi', 'mascara', 'kẻ mắt', 'kem nền',
+        'kem che khuyết điểm', 'phấn má', 'phấn mắt', 'sơn móng tay', 'nước hoa',
+        'hương thơm', 'dầu gội', 'dầu xả', 'chăm sóc tóc', 'dầu dưỡng tóc',
+        'ủ tóc', 'râu', 'cạo râu', 'dao cạo', 'làm trắng răng',
+        'kem đánh răng', 'làm trắng', 'chống lão hóa', 'collagen', 'vitamin c',
+        'retinol', 'mặt nạ', 'sữa rửa mặt', 'toner', 'sữa dưỡng thể',
+        'sữa tắm', 'xà phòng', 'lăn khử mùi', 'làm đẹp', 'làm nail',
+        'nối mi', 'lông mày', 'son bóng', 'máy sấy tóc', 'máy duỗi tóc',
+        'máy uốn tóc', 'tinh dầu',
+        // --- Mua sam & Khuyen mai ---
+        'mua ngay', 'miễn phí vận chuyển', 'freeship', 'giảm giá', 'sale',
+        'khuyến mãi', 'xả kho', 'flash sale', 'bán chạy nhất', 'hàng mới về',
+        'quà tặng', 'ý tưởng quà tặng', 'combo', 'deal', 'ưu đãi',
+        'mã giảm giá', 'giá rẻ', 'đặt hàng ngay', 'giới hạn thời gian', 'độc quyền',
+        'cao cấp', 'đang hot', 'xu hướng', 'viral', 'phải có',
+        'đánh giá cao', 'hoàn tiền', 'mua 1 tặng 1', 'combo ưu đãi', 'hàng về lại',
+        'giảm 50%', 'ưu đãi đặc biệt',
+        // --- Dien tu ---
+        'điện thoại', 'tai nghe', 'tai nghe không dây', 'loa', 'đồng hồ thông minh',
+        'đồng hồ', 'máy tính bảng', 'laptop', 'máy ảnh', 'flycam',
+        'máy chiếu', 'sạc dự phòng', 'bàn phím', 'chuột máy tính', 'màn hình',
+        'tivi', 'loa thanh', 'bluetooth', 'micro',
+        'webcam', 'máy in', 'router', 'wifi', 'tivi thông minh',
+        // --- Thoi trang ---
+        'quần áo', 'giày', 'giày sneaker', 'dép sandal', 'giày boot',
+        'váy', 'đầm', 'áo sơ mi', 'quần', 'quần jean',
+        'áo khoác', 'áo hoodie', 'áo thun', 'đồ lót', 'tất',
+        'mũ', 'mũ lưỡi trai', 'khăn quàng', 'găng tay', 'thắt lưng',
+        'ví', 'túi xách', 'balo', 'vali', 'kính râm',
+        'trang sức', 'dây chuyền', 'nhẫn', 'bông tai', 'vòng tay',
+        'thời trang đường phố', 'thời trang thiết kế', 'đồ thể thao', 'quần legging', 'đồ bơi',
+        'đồ ngủ', 'dép đi trong nhà', 'giày cao gót',
+        // --- Suc khoe & The hinh ---
+        'thực phẩm chức năng', 'vitamin', 'protein', 'men vi sinh', 'dầu cá',
+        'omega', 'magie', 'kẽm', 'thảo dược', 'trà',
+        'mật ong', 'thải độc', 'giảm cân', 'ăn kiêng', 'keto',
+        'thuần chay', 'hữu cơ', 'tốt cho sức khỏe', 'thể hình', 'phòng gym',
+        'yoga', 'tạ tay', 'dây kháng lực', 'máy chạy bộ', 'tập thể dục',
+        'massage', 'tư thế', 'chỉnh hình', 'giảm đau', 'giấc ngủ',
+        'gối', 'chăn', 'thảm yoga', 'súng massage', 'đai chỉnh tư thế',
+        'máy lọc nước',
+        // --- Me & Be ---
+        'em bé', 'quần áo trẻ em', 'đồ chơi trẻ em', 'bỉm', 'xe đẩy',
+        'bình sữa', 'đồ bầu', 'trẻ em', 'đồ ăn dặm', 'chăm sóc bé',
+        'giày trẻ em', 'cặp sách', 'máy theo dõi bé', 'cũi', 'địu em bé',
+        // --- Thu cung ---
+        'thú cưng', 'chó', 'mèo', 'thức ăn cho chó', 'thức ăn cho mèo',
+        'đồ chơi thú cưng', 'chăm sóc thú cưng', 'dây dắt chó', 'vòng cổ thú cưng', 'cát vệ sinh mèo',
+        'chim', 'cá', 'giường thú cưng', 'sữa tắm thú cưng', 'bánh thưởng thú cưng',
+        'bể cá',
+        // --- Thuc pham ---
+        'đồ ăn vặt', 'cà phê', 'sô cô la', 'gia vị', 'nước sốt',
+        'mì', 'gạo', 'trái cây sấy', 'các loại hạt', 'kẹo',
+        'đồ uống', 'nước ép', 'nước tăng lực', 'thanh protein', 'granola',
+        'yến mạch', 'bơ đậu phộng', 'dầu oliu', 'dầu dừa', 'làm bánh',
+        'thực phẩm hữu cơ', 'thực phẩm lành mạnh', 'không gluten',
+        // --- Xe co ---
+        'phụ kiện ô tô', 'camera hành trình', 'rửa xe', 'ghế ô tô', 'lốp xe',
+        'chăm sóc xe', 'xe máy', 'xe đạp', 'mũ bảo hiểm', 'đạp xe',
+        'sạc ô tô', 'giá đỡ điện thoại trên xe', 'bọc ghế xe', 'thảm lót sàn xe', 'sáp đánh bóng xe',
+        // --- The thao & Ngoai troi ---
+        'thể thao', 'chạy bộ', 'leo núi', 'cắm trại', 'câu cá',
+        'bơi lội', 'quần vợt', 'golf', 'bóng rổ', 'bóng đá',
+        'ván trượt', 'lướt sóng', 'trượt tuyết', 'tập luyện', 'thiết bị tập gym',
+        'lều', 'túi ngủ', 'áo mưa', 'ô', 'thùng giữ lạnh',
+        'dã ngoại', 'nướng bbq', 'bếp nướng',
     ];
 
     let keywordRetries = 0;
