@@ -169,6 +169,32 @@ async function downloadThumbnail(page, imageUrl, adId) {
     }
 }
 
+// Danh sach URL anh ung vien cho thumbnail, theo thu tu uu tien:
+// het anh (images) truoc, roi den anh preview cua video (video_preview_image_url).
+// Ad video-only (khong co images) truoc day bi thumbnail null vi chi lay images[0].
+function thumbnailCandidatesForAd(ad) {
+    const out = [];
+    const push = (u) => { if (u && typeof u === 'string' && !out.includes(u)) out.push(u); };
+    for (const img of Array.isArray(ad?.images) ? ad.images : []) {
+        push(img?.original_image_url || img?.url || (typeof img === 'string' ? img : null));
+    }
+    for (const v of Array.isArray(ad?.videos) ? ad.videos : []) {
+        push(v?.video_preview_image_url || v?.video_preview_url || null);
+    }
+    return out;
+}
+
+// Thu tung URL ung vien cho den khi co thumbnail (R2 hoac local).
+// Chi can 1 URL het han / timeout thi thu URL ke tiep, khong bo cuoc ngay.
+async function downloadThumbnailForAd(page, ad, adId) {
+    const candidates = thumbnailCandidatesForAd(ad);
+    for (const url of candidates) {
+        const thumb = await downloadThumbnail(page, url, adId);
+        if (thumb && (thumb.r2 || thumb.local)) return thumb;
+    }
+    return { local: null, r2: null };
+}
+
 async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyData = null) {
     const col = db.collection('ads');
     const now = Date.now();
@@ -178,9 +204,9 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
     let detailEntry = buildDetailEntry({ ...ad, domain }, keyword, transparencyData);
 
     if (!existing) {
-        const firstImage = ad.images && ad.images.length > 0 ? ad.images[0] : null;
         // [R2-THUMBNAIL] 3/4: thumb = { local, r2 } — ưu tiên URL R2, fallback file local.
-        const thumb = firstImage ? await downloadThumbnail(page, firstImage.original_image_url || firstImage.url, ad.ad_archive_id) : { local: null, r2: null };
+        // Thu het anh roi den preview video, thu tung URL cho den khi co thumb.
+        const thumb = await downloadThumbnailForAd(page, ad, ad.ad_archive_id);
 
         const newAdDoc = {
             ...ad,
@@ -225,6 +251,17 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
             historyToKeep.push(detailEntry);
         }
 
+        // [R2-THUMBNAIL] Ad cu thieu thumbnail (lan crawl dau URL het han /
+        // la ad video-only truoc khi co fallback preview) thi thu lay lai o
+        // lan crawl nay — khong de thieu vinh vien.
+        let thumbUpdate = {};
+        if (!existing.thumbnail_r2 && !existing.thumbnail_local) {
+            const thumb = await downloadThumbnailForAd(page, ad, ad.ad_archive_id);
+            if (thumb && (thumb.r2 || thumb.local)) {
+                thumbUpdate = { thumbnail_r2: thumb.r2, thumbnail_local: thumb.local };
+            }
+        }
+
         await col.updateOne(
             { ad_archive_id: ad.ad_archive_id },
             {
@@ -233,6 +270,7 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
                     seen_count: newCount,
                     collation_count: ad.collation_count || 1,
                     detail_history: historyToKeep.slice(-DETAIL_HISTORY_LIMIT),
+                    ...thumbUpdate,
                     ...(transparencyData ? { last_detail_seen_at: now } : {})
                 },
                 $addToSet: keyword ? { keyword_mentions: keyword } : {}
