@@ -80,6 +80,10 @@ const INDEXES = [
   { key: { domain_lower: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_domain_rep_start' },
   { key: { page_name_lower: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_page_rep_start' },
   { key: { countries_lower: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_countries_rep_start' },
+  // OTHER ($ne 'vn'): countries_lower dung $ne nen khong dung duoc prefix
+  // cua idx_countries_rep_start; can equality is_group_rep + range
+  // last_seen dung truoc, countries_lower kiem tra tu index (COUNT_SCAN).
+  { key: { is_group_rep: 1, last_seen: -1, countries_lower: 1, start_date: -1 }, name: 'idx_other_rep_start' },
   { key: { last_seen: -1 }, name: 'idx_last_seen' },
   { key: { duration_days: 1 }, name: 'idx_duration_days' },
   { key: { estimated_spend_usd: -1 }, name: 'spend_usd_sort' },
@@ -114,12 +118,13 @@ const INDEXES = [
   // đường chính nay là *_lower ở trên).
   { key: { page_name: 1, start_date: -1 }, name: 'idx_page_start_date' },
   { key: { domain: 1, start_date: -1 }, name: 'idx_domain_start_date' },
-  // Lọc country: equality trên countries_lower (đường nhanh) + các
-  // field gốc cho fallback khi doc chưa migrate.
+  // Lọc country: equality trên countries_lower (đường nhanh).
+  // Da xoa idx_country + idx_country_mentions_lower_start_date (chi phuc
+  // vu fallback khi doc chua migrate — DB da migrate, schema_fallback
+  // toan false): giai phong 2 slot tran 64 cho idx_other_rep_start va
+  // idx_product_key_score.
   { key: { countries_lower: 1, start_date: -1 }, name: 'idx_countries_lower_start_date' },
   { key: { countries_lower: 1, score: -1 }, name: 'idx_countries_lower_score' },
-  { key: { country_mentions: 1 }, name: 'idx_country' },
-  { key: { country_mentions_lower: 1, start_date: -1 }, name: 'idx_country_mentions_lower_start_date' },
   { key: { latest_detail_country_lower: 1, start_date: -1 }, name: 'idx_latest_country_lower_start_date' },
   // Lọc ngành nghề.
   { key: { industry: 1, start_date: -1 }, name: 'idx_industry_start_date' },
