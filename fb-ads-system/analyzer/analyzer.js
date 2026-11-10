@@ -1521,7 +1521,7 @@ async function main() {
     logMemory(`[Scanner] Pass 1 xong — unique texts (hash): ${maps.textKeys}, pages: ${Object.keys(maps.pageMap).length}, domains: ${Object.keys(maps.domainMap).length}`);
 
     // PASS 2: xử lý theo batch, dùng map toàn cục của pass 1
-    const BATCH_SIZE = 500; // hạ xuống 200 nếu RAM vẫn căng (doc nặng)
+    const BATCH_SIZE = 750; // tang tu 500 len 750 (11/11: chay nhanh hon); ha xuong 200 neu RAM van cang (doc nang)
     let batch = [];
     let totalProcessed = 0;
     const productStats = {};
