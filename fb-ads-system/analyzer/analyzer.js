@@ -1024,6 +1024,24 @@ const NON_PRODUCT_PATTERNS = [
   /đầu tư|chứng khoán|forex|tiền ảo|bitcoin|vay tiền|cho vay|tín dụng|bảo hiểm|kiếm tiền|làm giàu|thu nhập thụ động/i,
   /invest(ment)?|trading|forex|crypto|bitcoin|stock market|loan|credit|insurance|make money|passive income|earn money|get rich/i,
 ];
+// --- Tin hieu MUA (loc TICH CUC: chi lay product that) ---
+// Cum tu chi ro ad la quang cao BAN HANG (co y dinh mua): Buy, Sale, Mua,
+// Dat hang, Them vao gio, Giam gia, Freeship... — Viet + Anh. Phim, khoa
+// hoc, game, app thuong KHONG co cum tu nay (no noi "xem ngay", "hoc ngay",
+// "choi ngay", "tai app"). Dung kem loc loai tru: ad phai VUOT ca 2 (khong
+// phai non-product VA co tin hieu mua) moi duoc tinh la product.
+const BUY_SIGNAL_PATTERNS = [
+  /mua ngay|mua hàng|đặt hàng|đặt mua|mua 1 tặng 1|mua 1 được 1|giỏ hàng|thêm vào giỏ|thanh toán|giảm giá|khuyến mãi|freeship|miễn phí vận chuyển|giao hàng|giao nhanh|ship cod|\bcod\b|chỉ còn|số lượng có hạn|ưu đãi|giá chỉ|giá sale|chính hãng|bảo hành|đổi trả|đặt mua ngay|mua tại|mua ở|mua online/i,
+  /buy now|buy today|shop now|order now|add to cart|free shipping|\bshipping\b|\bcheckout\b|limited offer|get yours|order today|save \d+%|\d+% off|\bdeal\b|\bsale\b|\bdiscount\b|only \$\d+|\bprice\b|\bbuy\b/i,
+];
+// true neu ad co tin hieu mua (headline/text/description/CTA).
+function hasBuySignal(ad) {
+  if (!ad || typeof ad !== 'object') return false;
+  const hay = [ad.headline, ad.text, ad.description, ad.cta].filter(Boolean).join(' ').toLowerCase();
+  if (!hay) return false;
+  for (const re of BUY_SIGNAL_PATTERNS) if (re.test(hay)) return true;
+  return false;
+}
 // Nganh hang khong phai san pham ban duoc (theo phan loai industry cua analyzer).
 const NON_PRODUCT_INDUSTRIES = new Set(['entertainment', 'gambling', 'real_estate']);
 // true neu ad KHONG phai san pham ban duoc: nganh loai tru, hoac
@@ -1101,12 +1119,13 @@ function accumulateProductStats(map, analyzedAds, nowMs = Date.now()) {
     // (chi lay san pham ban duoc: me & be, gia dung, tien ich, ...).
     if (isNonProductAd(ad)) continue;
     let s = map[key];
-    if (!s) s = map[key] = { key, domain, landingUrl: key.startsWith('http') ? key : '', platform: isShopifyDomain(domain) ? 'shopify' : 'other', countries: new Set(), totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, winningTotalScore: 0, totalSpendUsd: 0, activeAds: 0, firstStartDate: null, topAdScore: -Infinity, topAdHeadline: '', topAdText: '', topAdId: null, topAdLandingUrl: '', topAdIndustry: '' };
+    if (!s) s = map[key] = { key, domain, landingUrl: key.startsWith('http') ? key : '', platform: isShopifyDomain(domain) ? 'shopify' : 'other', countries: new Set(), totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, winningTotalScore: 0, buySignalAds: 0, totalSpendUsd: 0, activeAds: 0, firstStartDate: null, topAdScore: -Infinity, topAdHeadline: '', topAdText: '', topAdId: null, topAdLandingUrl: '', topAdIndustry: '' };
     s.totalAds++;
     s.pages.add(ad.page_name);
     s.totalScore += ad.score || 0;
     if (Array.isArray(ad.countries_lower)) for (const c of ad.countries_lower) if (c) s.countries.add(String(c).toLowerCase());
     if (ad.level === '🔥 WINNER' || ad.level === '🏆 LEGEND') { s.winningAdsCount++; s.winningTotalScore += ad.score || 0; }
+    if (hasBuySignal(ad)) s.buySignalAds++;
     s.totalSpendUsd += ad.estimated_spend_usd || 0;
     if (ad.last_seen && (nowMs - ad.last_seen) <= PRODUCT_ACTIVE_WINDOW_MS) s.activeAds++;
     if (typeof ad.start_date === 'number' && (s.firstStartDate === null || ad.start_date < s.firstStartDate)) s.firstStartDate = ad.start_date;
@@ -1118,6 +1137,14 @@ function accumulateProductStats(map, analyzedAds, nowMs = Date.now()) {
       s.topAdLandingUrl = ad.landing_url || ad.ad_library_url || '';
       s.topAdIndustry = ad.industry || '';
     }
+  }
+  // Chi giu PRODUCT THAT: co it nhat 1 ad co tin hieu mua VA it nhat 1 ad
+  // thang. Ad phim/khoa hoc/game/app da bi loai o tren (isNonProductAd);
+  // day la cua loc TICH CUC thu 2. So luong xuat hien (winning_ads /
+  // total_ads) hien tren bang va dung de xep hang, khong dat nguong cung 2.
+  for (const k of Object.keys(map)) {
+    const s = map[k];
+    if ((s.buySignalAds || 0) < 1 || (s.winningAdsCount || 0) < 1) delete map[k];
   }
   return map;
 }
@@ -1150,7 +1177,7 @@ function dailyWinnersDateString(nowMs = Date.now()) {
 function buildDailyWinners(map, dateStr, limit = DAILY_WINNERS_LIMIT) {
   return Object.values(map)
     .filter((s) => s.winningAdsCount > 0)
-    .map((s) => ({ product_key: s.key, domain: s.domain, landing_url: s.landingUrl || s.topAdLandingUrl || null, category: s.topAdIndustry || null, title: productTitleFor(s), product_score: computeProductScore(s), winning_ads: s.winningAdsCount, total_ads: s.totalAds, total_pages: s.pages.size, total_spend_usd: Number(s.totalSpendUsd.toFixed(1)), platform: s.platform || 'other', is_vn: s.countries.has('vn'), countries: [...s.countries] }))
+    .map((s) => ({ product_key: s.key, domain: s.domain, landing_url: s.landingUrl || s.topAdLandingUrl || null, category: s.topAdIndustry || null, title: productTitleFor(s), product_score: computeProductScore(s), winning_ads: s.winningAdsCount, buy_signal_ads: s.buySignalAds || 0, total_ads: s.totalAds, total_pages: s.pages.size, total_spend_usd: Number(s.totalSpendUsd.toFixed(1)), platform: s.platform || 'other', is_vn: s.countries.has('vn'), countries: [...s.countries] }))
     .sort((a, b) => b.product_score - a.product_score || b.winning_ads - a.winning_ads || a.product_key.localeCompare(b.product_key))
     .slice(0, limit)
     .map((w, i) => ({ date: dateStr, rank: i + 1, ...w }));
@@ -1184,6 +1211,7 @@ async function flushProductsCollection(db, map) {
             total_pages: pages,
             total_score: Number(s.totalScore.toFixed(1)),
             winning_ads: s.winningAdsCount,
+            buy_signal_ads: s.buySignalAds || 0,
             product_score: productScore,
             title: productTitleFor(s),
             platform: s.platform || 'other',
@@ -1529,4 +1557,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, normalizeLandingUrl, productKeyFor, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, hasPlaceholderCreative, isNonProductAd, NON_PRODUCT_PATTERNS, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, normalizeLandingUrl, productKeyFor, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, hasPlaceholderCreative, isNonProductAd, NON_PRODUCT_PATTERNS, hasBuySignal, BUY_SIGNAL_PATTERNS, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
