@@ -42,6 +42,10 @@ const MAX_SCROLLS_PER_KEYWORD = parseInt(process.env.MAX_SCROLLS_PER_KEYWORD || 
 const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10);
 const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10);
 const MAX_RETRIES_PER_KEYWORD = 2;
+// [RAM-FIX] Restart browser dinh ky de giai phong RAM Chromium tich luy
+// qua nhieu keyword (1 browser chay het 374 keyword -> RAM phinh toi
+// 99% roi OOM kill). Chinh qua env BROWSER_RESTART_EVERY_KEYWORDS.
+const BROWSER_RESTART_EVERY_KEYWORDS = parseInt(process.env.BROWSER_RESTART_EVERY_KEYWORDS || '50', 10);
 
 let db;
 const seen = new Set();
@@ -330,6 +334,18 @@ async function applyStealth(page) {
     });
 }
 
+// [RAM-FIX] Dong browser cu va mo browser moi (cung USER_DATA_DIR nen
+// giu nguyen session dang nhap Facebook). Dung cho restart dinh ky va
+// retry rate-limit (thay cho doan close + launch lap lai o main loop).
+async function restartBrowserContext(oldContext, isDocker, reason) {
+    console.log(`[RAM] ${reason} — dong browser cu, mo browser moi...`);
+    try { await oldContext.close(); } catch { }
+    const ctx = await createBrowserContext(isDocker);
+    const heapMB = Math.round(process.memoryUsage().heapUsed / 1048576);
+    console.log(`[RAM] Browser moi da mo (Node heap hien tai: ${heapMB} MB).`);
+    return ctx;
+}
+
 async function createBrowserContext(isDocker) {
     return await chromium.launchPersistentContext(USER_DATA_DIR, {
         headless: false,
@@ -344,6 +360,7 @@ async function createBrowserContext(isDocker) {
             '--disable-blink-features=AutomationControlled',
             '--disable-web-security',
             '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-dev-shm-usage',
             ...(isDocker ? ['--no-sandbox', '--disable-setuid-sandbox'] : [])
         ]
     });
@@ -592,10 +609,8 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
             keywordRetries++;
             if (keywordRetries <= MAX_RETRIES_PER_KEYWORD) {
                 console.log(`⏳ [${keyword}] Gặp lỗi / Rate Limit (thử lại lần ${keywordRetries}/${MAX_RETRIES_PER_KEYWORD}). Tạm dừng hệ thống 3 phút rồi thử lại...`);
-                try { await context.close(); } catch { }
                 await new Promise(resolve => setTimeout(resolve, 3 * 60 * 1000));
-                
-                context = await createBrowserContext(isDocker);
+                context = await restartBrowserContext(context, isDocker, `[${keyword}] Rate limit`);
                 i--; 
             } else {
                 console.warn(`⚠️ [${keyword}] Đã thử lại ${MAX_RETRIES_PER_KEYWORD} lần thất bại. Bỏ qua từ khóa này để tiếp tục!`);
@@ -604,6 +619,13 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
             }
         } else {
             keywordRetries = 0;
+            const doneCount = i + 1;
+            if (BROWSER_RESTART_EVERY_KEYWORDS > 0
+                && doneCount % BROWSER_RESTART_EVERY_KEYWORDS === 0
+                && doneCount < keywords.length) {
+                context = await restartBrowserContext(context, isDocker,
+                    `Da xong ${doneCount}/${keywords.length} keyword`);
+            }
         }
     }
 
