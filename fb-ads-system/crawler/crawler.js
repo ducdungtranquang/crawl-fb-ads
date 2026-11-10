@@ -3,7 +3,7 @@ const path = require('path');
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
 // [R2-THUMBNAIL] 1/4: module upload thumbnail lên Cloudflare R2 (xem r2-upload.js).
-const { uploadThumbnailToR2, r2ThumbnailExists, thumbnailKeyFor, r2PublicUrl, isR2Enabled } = require('./r2-upload');
+const { uploadThumbnailToR2, r2ThumbnailExists, thumbnailKeyFor, r2PublicUrl } = require('./r2-upload');
 
 // ============================================================
 // [R2-THUMBNAIL] Các chỗ đã sửa để đẩy thumbnail lên R2:
@@ -33,7 +33,6 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.100.7:27017/?direc
 const DB_NAME = 'fb_ads';
 
 const USER_DATA_DIR = './chrome-profile-mac';
-const STORAGE_PATH = path.join(__dirname, '..', '..', 'storage', 'images');
 
 const SEEN_THRESHOLD = 10 * 60 * 1000;
 const DETAIL_HISTORY_LIMIT = 200;
@@ -52,7 +51,6 @@ const seen = new Set();
 let lastSavedAt = Date.now();
 let isRateLimited = false;
 
-fs.mkdirSync(STORAGE_PATH, { recursive: true });
 
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -149,6 +147,8 @@ async function initializeInfrastructure() {
 // [R2-THUMBNAIL] 2/4 ĐÃ SỬA: hàm này đẩy thumbnail lên R2 (HEAD check chống trùng)
 // thay vì chỉ ghi file local như trước.
 async function downloadThumbnail(page, imageUrl, adId) {
+    // [R2-ONLY] Chi upload len R2, KHONG luu file local nua (tranh day dia
+    // may crawler). R2 tat hoac upload loi -> khong co thumbnail (null).
     // Thumbnail dùng chung theo hash của URL ảnh: ad trùng creative
     // (cùng ảnh) và ad đã upload rồi đều trỏ chung 1 object R2.
     // Check tồn tại trước: có rồi thì thôi, khỏi tải/upload lại.
@@ -156,18 +156,12 @@ async function downloadThumbnail(page, imageUrl, adId) {
     try {
         const key = thumbnailKeyFor(imageUrl);
         if (await r2ThumbnailExists(key)) return { local: null, r2: r2PublicUrl(key) };
-        const fileName = `${path.basename(key)}`;
-        const filePath = path.join(STORAGE_PATH, fileName);
-        if (!isR2Enabled()) {
-            try { await fs.promises.access(filePath); return { local: `/images/${fileName}`, r2: null }; } catch {}
-        }
         const response = await page.request.get(imageUrl, { timeout: 5000 });
         if (!response.ok()) return { local: null, r2: null };
         const buffer = await response.body();
         const r2Url = await uploadThumbnailToR2(buffer, key);
         if (r2Url) return { local: null, r2: r2Url };
-        await fs.promises.writeFile(filePath, buffer);
-        return { local: `/images/${fileName}`, r2: null };
+        return { local: null, r2: null };
     } catch {
         return { local: null, r2: null };
     }
