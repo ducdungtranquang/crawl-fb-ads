@@ -280,8 +280,19 @@ const LIVESTOCK_WORDS = ['heo', 'lợn', 'gà', 'vịt', 'trâu', 'bò', 'dê', 
 //   khi có từ khóa tài chính khác ngoài "đầu tư", hoặc không có ngữ
 //   cảnh sức khỏe/cơ thể.
 const HEALTH_CONTEXT_WORDS = ['sức khỏe', 'cơ thể', 'massage', 'thư giãn', 'làm đẹp', 'giảm cân'];
+// Cum tu MANH chi ro ad la phim/drama (xem phim, long tieng, vietsub...).
+// Dung de dua phim ve dung nganh entertainment truoc khi cham diem.
+const MOVIE_STRONG_PATTERNS = [
+  /xem phim|lồng tiếng|thuyết minh|vietsub|phim bộ|phim lẻ|phim chiếu rạp|rạp chiếu phim|phim hành động|phim tình cảm|phim hài|phim kinh dị|tập \d+|phụ đề|full hd|phim mới/i,
+  /watch (a |the )?movie|full movie|tv series|tv show|netflix|episode|season \d+|dubbed|subtitle|trailer|cinema|streaming/i,
+];
+
 function classifyIndustry(ad) {
   const fullText = normalize((ad.text || '') + ' ' + (ad.headline || ''));
+  // Phim ve dung nganh entertainment NGAY (truoc khi cham diem): ad phim
+  // co text mo ta dien vien/trang phuc/canh dep nen hay bi cham diem
+  // beauty_health cao hon entertainment -> nhay vao ngach thoi trang/lam dep.
+  if (MOVIE_STRONG_PATTERNS.some((re) => re.test(fullText))) return 'entertainment';
   // Strip URL + SĐT trước: "điện thoại: (0277) 6501 424" ở cuối ad ghế
   // massage từng kéo cả ad sang electronics.
   const cleanText = normalize(stripUrlsAndPhones(fullText));
@@ -802,6 +813,10 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     const presetPriorityValue = presetPriority(industryValue, creativeKind);
     return {
       ...ad,
+      // first_seen khong bao gio duoc sau last_seen (du lieu crawler lech:
+      // 'Lan dau phat hien' sau 'ngay ket thuc' la khong the). Kep ve <= last_seen.
+      first_seen: (ad.first_seen && ad.last_seen) ? Math.min(ad.first_seen, ad.last_seen) : ad.first_seen,
+      last_seen: ad.last_seen || ad.first_seen || null,
       ad_archive_id: archiveId,
       domain,
       product_key: productKeyFor(ad, domain),
@@ -965,6 +980,14 @@ const EXCLUDED_PRODUCT_DOMAINS = [
   'alibaba.com', 'aliexpress.com', 'aliexpress.us', '1688.com', 'taobao.com', 'tmall.com', 'jd.com', 'dhgate.com',
   'amazon.com', 'amazon.ca', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.com.au', 'amazon.in', 'amazon.co.jp', 'amazon.com.mx', 'amazon.com.br',
   'ebay.com', 'etsy.com', 'walmart.com',
+  // San TMDT moi
+  'temu.com', 'shein.com', 'wish.com',
+  // App store (app cai dat, khong phai san pham ban)
+  'play.google.com', 'itunes.apple.com', 'apps.apple.com',
+  // Link rut gon / redirect (khong phai landing that)
+  'fb.me', 'fb.watch', 'l.facebook.com',
+  // Mang quang cao (domain quang cao, khong phai san pham)
+  'doubleclick.net', 'googleadservices.com', 'googlesyndication.com',
   // Mang xa hoi / nhan tin / video
   'facebook.com', 'fb.com', 'instagram.com', 'tiktok.com', 'youtube.com', 'messenger.com', 'whatsapp.com', 'zalo.me', 'telegram.org', 'twitter.com', 'x.com', 'pinterest.com', 'linkedin.com', 'snapchat.com', 'threads.net',
 ];
@@ -978,6 +1001,72 @@ function isExcludedProductDomain(domain) {
   for (const base of EXCLUDED_PRODUCT_DOMAINS) {
     if (d === base || d.endsWith('.' + base)) return true;
   }
+  return false;
+}
+// true neu domain la Shopify: *.myshopify.com (subdomain mac dinh).
+// Store dung domain rieng (custom domain) khong nhan duoc tu URL — can
+// fetch HTML de check fingerprint Shopify (buoc enrich rieng, chua lam).
+function isShopifyDomain(domain) {
+  if (!domain || typeof domain !== 'string') return false;
+  const d = domain.trim().toLowerCase().replace(/^www\./, '');
+  return d === 'myshopify.com' || d.endsWith('.myshopify.com');
+}
+// true neu text/headline/description chua placeholder template {{...}}
+// (vd {{product.name}}, {{product.brand}}) — ad chay template chua render,
+// title lay tu do se ro ri placeholder ra bang.
+function hasPlaceholderCreative(text) {
+  return typeof text === 'string' && /\{\{[^}]*\}\}/.test(text);
+}
+// --- Loc ad KHONG phai san pham ban duoc (chi lay product that) ---
+// Cac cum tu chi ro ad la phim, khoa hoc, game, app, tai chinh, dich vu
+// — tieng Viet + tieng Anh. Dung de loai khoi bang winning products.
+// Chi dung cum tu (khong dung tu don chung chung nhu "hoc", "phim",
+// "game", "app") de tranh loai nham san pham that (vd "game" trong ten
+// san pham, "app" trong "tai app de mua hang").
+const NON_PRODUCT_PATTERNS = [
+  // Phim / xem phim / drama
+  /xem phim|lồng tiếng|thuyết minh|vietsub|phim lẻ|phim bộ|phim chiếu rạp|rạp chiếu phim|phim hành động|phim tình cảm|phim hài|phim kinh dị|phim mới|tập \d+|diễn viên|phụ đề/i,
+  /watch (a |the )?movie|full movie|watch free|tv series|tv show|netflix|episode|season \d+|dubbed|subtitle|trailer|cinema|streaming/i,
+  // Khoa hoc / giao duc
+  /khóa học|lớp học|học online|học trực tuyến|đào tạo|giảng viên|khóa đào tạo|luyện thi|ôn thi|chứng chỉ|bằng cấp|trường học|đại học|cao đẳng|trung tâm|giáo dục|học phí|đăng ký học|học tiếng anh|học viên|khóa học miễn phí|lớp học đầu tư/i,
+  /online course|free course|learn english|masterclass|webinar|sign up (for|to) (the )?course|enroll(ment)?|certification|degree|academy|coaching/i,
+  // Game / co bac
+  /chơi game|tải game|game mobile|game online|giftcode|nạp game|game thủ|esport|liên quân|pubg|free fire|cờ bạc|cá cược|cá độ|sòng bạc|đánh bài|xóc đĩa|tài xỉu|lô đề|xổ số/i,
+  /play (a |the )?game|download (a |the )?game|mobile game|online game|gamer|esports|free spins|slots|casino|poker|betting|gambling|jackpot|lottery/i,
+  // App (san pham la app, khong phai hang hoa)
+  /tải app|tải ứng dụng|cài đặt app|download app|install app|get the app|app store|google play|download now|install now/i,
+  // Tai chinh / dau tu / vay
+  /đầu tư|chứng khoán|forex|tiền ảo|bitcoin|vay tiền|cho vay|tín dụng|bảo hiểm|kiếm tiền|làm giàu|thu nhập thụ động/i,
+  /invest(ment)?|trading|forex|crypto|bitcoin|stock market|loan|credit|insurance|make money|passive income|earn money|get rich/i,
+];
+// --- Tin hieu MUA (loc TICH CUC: chi lay product that) ---
+// Cum tu chi ro ad la quang cao BAN HANG (co y dinh mua): Buy, Sale, Mua,
+// Dat hang, Them vao gio, Giam gia, Freeship... — Viet + Anh. Phim, khoa
+// hoc, game, app thuong KHONG co cum tu nay (no noi "xem ngay", "hoc ngay",
+// "choi ngay", "tai app"). Dung kem loc loai tru: ad phai VUOT ca 2 (khong
+// phai non-product VA co tin hieu mua) moi duoc tinh la product.
+const BUY_SIGNAL_PATTERNS = [
+  /mua ngay|mua hàng|đặt hàng|đặt mua|mua 1 tặng 1|mua 1 được 1|giỏ hàng|thêm vào giỏ|thanh toán|giảm giá|khuyến mãi|freeship|miễn phí vận chuyển|giao hàng|giao nhanh|ship cod|\bcod\b|chỉ còn|số lượng có hạn|ưu đãi|giá chỉ|giá sale|chính hãng|bảo hành|đổi trả|đặt mua ngay|mua tại|mua ở|mua online/i,
+  /buy now|buy today|shop now|order now|add to cart|free shipping|\bshipping\b|\bcheckout\b|limited offer|get yours|order today|save \d+%|\d+% off|\bdeal\b|\bsale\b|\bdiscount\b|only \$\d+|\bprice\b|\bbuy\b/i,
+];
+// true neu ad co tin hieu mua (headline/text/description/CTA).
+function hasBuySignal(ad) {
+  if (!ad || typeof ad !== 'object') return false;
+  const hay = [ad.headline, ad.text, ad.description, ad.cta].filter(Boolean).join(' ').toLowerCase();
+  if (!hay) return false;
+  for (const re of BUY_SIGNAL_PATTERNS) if (re.test(hay)) return true;
+  return false;
+}
+// Nganh hang khong phai san pham ban duoc (theo phan loai industry cua analyzer).
+const NON_PRODUCT_INDUSTRIES = new Set(['entertainment', 'gambling', 'real_estate']);
+// true neu ad KHONG phai san pham ban duoc: nganh loai tru, hoac
+// headline/text/description chua cum tu non-product (Viet + Anh).
+function isNonProductAd(ad) {
+  if (!ad || typeof ad !== 'object') return false;
+  if (ad.industry && NON_PRODUCT_INDUSTRIES.has(String(ad.industry).toLowerCase())) return true;
+  const hay = [ad.headline, ad.text, ad.description].filter(Boolean).join(' ').toLowerCase();
+  if (!hay) return false;
+  for (const re of NON_PRODUCT_PATTERNS) if (re.test(hay)) return true;
   return false;
 }
 // Regex dung cho query Mongo ($not): khop dung isExcludedProductDomain.
@@ -1038,12 +1127,20 @@ function accumulateProductStats(map, analyzedAds, nowMs = Date.now()) {
     if (!key) continue;
     const domain = String(ad.domain || extractDomain(ad.landing_url || ad.link || '') || '').toLowerCase();
     if (isExcludedProductDomain(domain)) continue;
+    // Ad chay template chua render ({{product.name}}, {{product.brand}},
+    // ...) khong vao bang: title lay tu headline se ro ri placeholder.
+    if (hasPlaceholderCreative(ad.text) || hasPlaceholderCreative(ad.headline) || hasPlaceholderCreative(ad.description)) continue;
+    // Ad phim / khoa hoc / game / app / tai chinh / dich vu khong vao bang
+    // (chi lay san pham ban duoc: me & be, gia dung, tien ich, ...).
+    if (isNonProductAd(ad)) continue;
     let s = map[key];
-    if (!s) s = map[key] = { key, domain, landingUrl: key.startsWith('http') ? key : '', totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, totalSpendUsd: 0, activeAds: 0, firstStartDate: null, topAdScore: -Infinity, topAdHeadline: '', topAdText: '', topAdId: null, topAdLandingUrl: '', topAdIndustry: '' };
+    if (!s) s = map[key] = { key, domain, landingUrl: key.startsWith('http') ? key : '', platform: isShopifyDomain(domain) ? 'shopify' : 'other', countries: new Set(), totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, winningTotalScore: 0, buySignalAds: 0, totalSpendUsd: 0, activeAds: 0, firstStartDate: null, topAdScore: -Infinity, topAdHeadline: '', topAdText: '', topAdId: null, topAdLandingUrl: '', topAdIndustry: '' };
     s.totalAds++;
     s.pages.add(ad.page_name);
     s.totalScore += ad.score || 0;
-    if (ad.level === '🔥 WINNER' || ad.level === '🏆 LEGEND') s.winningAdsCount++;
+    if (Array.isArray(ad.countries_lower)) for (const c of ad.countries_lower) if (c) s.countries.add(String(c).toLowerCase());
+    if (ad.level === '🔥 WINNER' || ad.level === '🏆 LEGEND') { s.winningAdsCount++; s.winningTotalScore += ad.score || 0; }
+    if (hasBuySignal(ad)) s.buySignalAds++;
     s.totalSpendUsd += ad.estimated_spend_usd || 0;
     if (ad.last_seen && (nowMs - ad.last_seen) <= PRODUCT_ACTIVE_WINDOW_MS) s.activeAds++;
     if (typeof ad.start_date === 'number' && (s.firstStartDate === null || ad.start_date < s.firstStartDate)) s.firstStartDate = ad.start_date;
@@ -1055,6 +1152,14 @@ function accumulateProductStats(map, analyzedAds, nowMs = Date.now()) {
       s.topAdLandingUrl = ad.landing_url || ad.ad_library_url || '';
       s.topAdIndustry = ad.industry || '';
     }
+  }
+  // Chi giu PRODUCT THAT: co it nhat 1 ad co tin hieu mua VA it nhat 1 ad
+  // thang. Ad phim/khoa hoc/game/app da bi loai o tren (isNonProductAd);
+  // day la cua loc TICH CUC thu 2. So luong xuat hien (winning_ads /
+  // total_ads) hien tren bang va dung de xep hang, khong dat nguong cung 2.
+  for (const k of Object.keys(map)) {
+    const s = map[k];
+    if ((s.buySignalAds || 0) < 1 || (s.winningAdsCount || 0) < 1) delete map[k];
   }
   return map;
 }
@@ -1068,10 +1173,13 @@ function productTitleFor(s) {
   return '';
 }
 
-// product_score = tổng score các ad + số page x 2 + số ad thắng x 5.
+// product_score = DIEM TRUNG BINH cua ad WIN (khong phai tong). Thuong cho
+// chat luong win, khong thuong so luong: san co 1 ad win diem 80 thang
+// domain co 47k ad win diem TB 25. Khong co ad win thi dung TB tat ca ad.
 function computeProductScore(s) {
-  const pages = s.pages.size;
-  return Number((s.totalScore + pages * 2 + s.winningAdsCount * 5).toFixed(1));
+  const winAvg = s.winningAdsCount > 0 ? (s.winningTotalScore || 0) / s.winningAdsCount : 0;
+  const avg = s.totalAds > 0 ? s.totalScore / s.totalAds : 0;
+  return Number((s.winningAdsCount > 0 ? winAvg : avg).toFixed(1));
 }
 
 // Snapshot top 30 product thắng của ngày chạy (theo product_score, chỉ
@@ -1084,7 +1192,7 @@ function dailyWinnersDateString(nowMs = Date.now()) {
 function buildDailyWinners(map, dateStr, limit = DAILY_WINNERS_LIMIT) {
   return Object.values(map)
     .filter((s) => s.winningAdsCount > 0)
-    .map((s) => ({ product_key: s.key, domain: s.domain, landing_url: s.landingUrl || s.topAdLandingUrl || null, category: s.topAdIndustry || null, title: productTitleFor(s), product_score: computeProductScore(s), winning_ads: s.winningAdsCount, total_ads: s.totalAds, total_pages: s.pages.size, total_spend_usd: Number(s.totalSpendUsd.toFixed(1)) }))
+    .map((s) => ({ product_key: s.key, domain: s.domain, landing_url: s.landingUrl || s.topAdLandingUrl || null, category: s.topAdIndustry || null, title: productTitleFor(s), product_score: computeProductScore(s), winning_ads: s.winningAdsCount, buy_signal_ads: s.buySignalAds || 0, total_ads: s.totalAds, total_pages: s.pages.size, total_spend_usd: Number(s.totalSpendUsd.toFixed(1)), platform: s.platform || 'other', is_vn: s.countries.has('vn'), countries: [...s.countries] }))
     .sort((a, b) => b.product_score - a.product_score || b.winning_ads - a.winning_ads || a.product_key.localeCompare(b.product_key))
     .slice(0, limit)
     .map((w, i) => ({ date: dateStr, rank: i + 1, ...w }));
@@ -1118,8 +1226,14 @@ async function flushProductsCollection(db, map) {
             total_pages: pages,
             total_score: Number(s.totalScore.toFixed(1)),
             winning_ads: s.winningAdsCount,
+            buy_signal_ads: s.buySignalAds || 0,
             product_score: productScore,
             title: productTitleFor(s),
+            platform: s.platform || 'other',
+            is_vn: s.countries.has('vn'),
+            countries: [...s.countries],
+            avg_winning_score: s.winningAdsCount > 0 ? Number(((s.winningTotalScore || 0) / s.winningAdsCount).toFixed(1)) : null,
+            avg_score: s.totalAds > 0 ? Number((s.totalScore / s.totalAds).toFixed(1)) : null,
             top_ad_id: s.topAdId,
             landing_url: s.landingUrl || s.topAdLandingUrl || null,
             category: s.topAdIndustry || null,
@@ -1458,4 +1572,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, normalizeLandingUrl, productKeyFor, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, normalizeLandingUrl, productKeyFor, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, hasPlaceholderCreative, isNonProductAd, NON_PRODUCT_PATTERNS, hasBuySignal, BUY_SIGNAL_PATTERNS, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
