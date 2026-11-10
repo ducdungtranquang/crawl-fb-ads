@@ -280,8 +280,19 @@ const LIVESTOCK_WORDS = ['heo', 'lợn', 'gà', 'vịt', 'trâu', 'bò', 'dê', 
 //   khi có từ khóa tài chính khác ngoài "đầu tư", hoặc không có ngữ
 //   cảnh sức khỏe/cơ thể.
 const HEALTH_CONTEXT_WORDS = ['sức khỏe', 'cơ thể', 'massage', 'thư giãn', 'làm đẹp', 'giảm cân'];
+// Cum tu MANH chi ro ad la phim/drama (xem phim, long tieng, vietsub...).
+// Dung de dua phim ve dung nganh entertainment truoc khi cham diem.
+const MOVIE_STRONG_PATTERNS = [
+  /xem phim|lồng tiếng|thuyết minh|vietsub|phim bộ|phim lẻ|phim chiếu rạp|rạp chiếu phim|phim hành động|phim tình cảm|phim hài|phim kinh dị|tập \d+|phụ đề|full hd|phim mới/i,
+  /watch (a |the )?movie|full movie|tv series|tv show|netflix|episode|season \d+|dubbed|subtitle|trailer|cinema|streaming/i,
+];
+
 function classifyIndustry(ad) {
   const fullText = normalize((ad.text || '') + ' ' + (ad.headline || ''));
+  // Phim ve dung nganh entertainment NGAY (truoc khi cham diem): ad phim
+  // co text mo ta dien vien/trang phuc/canh dep nen hay bi cham diem
+  // beauty_health cao hon entertainment -> nhay vao ngach thoi trang/lam dep.
+  if (MOVIE_STRONG_PATTERNS.some((re) => re.test(fullText))) return 'entertainment';
   // Strip URL + SĐT trước: "điện thoại: (0277) 6501 424" ở cuối ad ghế
   // massage từng kéo cả ad sang electronics.
   const cleanText = normalize(stripUrlsAndPhones(fullText));
@@ -802,6 +813,10 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     const presetPriorityValue = presetPriority(industryValue, creativeKind);
     return {
       ...ad,
+      // first_seen khong bao gio duoc sau last_seen (du lieu crawler lech:
+      // 'Lan dau phat hien' sau 'ngay ket thuc' la khong the). Kep ve <= last_seen.
+      first_seen: (ad.first_seen && ad.last_seen) ? Math.min(ad.first_seen, ad.last_seen) : ad.first_seen,
+      last_seen: ad.last_seen || ad.first_seen || null,
       ad_archive_id: archiveId,
       domain,
       product_key: productKeyFor(ad, domain),
