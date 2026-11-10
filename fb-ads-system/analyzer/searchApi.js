@@ -1827,7 +1827,7 @@ function initSearchServer(dbInstance) {
             // Filter chung cho ca day + month: ?platform=shopify|other, ?country=VN.
             const pf = String(req.query.platform || '').trim().toLowerCase();
             const cc = String(req.query.country || '').trim().toLowerCase();
-            const prodFilter = { domain: { $not: excludedProductDomainRegex() }, title: { $not: nonProductTitleRegex() }, category: { $nin: [...NON_PRODUCT_INDUSTRIES] }, $and: [{ $or: [{ winning_ads: { $gte: 1 } }, { winning_ads: { $exists: false } }] }, { $or: [{ buy_signal_ads: { $gte: 1 } }, { buy_signal_ads: { $exists: false } }] }] };
+            const prodFilter = { domain: { $not: excludedProductDomainRegex() }, title: { $not: nonProductTitleRegex() }, category: { $nin: [...NON_PRODUCT_INDUSTRIES] }, $and: [{ $or: [{ winning_ads: { $gte: 1 } }, { winning_ads: { $exists: false } }] }, { $or: [{ buy_signal_ads: { $gte: 1 } }, { buy_signal_ads: { $exists: false } }] }, { thumbnail_r2: { $exists: true, $nin: [null, ''] } }] };
             if (pf === 'shopify' || pf === 'other') prodFilter.platform = pf;
             if (cc === 'vn' || cc === 'vietnam') prodFilter.is_vn = true;
             if (day) {
@@ -2013,7 +2013,9 @@ function buildProductsSearchQuery(params) {
     // Chi product THAT (loc TICH CUC): co it nhat 1 ad thang + co tin hieu
     // mua (Buy/Sale/Mua/Dat hang...). buy_signal_ads chi co tu FULL moi;
     // doc cu chua co field thi khong loai bang dieu kien nay.
-    query.$and = [...(query.$and || []), { domain: { $not: excludedProductDomainRegex() } }, { title: { $not: nonProductTitleRegex() } }, { category: { $nin: [...NON_PRODUCT_INDUSTRIES] } }, { $or: [{ winning_ads: { $gte: 1 } }, { winning_ads: { $exists: false } }] }, { $or: [{ buy_signal_ads: { $gte: 1 } }, { buy_signal_ads: { $exists: false } }] }];
+    // [THUMB-ONLY] Chi hien product co anh tren R2 (thumbnail_r2 do analyzer
+// ghi tu FULL moi; doc cu chua co field thi tam an cho toi khi FULL rebuild).
+query.$and = [...(query.$and || []), { domain: { $not: excludedProductDomainRegex() } }, { title: { $not: nonProductTitleRegex() } }, { category: { $nin: [...NON_PRODUCT_INDUSTRIES] } }, { $or: [{ winning_ads: { $gte: 1 } }, { winning_ads: { $exists: false } }] }, { $or: [{ buy_signal_ads: { $gte: 1 } }, { buy_signal_ads: { $exists: false } }] }, { thumbnail_r2: { $exists: true, $nin: [null, ''] } }];
     return query;
 }
 
@@ -2041,7 +2043,7 @@ function parseMonthParam(monthParam, nowMs = Date.now()) {
 // khong khop filter (can FULL sau PR).
 function buildMonthlyWinnersPipeline(month, filters = {}) {
     const { start, end } = monthRange(month);
-    const match = { date: { $gte: start, $lt: end }, domain: { $not: excludedProductDomainRegex() }, title: { $not: nonProductTitleRegex() }, category: { $nin: [...NON_PRODUCT_INDUSTRIES] }, $and: [{ $or: [{ winning_ads: { $gte: 1 } }, { winning_ads: { $exists: false } }] }, { $or: [{ buy_signal_ads: { $gte: 1 } }, { buy_signal_ads: { $exists: false } }] }] };
+    const match = { date: { $gte: start, $lt: end }, domain: { $not: excludedProductDomainRegex() }, title: { $not: nonProductTitleRegex() }, category: { $nin: [...NON_PRODUCT_INDUSTRIES] }, thumbnail_r2: { $exists: true, $nin: [null, ''] }, $and: [{ $or: [{ winning_ads: { $gte: 1 } }, { winning_ads: { $exists: false } }] }, { $or: [{ buy_signal_ads: { $gte: 1 } }, { buy_signal_ads: { $exists: false } }] }] };
     const pf = String(filters.platform || '').trim().toLowerCase();
     if (pf === 'shopify' || pf === 'other') match.platform = pf;
     const cc = String(filters.country || '').trim().toLowerCase();

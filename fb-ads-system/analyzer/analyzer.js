@@ -1134,7 +1134,7 @@ function accumulateProductStats(map, analyzedAds, nowMs = Date.now()) {
     // (chi lay san pham ban duoc: me & be, gia dung, tien ich, ...).
     if (isNonProductAd(ad)) continue;
     let s = map[key];
-    if (!s) s = map[key] = { key, domain, landingUrl: key.startsWith('http') ? key : '', platform: isShopifyDomain(domain) ? 'shopify' : 'other', countries: new Set(), totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, winningTotalScore: 0, buySignalAds: 0, totalSpendUsd: 0, activeAds: 0, firstStartDate: null, topAdScore: -Infinity, topAdHeadline: '', topAdText: '', topAdId: null, topAdLandingUrl: '', topAdIndustry: '' };
+    if (!s) s = map[key] = { key, domain, landingUrl: key.startsWith('http') ? key : '', platform: isShopifyDomain(domain) ? 'shopify' : 'other', countries: new Set(), totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, winningTotalScore: 0, buySignalAds: 0, totalSpendUsd: 0, activeAds: 0, firstStartDate: null, topAdScore: -Infinity, topAdHeadline: '', topAdText: '', topAdId: null, topAdLandingUrl: '', topAdIndustry: '', topAdThumbnail: null };
     s.totalAds++;
     s.pages.add(ad.page_name);
     s.totalScore += ad.score || 0;
@@ -1144,6 +1144,7 @@ function accumulateProductStats(map, analyzedAds, nowMs = Date.now()) {
     s.totalSpendUsd += ad.estimated_spend_usd || 0;
     if (ad.last_seen && (nowMs - ad.last_seen) <= PRODUCT_ACTIVE_WINDOW_MS) s.activeAds++;
     if (typeof ad.start_date === 'number' && (s.firstStartDate === null || ad.start_date < s.firstStartDate)) s.firstStartDate = ad.start_date;
+    if (!s.topAdThumbnail && ad.thumbnail_r2) s.topAdThumbnail = ad.thumbnail_r2;
     if ((ad.score || 0) > s.topAdScore) {
       s.topAdScore = ad.score || 0;
       s.topAdHeadline = (ad.headline || '').trim();
@@ -1151,6 +1152,10 @@ function accumulateProductStats(map, analyzedAds, nowMs = Date.now()) {
       s.topAdId = ad.ad_archive_id != null ? String(ad.ad_archive_id) : null;
       s.topAdLandingUrl = ad.landing_url || ad.ad_library_url || '';
       s.topAdIndustry = ad.industry || '';
+      // Anh dai dien: thumbnail_r2 (URL R2 ben) cua ad top score. Ad top
+      // chua co thumb (crawl truoc fix thumbnail) thi giu anh dau tien co
+      // thumb trong nhom o duoi, khong de product mat anh oan.
+      s.topAdThumbnail = ad.thumbnail_r2 || s.topAdThumbnail || null;
     }
   }
   // Chi giu PRODUCT THAT: co it nhat 1 ad co tin hieu mua VA it nhat 1 ad
@@ -1192,7 +1197,7 @@ function dailyWinnersDateString(nowMs = Date.now()) {
 function buildDailyWinners(map, dateStr, limit = DAILY_WINNERS_LIMIT) {
   return Object.values(map)
     .filter((s) => s.winningAdsCount > 0)
-    .map((s) => ({ product_key: s.key, domain: s.domain, landing_url: s.landingUrl || s.topAdLandingUrl || null, category: s.topAdIndustry || null, title: productTitleFor(s), product_score: computeProductScore(s), winning_ads: s.winningAdsCount, buy_signal_ads: s.buySignalAds || 0, total_ads: s.totalAds, total_pages: s.pages.size, total_spend_usd: Number(s.totalSpendUsd.toFixed(1)), platform: s.platform || 'other', is_vn: s.countries.has('vn'), countries: [...s.countries] }))
+    .map((s) => ({ product_key: s.key, domain: s.domain, landing_url: s.landingUrl || s.topAdLandingUrl || null, category: s.topAdIndustry || null, title: productTitleFor(s), thumbnail_r2: s.topAdThumbnail || null, product_score: computeProductScore(s), winning_ads: s.winningAdsCount, buy_signal_ads: s.buySignalAds || 0, total_ads: s.totalAds, total_pages: s.pages.size, total_spend_usd: Number(s.totalSpendUsd.toFixed(1)), platform: s.platform || 'other', is_vn: s.countries.has('vn'), countries: [...s.countries] }))
     .sort((a, b) => b.product_score - a.product_score || b.winning_ads - a.winning_ads || a.product_key.localeCompare(b.product_key))
     .slice(0, limit)
     .map((w, i) => ({ date: dateStr, rank: i + 1, ...w }));
@@ -1235,6 +1240,7 @@ async function flushProductsCollection(db, map) {
             avg_winning_score: s.winningAdsCount > 0 ? Number(((s.winningTotalScore || 0) / s.winningAdsCount).toFixed(1)) : null,
             avg_score: s.totalAds > 0 ? Number((s.totalScore / s.totalAds).toFixed(1)) : null,
             top_ad_id: s.topAdId,
+            thumbnail_r2: s.topAdThumbnail || null,
             landing_url: s.landingUrl || s.topAdLandingUrl || null,
             category: s.topAdIndustry || null,
             publication_date: s.firstStartDate,
