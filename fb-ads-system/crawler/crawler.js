@@ -3,7 +3,7 @@ const path = require('path');
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
 // [R2-THUMBNAIL] 1/4: module upload thumbnail lên Cloudflare R2 (xem r2-upload.js).
-const { uploadThumbnailToR2, r2ThumbnailExists, thumbnailKeyFor, r2PublicUrl, isR2Enabled } = require('./r2-upload');
+const { uploadThumbnailToR2, r2ThumbnailExists, thumbnailKeyFor, r2PublicUrl } = require('./r2-upload');
 
 // ============================================================
 // [R2-THUMBNAIL] Các chỗ đã sửa để đẩy thumbnail lên R2:
@@ -33,7 +33,6 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb://192.168.100.7:27017/?direc
 const DB_NAME = 'fb_ads';
 
 const USER_DATA_DIR = './chrome-profile-mac';
-const STORAGE_PATH = path.join(__dirname, '..', '..', 'storage', 'images');
 
 const SEEN_THRESHOLD = 10 * 60 * 1000;
 const DETAIL_HISTORY_LIMIT = 200;
@@ -42,13 +41,16 @@ const MAX_SCROLLS_PER_KEYWORD = parseInt(process.env.MAX_SCROLLS_PER_KEYWORD || 
 const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10);
 const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10);
 const MAX_RETRIES_PER_KEYWORD = 2;
+// [RAM-FIX] Restart browser dinh ky de giai phong RAM Chromium tich luy
+// qua nhieu keyword (1 browser chay het 374 keyword -> RAM phinh toi
+// 99% roi OOM kill). Chinh qua env BROWSER_RESTART_EVERY_KEYWORDS.
+const BROWSER_RESTART_EVERY_KEYWORDS = parseInt(process.env.BROWSER_RESTART_EVERY_KEYWORDS || '50', 10);
 
 let db;
 const seen = new Set();
 let lastSavedAt = Date.now();
 let isRateLimited = false;
 
-fs.mkdirSync(STORAGE_PATH, { recursive: true });
 
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -150,6 +152,8 @@ async function initializeInfrastructure() {
 // [R2-THUMBNAIL] 2/4 ĐÃ SỬA: hàm này đẩy thumbnail lên R2 (HEAD check chống trùng)
 // thay vì chỉ ghi file local như trước.
 async function downloadThumbnail(page, imageUrl, adId) {
+    // [R2-ONLY] Chi upload len R2, KHONG luu file local nua (tranh day dia
+    // may crawler). R2 tat hoac upload loi -> khong co thumbnail (null).
     // Thumbnail dùng chung theo hash của URL ảnh: ad trùng creative
     // (cùng ảnh) và ad đã upload rồi đều trỏ chung 1 object R2.
     // Check tồn tại trước: có rồi thì thôi, khỏi tải/upload lại.
@@ -157,18 +161,12 @@ async function downloadThumbnail(page, imageUrl, adId) {
     try {
         const key = thumbnailKeyFor(imageUrl);
         if (await r2ThumbnailExists(key)) return { local: null, r2: r2PublicUrl(key) };
-        const fileName = `${path.basename(key)}`;
-        const filePath = path.join(STORAGE_PATH, fileName);
-        if (!isR2Enabled()) {
-            try { await fs.promises.access(filePath); return { local: `/images/${fileName}`, r2: null }; } catch {}
-        }
         const response = await page.request.get(imageUrl, { timeout: 5000 });
         if (!response.ok()) return { local: null, r2: null };
         const buffer = await response.body();
         const r2Url = await uploadThumbnailToR2(buffer, key);
         if (r2Url) return { local: null, r2: r2Url };
-        await fs.promises.writeFile(filePath, buffer);
-        return { local: `/images/${fileName}`, r2: null };
+        return { local: null, r2: null };
     } catch {
         return { local: null, r2: null };
     }
@@ -355,6 +353,18 @@ async function applyStealth(page) {
     });
 }
 
+// [RAM-FIX] Dong browser cu va mo browser moi (cung USER_DATA_DIR nen
+// giu nguyen session dang nhap Facebook). Dung cho restart dinh ky va
+// retry rate-limit (thay cho doan close + launch lap lai o main loop).
+async function restartBrowserContext(oldContext, isDocker, reason) {
+    console.log(`[RAM] ${reason} — dong browser cu, mo browser moi...`);
+    try { await oldContext.close(); } catch { }
+    const ctx = await createBrowserContext(isDocker);
+    const heapMB = Math.round(process.memoryUsage().heapUsed / 1048576);
+    console.log(`[RAM] Browser moi da mo (Node heap hien tai: ${heapMB} MB).`);
+    return ctx;
+}
+
 async function createBrowserContext(isDocker) {
     return await chromium.launchPersistentContext(USER_DATA_DIR, {
         headless: false,
@@ -370,6 +380,7 @@ async function createBrowserContext(isDocker) {
             '--disable-infobars',
             '--disable-web-security',
             '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-dev-shm-usage',
             ...(isDocker ? ['--no-sandbox', '--disable-setuid-sandbox'] : [])
         ]
     });
@@ -643,10 +654,8 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
             keywordRetries++;
             if (keywordRetries <= MAX_RETRIES_PER_KEYWORD) {
                 console.log(`⏳ [${keyword}] Gặp lỗi / Rate Limit (thử lại lần ${keywordRetries}/${MAX_RETRIES_PER_KEYWORD}). Tạm dừng hệ thống 3 phút rồi thử lại...`);
-                try { await context.close(); } catch { }
                 await new Promise(resolve => setTimeout(resolve, 3 * 60 * 1000));
-                
-                context = await createBrowserContext(isDocker);
+                context = await restartBrowserContext(context, isDocker, `[${keyword}] Rate limit`);
                 i--; 
             } else {
                 console.warn(`⚠️ [${keyword}] Đã thử lại ${MAX_RETRIES_PER_KEYWORD} lần thất bại. Bỏ qua từ khóa này để tiếp tục!`);
@@ -655,6 +664,13 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
             }
         } else {
             keywordRetries = 0;
+            const doneCount = i + 1;
+            if (BROWSER_RESTART_EVERY_KEYWORDS > 0
+                && doneCount % BROWSER_RESTART_EVERY_KEYWORDS === 0
+                && doneCount < keywords.length) {
+                context = await restartBrowserContext(context, isDocker,
+                    `Da xong ${doneCount}/${keywords.length} keyword`);
+            }
         }
     }
 
