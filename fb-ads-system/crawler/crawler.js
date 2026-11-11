@@ -5,7 +5,7 @@ const { MongoClient } = require('mongodb');
 // [R2-THUMBNAIL] Thumbnail ad qua module ./thumbnail.js (tải ảnh -> upload
 // R2, R2-only, không lưu file local). Trạng thái R2 được log 1 dòng khi
 // khởi động ở main IIFE cuối file.
-const { downloadThumbnailForAd, getR2Status, hasThumbnail } = require('./thumbnail');
+const { downloadThumbnailForAd, getR2Status, hasThumbnail, videoUrlForAd, isVideoThumbnailUrl } = require('./thumbnail');
 process.removeAllListeners('warning');
 process.on('warning', (warning) => {
     if (warning.name === 'TimeoutNegativeWarning') return;
@@ -153,22 +153,30 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
     if (!existing) {
         // [R2-THUMBNAIL] thumb = { local, r2 } — URL R2 (null nếu R2 tắt/lỗi).
         // Thu het anh roi den preview video, thu tung URL cho den khi co thumb.
-        const thumb = await downloadThumbnailForAd(page, ad, ad.ad_archive_id);
+        let thumb = await downloadThumbnailForAd(page, ad, ad.ad_archive_id);
 
-        // [THUMB-ONLY-DB] Chi them ad moi vao DB khi upload thumbnail R2
-        // thanh cong. Ad khong co anh khong co gia tri cho tool soi ad (FE
-        // hien anh dai dien); giu lai chi lam loang DB + bang winning
-        // products. Ad bi bo qua se duoc thu lai o lan crawl sau (gap lai
-        // trong list moi — `seen` chi chan trong cung keyword/luot chay).
+        // [VIDEO-FALLBACK] Ad moi khong co thumbnail (tai anh loi / khong
+        // co URL anh) thi lay TAM video URL lam thumbnail_r2 de FE con hien
+        // video, thay vi bo qua ad — logic cu (THUMB-ONLY-DB) lam mat ~44%
+        // ad moi. Chi bo qua khi ad khong co ca anh lan video; ad bi bo qua
+        // se duoc thu lai o lan crawl sau (gap lai trong list moi — `seen`
+        // chi chan trong cung keyword/luot chay).
         if (!hasThumbnail(thumb)) {
-            console.log(`⏭️ [${keyword || '?'}] Bỏ qua Ad ID: ${ad.ad_archive_id} (không upload được thumbnail R2 — sẽ thử lại lần crawl sau)`);
+            const videoUrl = videoUrlForAd(ad);
+            if (videoUrl) {
+                thumb = { local: null, r2: videoUrl };
+                console.log(`🎬 [${keyword || '?'}] Ad ID: ${ad.ad_archive_id} không có thumbnail — dùng tạm video URL làm thumbnail_r2`);
+            }
+        }
+        if (!hasThumbnail(thumb)) {
+            console.log(`⏭️ [${keyword || '?'}] Bỏ qua Ad ID: ${ad.ad_archive_id} (không có ảnh lẫn video — sẽ thử lại lần crawl sau)`);
             return;
         }
 
         const newAdDoc = {
             ...ad,
             domain,
-            thumbnail_local: thumb.local, thumbnail_r2: thumb.r2, // [R2-THUMBNAIL] 4/4: URL ảnh trên R2 (null nếu R2 tắt/lỗi)
+            thumbnail_local: thumb.local, thumbnail_r2: thumb.r2, // [R2-THUMBNAIL] URL ảnh trên R2, hoặc video URL tạm nếu ad không có ảnh
             first_seen: now,
             last_seen: now,
             seen_count: 1,
@@ -210,9 +218,11 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
 
         // [R2-THUMBNAIL] Ad cu thieu thumbnail (lan crawl dau URL het han /
         // la ad video-only truoc khi co fallback preview) thi thu lay lai o
-        // lan crawl nay — khong de thieu vinh vien.
+        // lan crawl nay — khong de thieu vinh vien. Ad dang dung video URL
+        // tam lam thumbnail_r2 cung thu lai: URL video het han oe, neu tai
+        // duoc anh that thi ghi de thanh URL R2.
         let thumbUpdate = {};
-        if (!existing.thumbnail_r2 && !existing.thumbnail_local) {
+        if ((!existing.thumbnail_r2 && !existing.thumbnail_local) || isVideoThumbnailUrl(existing.thumbnail_r2)) {
             const thumb = await downloadThumbnailForAd(page, ad, ad.ad_archive_id);
             if (thumb && (thumb.r2 || thumb.local)) {
                 thumbUpdate = { thumbnail_r2: thumb.r2, thumbnail_local: thumb.local };
