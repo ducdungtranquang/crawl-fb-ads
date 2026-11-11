@@ -36,8 +36,11 @@ const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10);
 const MAX_RETRIES_PER_KEYWORD = 2;
 // [RAM-FIX] Restart browser dinh ky de giai phong RAM Chromium tich luy
 // qua nhieu keyword (1 browser chay het 374 keyword -> RAM phinh toi
-// 99% roi OOM kill). Chinh qua env BROWSER_RESTART_EVERY_KEYWORDS.
-const BROWSER_RESTART_EVERY_KEYWORDS = parseInt(process.env.BROWSER_RESTART_EVERY_KEYWORDS || '50', 10);
+// 99% roi OOM kill). Mac dinh 30 (khong phai 50): crawler-2 chi co 3.8GB
+// RAM, ngay 11/11 process bi OOM kill o keyword 38 — restart phai xay ra
+// TRUOC diem chet (38) thi moi cuu duoc, restart o 50 la qua muon.
+// Chinh qua env BROWSER_RESTART_EVERY_KEYWORDS (neu van OOM thi ha 25).
+const BROWSER_RESTART_EVERY_KEYWORDS = parseInt(process.env.BROWSER_RESTART_EVERY_KEYWORDS || '30', 10);
 
 let db;
 const seen = new Set();
