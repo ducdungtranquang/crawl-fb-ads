@@ -2,17 +2,10 @@ const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
-// [R2-THUMBNAIL] 1/4: module upload thumbnail lên Cloudflare R2 (xem r2-upload.js).
-const { uploadThumbnailToR2, r2ThumbnailExists, thumbnailKeyFor, r2PublicUrl } = require('./r2-upload');
-
-// ============================================================
-// [R2-THUMBNAIL] Các chỗ đã sửa để đẩy thumbnail lên R2:
-//   1. require('./r2-upload') ở đầu file (module upload + chống trùng)
-//   2. Hàm downloadThumbnail (HEAD R2 trước, rồi upload, fallback local)
-//   3. Dòng `const thumb = ...` trong saveAdAndDetailDirectly
-//   4. Field `thumbnail_r2` trong newAdDoc (cạnh `thumbnail_local`)
-// Muốn tắt R2: để trống key trong r2-upload.js là crawler tự về file local.
-// ============================================================
+// [R2-THUMBNAIL] Thumbnail ad qua module ./thumbnail.js (tải ảnh -> upload
+// R2, R2-only, không lưu file local). Trạng thái R2 được log 1 dòng khi
+// khởi động ở main IIFE cuối file.
+const { downloadThumbnailForAd, getR2Status, hasThumbnail } = require('./thumbnail');
 process.removeAllListeners('warning');
 process.on('warning', (warning) => {
     if (warning.name === 'TimeoutNegativeWarning') return;
@@ -43,8 +36,11 @@ const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10);
 const MAX_RETRIES_PER_KEYWORD = 2;
 // [RAM-FIX] Restart browser dinh ky de giai phong RAM Chromium tich luy
 // qua nhieu keyword (1 browser chay het 374 keyword -> RAM phinh toi
-// 99% roi OOM kill). Chinh qua env BROWSER_RESTART_EVERY_KEYWORDS.
-const BROWSER_RESTART_EVERY_KEYWORDS = parseInt(process.env.BROWSER_RESTART_EVERY_KEYWORDS || '50', 10);
+// 99% roi OOM kill). Mac dinh 30 (khong phai 50): crawler-2 chi co 3.8GB
+// RAM, ngay 11/11 process bi OOM kill o keyword 38 — restart phai xay ra
+// TRUOC diem chet (38) thi moi cuu duoc, restart o 50 la qua muon.
+// Chinh qua env BROWSER_RESTART_EVERY_KEYWORDS (neu van OOM thi ha 25).
+const BROWSER_RESTART_EVERY_KEYWORDS = parseInt(process.env.BROWSER_RESTART_EVERY_KEYWORDS || '30', 10);
 
 let db;
 const seen = new Set();
@@ -144,55 +140,8 @@ async function initializeInfrastructure() {
     console.log('✅ Crawler MongoDB connected & Index created.');
 }
 
-// [R2-THUMBNAIL] 2/4 ĐÃ SỬA: hàm này đẩy thumbnail lên R2 (HEAD check chống trùng)
-// thay vì chỉ ghi file local như trước.
-async function downloadThumbnail(page, imageUrl, adId) {
-    // [R2-ONLY] Chi upload len R2, KHONG luu file local nua (tranh day dia
-    // may crawler). R2 tat hoac upload loi -> khong co thumbnail (null).
-    // Thumbnail dùng chung theo hash của URL ảnh: ad trùng creative
-    // (cùng ảnh) và ad đã upload rồi đều trỏ chung 1 object R2.
-    // Check tồn tại trước: có rồi thì thôi, khỏi tải/upload lại.
-    if (!imageUrl || !adId) return { local: null, r2: null };
-    try {
-        const key = thumbnailKeyFor(imageUrl);
-        if (await r2ThumbnailExists(key)) return { local: null, r2: r2PublicUrl(key) };
-        const response = await page.request.get(imageUrl, { timeout: 5000 });
-        if (!response.ok()) return { local: null, r2: null };
-        const buffer = await response.body();
-        const r2Url = await uploadThumbnailToR2(buffer, key);
-        if (r2Url) return { local: null, r2: r2Url };
-        return { local: null, r2: null };
-    } catch {
-        return { local: null, r2: null };
-    }
-}
-
-// Danh sach URL anh ung vien cho thumbnail, theo thu tu uu tien:
-// het anh (images) truoc, roi den anh preview cua video (video_preview_image_url).
-// Ad video-only (khong co images) truoc day bi thumbnail null vi chi lay images[0].
-function thumbnailCandidatesForAd(ad) {
-    const out = [];
-    const push = (u) => { if (u && typeof u === 'string' && !out.includes(u)) out.push(u); };
-    for (const img of Array.isArray(ad?.images) ? ad.images : []) {
-        push(img?.original_image_url || img?.url || (typeof img === 'string' ? img : null));
-    }
-    for (const v of Array.isArray(ad?.videos) ? ad.videos : []) {
-        push(v?.video_preview_image_url || v?.video_preview_url || null);
-    }
-    return out;
-}
-
-// Thu tung URL ung vien cho den khi co thumbnail (R2 hoac local).
-// Chi can 1 URL het han / timeout thi thu URL ke tiep, khong bo cuoc ngay.
-async function downloadThumbnailForAd(page, ad, adId) {
-    const candidates = thumbnailCandidatesForAd(ad);
-    for (const url of candidates) {
-        const thumb = await downloadThumbnail(page, url, adId);
-        if (thumb && (thumb.r2 || thumb.local)) return thumb;
-    }
-    return { local: null, r2: null };
-}
-
+// Thumbnail ad (download + upload R2) nằm trong ./thumbnail.js — tách riêng
+// để test được mà không cần browser thật.
 async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyData = null) {
     const col = db.collection('ads');
     const now = Date.now();
@@ -202,9 +151,19 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
     let detailEntry = buildDetailEntry({ ...ad, domain }, keyword, transparencyData);
 
     if (!existing) {
-        // [R2-THUMBNAIL] 3/4: thumb = { local, r2 } — ưu tiên URL R2, fallback file local.
+        // [R2-THUMBNAIL] thumb = { local, r2 } — URL R2 (null nếu R2 tắt/lỗi).
         // Thu het anh roi den preview video, thu tung URL cho den khi co thumb.
         const thumb = await downloadThumbnailForAd(page, ad, ad.ad_archive_id);
+
+        // [THUMB-ONLY-DB] Chi them ad moi vao DB khi upload thumbnail R2
+        // thanh cong. Ad khong co anh khong co gia tri cho tool soi ad (FE
+        // hien anh dai dien); giu lai chi lam loang DB + bang winning
+        // products. Ad bi bo qua se duoc thu lai o lan crawl sau (gap lai
+        // trong list moi — `seen` chi chan trong cung keyword/luot chay).
+        if (!hasThumbnail(thumb)) {
+            console.log(`⏭️ [${keyword || '?'}] Bỏ qua Ad ID: ${ad.ad_archive_id} (không upload được thumbnail R2 — sẽ thử lại lần crawl sau)`);
+            return;
+        }
 
         const newAdDoc = {
             ...ad,
@@ -506,6 +465,11 @@ async function scanKeyword(context, keyword, index, total) {
 const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
 (async () => {
     await initializeInfrastructure();
+    // Log trạng thái R2 ngay khi khởi động (vụ 11/11/2026: R2 tắt lặng lẽ
+    // làm ad mới mất thumbnail mà log không nói lý do).
+    const r2 = getR2Status();
+    if (r2.enabled) console.log(`[R2] BẬT — bucket ${r2.bucket}, public ${r2.publicBaseUrl} — thumbnail ad mới sẽ upload lên R2.`);
+    else console.log(`[R2] TẮT (${r2.reason}) — ad mới sẽ KHÔNG có thumbnail. Kiểm tra key/secret R2 hoặc cài @aws-sdk/client-s3.`);
     let context = await createBrowserContext(isDocker);
 
     const keywords = [
