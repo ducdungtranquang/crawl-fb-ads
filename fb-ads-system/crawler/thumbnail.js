@@ -62,6 +62,12 @@ function thumbnailCandidatesForAd(ad) {
     return out;
 }
 
+// Ad co thumbnail R2 dung duoc khong. Chi tinh URL R2 (R2-only nen local
+// luon null — ad chi co thumbnail_local thi van tinh la KHONG co anh).
+function hasThumbnail(thumb) {
+    return Boolean(thumb && thumb.r2);
+}
+
 // Thu tung URL ung vien cho den khi co thumbnail.
 // Chi can 1 URL het han / timeout thi thu URL ke tiep, khong bo cuoc ngay.
 async function downloadThumbnailForAd(page, ad, adId) {
@@ -73,4 +79,4 @@ async function downloadThumbnailForAd(page, ad, adId) {
     return { local: null, r2: null };
 }
 
-module.exports = { downloadThumbnail, thumbnailCandidatesForAd, downloadThumbnailForAd, isR2Enabled, getR2Status };
+module.exports = { downloadThumbnail, thumbnailCandidatesForAd, downloadThumbnailForAd, hasThumbnail, isR2Enabled, getR2Status };
