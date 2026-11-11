@@ -404,6 +404,13 @@ function detectFunnel(ad) {
 // - Tuổi dùng số ngày THỰC (phân số, tối thiểu 0,05 ngày ≈ 1,2 giờ) thay vì
 //   làm tròn lên 1: các ad mới lên trong cùng 1 ngày không còn ra cùng
 //   một bộ ba $35 / 1,7k / 1 bản sao.
+// - Đa dạng hóa (2026-11-11): mô hình gốc chỉ dùng vài đầu vào rời rạc
+//   (tier bBase 3 mức, mInd 4 mức, CPM theo nước) nên nhiều ad khác nhau
+//   vẫn ra cùng 1 con số spend/reach. Nhân thêm hệ số nhỏ (tối đa +25%,
+//   thường +3-8%) từ 3 tín hiệu liên tục có sẵn theo từng ad: quy mô Page
+//   (số ad của page), độ đông của keyword (số ad cùng keyword), độ bền
+//   (seen_count). Page like KHÔNG có trong dữ liệu crawl (Library list
+//   không trả trường này) nên dùng page_ads_count làm tín hiệu quy mô Page.
 // Các hằng số điều chỉnh được tại SPEND_MODEL_CAPS. Công thức gốc
 // (D × T × bBase × mInd × fT) và các tier giữ nguyên.
 const SPEND_MODEL_CAPS = {
@@ -416,7 +423,7 @@ const SPEND_MODEL_CAPS = {
   minPageCapUsd: 5000,
 };
 
-function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1, pageAdsCount = 1) {
+function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1, pageAdsCount = 1, keywordDupCount = 1) {
   const T = Math.min(SPEND_MODEL_CAPS.maxDays, Math.max(SPEND_MODEL_CAPS.minAgeDays, durationDays));
   const D = Math.min(SPEND_MODEL_CAPS.maxCopies, Math.max(1, Math.round(duplicatesCount || ad.seen_count || 1)));
 
@@ -460,10 +467,19 @@ function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1, pageAd
 
   const fT = 1.0 + 0.12 * Math.log(T);
 
+  // 3b. Hệ số đa dạng hóa (xem ghi chú ở SPEND_MODEL_CAPS): phá vỡ các cặp
+  // spend/reach trùng nhau mà không đổi thứ hạng lớn hay tier. Mỗi thừa số
+  // dùng log1p nên tăng chậm theo tín hiệu (page 100 ad ≈ +9%, keyword
+  // 100 ad ≈ +9%, seen 10 lần ≈ +2%); tích tối đa chặn ở 1.25.
+  const diversify = Math.min(1.25,
+    (1 + 0.02 * Math.log1p(Math.max(0, pageAdsCount || 0))) *
+    (1 + 0.02 * Math.log1p(Math.max(0, keywordDupCount || 0))) *
+    (1 + 0.01 * Math.log1p(Math.max(0, ad.seen_count || 0))));
+
   // 4. Tính toán Ngân sách Chi tiêu — trả về KHOẢNG (min–max) thay vì 1 số điểm.
   // Khoảng phản ánh độ bất định lớn nhất của mô hình: việc xếp tier (bBase).
   // min = tier dưới, max = tier trên; ở tier biên thì nhân 0.5 / 1.5.
-  const spendFor = (b) => Math.max(D * T * b * mInd * fT, SPEND_MODEL_CAPS.spendFloorUsd); // Tối thiểu $1 tuyệt đối
+  const spendFor = (b) => Math.max(D * T * b * mInd * fT * diversify, SPEND_MODEL_CAPS.spendFloorUsd); // Tối thiểu $1 tuyệt đối
   let estimatedSpend = spendFor(bBase);
   const tierIdx = TIERS.indexOf(bBase);
   const bLow = tierIdx > 0 ? TIERS[tierIdx - 1] : bBase * 0.5;
@@ -503,7 +519,8 @@ function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1, pageAd
     estimated_spend: spendLevel,
     estimated_spend_source: 'model',
     estimated_spend_capped: spendCapped,
-    cpm_used: cpm
+    cpm_used: cpm,
+    spend_diversify: Number(diversify.toFixed(3))
   };
 }
 
@@ -634,13 +651,21 @@ function countIntoMaps(maps, ad) {
     maps.textMap[k] = (maps.textMap[k] || 0) + 1; // text rỗng không đếm (tránh phình D)
   }
   if (domain) maps.domainMap[domain] = (maps.domainMap[domain] || 0) + 1;
+  // Đếm độ đông của keyword: mỗi keyword trong keyword_mentions (crawler
+  // ghi lại từ khóa nào tìm thấy ad) đếm +1 — dùng cho hệ số đa dạng hóa
+  // spend/reach (keyword càng đông ad thì ad càng nhích nhẹ).
+  if (Array.isArray(ad.keyword_mentions)) {
+    for (const kw of ad.keyword_mentions) {
+      if (typeof kw === 'string' && kw) maps.keywordMap[kw] = (maps.keywordMap[kw] || 0) + 1;
+    }
+  }
   // Nhóm duplicate cho dedupe: pass 1 xây groupMap toàn cục, pass 2 chỉ
   // đọc (xem accumulateGroupMap). Text rỗng -> null, không gom.
   if (maps.groupMap) accumulateGroupMap(maps.groupMap, ad, text);
 }
 
 function emptyMaps() {
-  return { pageMap: {}, textMap: {}, domainMap: {}, textKeys: 0, groupMap: {} };
+  return { pageMap: {}, textMap: {}, domainMap: {}, keywordMap: {}, textKeys: 0, groupMap: {} };
 }
 
 // ===== NGƯỠNG PRESET (MINEA-STYLE) — phải khớp FILTER_DEFAULTS trong searchApi.js =====
@@ -669,7 +694,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
   if (!globalMaps) {
     for (const ad of ads) countIntoMaps(maps, ad);
   }
-  const { pageMap, textMap, domainMap } = maps;
+  const { pageMap, textMap, domainMap, keywordMap = {} } = maps;
   const groupMap = maps.groupMap || {};
 
   return ads.map(ad => {
@@ -697,7 +722,10 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     // là nhóm riêng để không ẩn nhầm.
     const groupInfo = selectGroupInfo(groupMap, ad, text, archiveId);
 
-    const spendReachData = estimateSpendAndReach(ad, ageDaysRaw, duplicatesCount, pageMap[ad.page_name] || 0);
+    // Độ đông của keyword: số ad cùng từ khóa đông nhất mà ad này từng được
+    // tìm thấy (keyword_mentions do crawler ghi). Không có keyword -> 1.
+    const keywordDupCount = Math.max(1, ...((Array.isArray(ad.keyword_mentions) ? ad.keyword_mentions : []).map((k) => keywordMap[k] || 1)));
+    const spendReachData = estimateSpendAndReach(ad, ageDaysRaw, duplicatesCount, pageMap[ad.page_name] || 0, keywordDupCount);
 
     let score = 0;
     const pageAds = pageMap[ad.page_name] || 0;
@@ -845,6 +873,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       estimated_spend_source: spendReachData.estimated_spend_source,
       estimated_spend_capped: spendReachData.estimated_spend_capped,
       cpm_used: spendReachData.cpm_used,
+      spend_diversify: spendReachData.spend_diversify,
       // Tín hiệu thô để sau này build bộ lọc "Quảng cáo mới lên",
       // "Ready to Scale", "Đang chạy mạnh". Ngưỡng chỉ là gợi ý,
       // chỉnh khi build filter thật.
@@ -857,6 +886,12 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
         is_new_ad: isNewAd,
         is_ready_to_scale: isReadyToScale,
         is_weekly_winner: isWeeklyWinner,
+        // OTHER = không phải VN (gồm cả ad chưa có nhãn nước): cờ tính sẵn
+        // để API lọc bằng equality boolean thay vì $ne 'vn' (xem fix
+        // OTHER 11/11: $ne không dùng được index -> đếm >25s -> FE timeout
+        // rồi trả 0). Tính SAU fallback suy luận VN nên ad suy luận 'vn'
+        // không lọt vào OTHER.
+        is_other: !countriesLower.includes('vn'),
         seen_within_week: seenWithinWeek,
         duplicates_count: duplicatesCount,
         page_ads_count: pageAds,
@@ -1476,7 +1511,11 @@ async function main() {
         { key: { domain_lower: 1, is_group_rep: 1, start_date: -1 }, name: "idx_domain_rep_start" },
         { key: { page_name_lower: 1, is_group_rep: 1, start_date: -1 }, name: "idx_page_rep_start" },
         { key: { countries_lower: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: "idx_countries_rep_start" },
-        { key: { is_group_rep: 1, last_seen: -1, countries_lower: 1, start_date: -1 }, name: "idx_other_rep_start" },
+        // OTHER (fix 11/11): cờ filter_signals.is_other thay $ne 'vn' —
+        // equality boolean dùng được COUNT_SCAN. Giữ countries_lower trong
+        // key để đường fallback $ne (trước FULL) vẫn kiểm tra từ index.
+        // Cùng tên, khác key nên deploy PHẢI drop index cũ trước.
+        { key: { is_group_rep: 1, last_seen: -1, 'filter_signals.is_other': 1, countries_lower: 1, start_date: -1 }, name: "idx_other_rep_start" },
         // 2 index dem/sort khi dedupe bat (truoc day chi co trong
         // create-indexes.js, analyzer FULL khong tu tao).
         { key: { is_group_rep: 1, estimated_spend_usd: 1 }, name: "idx_group_rep_spend" },
@@ -1521,7 +1560,7 @@ async function main() {
     logMemory(`[Scanner] Pass 1 xong — unique texts (hash): ${maps.textKeys}, pages: ${Object.keys(maps.pageMap).length}, domains: ${Object.keys(maps.domainMap).length}`);
 
     // PASS 2: xử lý theo batch, dùng map toàn cục của pass 1
-    const BATCH_SIZE = 500; // hạ xuống 200 nếu RAM vẫn căng (doc nặng)
+    const BATCH_SIZE = 750; // tang tu 500 len 750 (11/11: chay nhanh hon); ha xuong 200 neu RAM van cang (doc nang)
     let batch = [];
     let totalProcessed = 0;
     const productStats = {};

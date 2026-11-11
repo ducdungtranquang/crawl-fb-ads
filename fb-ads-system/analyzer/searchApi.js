@@ -297,8 +297,6 @@ const SORT_FIELD_ALIASES = {
     trending_score: 'trending_score', trendingscore: 'trending_score', trending: 'trending_score',
     start_date: 'start_date', startdate: 'start_date', newest: 'start_date', 'moi nhat': 'start_date',
     published: 'start_date', 'moi xuat ban nhat': 'start_date',
-    duplicates_count: 'duplicates_count', duplicates: 'duplicates_count', copies: 'duplicates_count',
-    'nhieu ban sao nhat': 'duplicates_count', 'ban sao': 'duplicates_count',
     duration_days: 'duration_days', duration: 'duration_days', 'chay lau nhat': 'duration_days',
     estimated_spend_usd: 'estimated_spend_usd', spend: 'estimated_spend_usd',
     'chi tieu uoc tinh cao nhat': 'estimated_spend_usd', 'chi tieu': 'estimated_spend_usd',
@@ -408,7 +406,7 @@ function normalizePresetNames(filterParam) {
 // builder; gọi trực tiếp (test/unit) không truyền schema thì mặc định
 // đường nhanh như cũ để không vỡ test cũ.
 const SCHEMA_PROBE_TTL_MS = 5 * 60 * 1000;
-let schemaProbeCache = { at: 0, probe: { lower: true, country: true, industry: true, rank: true, flags: true } };
+let schemaProbeCache = { at: 0, probe: { lower: true, country: true, industry: true, rank: true, flags: true, otherFlag: true } };
 let schemaProbeInFlight = null;
 async function refreshSchemaProbe(adsCol) {
     const now = Date.now();
@@ -419,15 +417,16 @@ async function refreshSchemaProbe(adsCol) {
             const docs = await adsCol.find({})
                 .project({ page_name_lower: 1, domain_lower: 1, countries_lower: 1, industry: 1, creative_rank: 1, filter_signals: 1, is_group_rep: 1, preset_priority: 1 })
                 .sort({ last_seen: -1 }).limit(3).toArray();
-            const probe = { lower: true, country: true, industry: true, rank: true, flags: true, groupRep: true, priority: true };
+            const probe = { lower: true, country: true, industry: true, rank: true, flags: true, groupRep: true, priority: true, otherFlag: true };
             if (!docs.length) {
-                Object.assign(probe, { lower: false, country: false, industry: false, rank: false, flags: false, groupRep: false, priority: false });
+                Object.assign(probe, { lower: false, country: false, industry: false, rank: false, flags: false, groupRep: false, priority: false, otherFlag: false });
             } else {
                 probe.lower = docs.every(d => typeof d.page_name_lower === 'string' && typeof d.domain_lower === 'string');
                 probe.country = docs.every(d => Array.isArray(d.countries_lower));
                 probe.industry = docs.every(d => typeof d.industry === 'string' && d.industry.length > 0);
                 probe.rank = docs.every(d => typeof d.creative_rank === 'number');
                 probe.flags = docs.every(d => d.filter_signals && typeof d.filter_signals.is_new_ad === 'boolean');
+                probe.otherFlag = docs.every(d => d.filter_signals && typeof d.filter_signals.is_other === 'boolean');
                 probe.groupRep = docs.every(d => typeof d.is_group_rep === 'boolean');
                 probe.priority = docs.every(d => typeof d.preset_priority === 'number');
             }
@@ -435,7 +434,7 @@ async function refreshSchemaProbe(adsCol) {
             return probe;
         } catch (e) {
             console.warn('[Search API] Schema probe lỗi, dùng fallback an toàn:', e.message);
-            const probe = { lower: false, country: false, industry: false, rank: false, flags: false, groupRep: false, priority: false };
+            const probe = { lower: false, country: false, industry: false, rank: false, flags: false, groupRep: false, priority: false, otherFlag: false };
             schemaProbeCache = { at: Date.now(), probe };
             return probe;
         } finally {
@@ -525,7 +524,14 @@ function buildCountryCondition(countryParam, schema) {
     // hoặc thiếu — $ne khớp cả trường vắng mặt). Giả định: countries_lower
     // đã chuẩn hóa ISO (migrate PR #7 + analyzer ghi ISO).
     if (codes.includes('other')) {
-        const otherCond = { countries_lower: { $ne: 'vn' } };
+        // Cờ filter_signals.is_other (analyzer ghi sẵn, có index riêng):
+        // equality boolean nên COUNT_SCAN được, nhanh hơn $ne 'vn' (vốn
+        // không dùng được index -> đếm >25s -> FE route timeout 25s rồi
+        // trả 0 — gốc lỗi OTHER=0 ngày 11/11). Khi probe chưa thấy cờ
+        // (analyzer chưa FULL bản mới) thì fallback $ne cũ.
+        const otherCond = (schema && schema.otherFlag)
+            ? { 'filter_signals.is_other': true }
+            : { countries_lower: { $ne: 'vn' } };
         const rest = codes.filter((c) => c !== 'other');
         if (!rest.length) return otherCond;
         return { $or: [otherCond, { countries_lower: { $in: rest.flatMap(countryMatchValues) } }] };
@@ -785,7 +791,7 @@ async function refreshEsDedupeProbe(esClient) {
 }
 
 // Các field sort được phép (dùng chung cho handler + resolveSearchSort).
-const ALLOWED_SORT_FIELDS = new Set(['score', 'trending_score', 'start_date', 'seen_count', 'analyzed_at', 'first_seen', 'last_seen', 'scaling_score', 'estimated_spend_usd', 'duplicates_count', 'duration_days', 'estimated_spend_max_usd', 'estimated_spend_min_usd', 'estimated_reach']);
+const ALLOWED_SORT_FIELDS = new Set(['score', 'trending_score', 'start_date', 'seen_count', 'analyzed_at', 'first_seen', 'last_seen', 'scaling_score', 'estimated_spend_usd', 'duration_days', 'estimated_spend_max_usd', 'estimated_spend_min_usd', 'estimated_reach']);
 
 // Param tinh chỉnh theo từng preset. Một preset dùng đường nhanh cờ khi
 // user không truyền param nào, HOẶC mọi param đã truyền đều BẰNG đúng giá
