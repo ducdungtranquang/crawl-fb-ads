@@ -9,7 +9,6 @@
 // - Trước khi tải/upload, code HEAD R2 theo key: đã có thì dùng luôn URL
 //   đó, khỏi tải lại, khỏi upload lại. Check này dùng chung cho cả 2 máy
 //   crawl vì cùng 1 bucket.
-// - File local fallback cũng đặt tên theo hash để ad trùng ảnh dùng chung.
 //
 // CÁCH GẮN KEY (chọn 1 trong 2, chỉ làm TRÊN MÁY VM):
 //   Cách 1: dán Access Key ID + Secret Access Key của token R2 vào 2 dòng
@@ -22,8 +21,9 @@
 // (nếu có) sẽ thắng.
 //
 // Thiếu key/secret (còn nguyên chữ PASTE_HERE hoặc chưa đặt env) thì mọi
-// hàm upload/exists trả về null/false, crawler tự fallback sang ghi file
-// local như cũ — crawler không bao giờ crash vì R2.
+// hàm upload/exists trả về null/false — crawler KHÔNG crash vì R2, nhưng
+// ad mới sẽ KHÔNG có thumbnail (R2-only từ 10/11/2026, không còn fallback
+// ghi file local). Xem getR2Status() để biết R2 tắt vì lý do gì.
 
 // ============================================================
 //  DÁN KEY/SECRET VÀO 2 DÒNG DƯỚI (chỉ trên máy VM, không commit)
@@ -84,11 +84,24 @@ if (ENABLED) {
     credentials: { accessKeyId: ACCESS_KEY_ID, secretAccessKey: SECRET_ACCESS_KEY },
   });
 } else if (S3Client) {
-  console.warn('[R2] Chưa gắn key/secret R2 (dán vào 2 dòng PASTE_HERE trong file hoặc đặt biến môi trường R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY) — upload R2 tắt, dùng file local.');
+  console.warn('[R2] Chưa gắn key/secret R2 (dán vào 2 dòng PASTE_HERE trong file hoặc đặt biến môi trường R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY) — upload R2 tắt, ad mới sẽ không có thumbnail.');
 }
 
 function isR2Enabled() {
   return ENABLED;
+}
+
+// Trạng thái R2 để crawler log rõ ngay khi khởi động (trước đây R2 tắt
+// lặng lẽ trả null, ad mới mất thumbnail mà log không nói lý do — vụ
+// 11/11/2026). reason: null khi bật; 'sdk-missing' khi chưa cài
+// @aws-sdk/client-s3; 'keys-missing' khi thiếu key/secret;
+// 'config-missing' khi thiếu cấu hình khác (account/bucket/public URL).
+function getR2Status() {
+  let reason = null;
+  if (!S3Client || !PutObjectCommand || !HeadObjectCommand) reason = 'sdk-missing';
+  else if (!ACCESS_KEY_ID || !SECRET_ACCESS_KEY) reason = 'keys-missing';
+  else if (!ACCOUNT_ID || !BUCKET || !PUBLIC_BASE_URL) reason = 'config-missing';
+  return { enabled: ENABLED, reason, bucket: BUCKET, publicBaseUrl: PUBLIC_BASE_URL };
 }
 
 // Key R2 theo hash của URL ảnh — ad trùng ảnh dùng chung 1 key.
@@ -114,9 +127,18 @@ async function r2ThumbnailExists(key) {
 }
 
 // Upload buffer ảnh theo key đã tính, trả về URL công khai đầy đủ,
-// lỗi trả về null.
+// lỗi trả về null. R2 tắt thì cảnh báo 1 lần duy nhất mỗi process
+// (trước đây lặng lẽ trả null nên không ai biết R2 đang tắt).
+let disabledWarned = false;
 async function uploadThumbnailToR2(buffer, key) {
-  if (!ENABLED || !buffer || !key) return null;
+  if (!ENABLED || !buffer || !key) {
+    if (!ENABLED && !disabledWarned) {
+      disabledWarned = true;
+      const st = getR2Status();
+      console.warn(`[R2] Upload tắt (${st.reason}) — thumbnail sẽ là null, ad mới không có ảnh. Kiểm tra key/secret R2 hoặc cài @aws-sdk/client-s3.`);
+    }
+    return null;
+  }
   try {
     await s3.send(new PutObjectCommand({
       Bucket: BUCKET,
@@ -132,4 +154,4 @@ async function uploadThumbnailToR2(buffer, key) {
   }
 }
 
-module.exports = { uploadThumbnailToR2, r2ThumbnailExists, thumbnailKeyFor, r2PublicUrl, isR2Enabled };
+module.exports = { uploadThumbnailToR2, r2ThumbnailExists, thumbnailKeyFor, r2PublicUrl, isR2Enabled, getR2Status };
