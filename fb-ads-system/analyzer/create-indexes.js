@@ -80,10 +80,14 @@ const INDEXES = [
   { key: { domain_lower: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_domain_rep_start' },
   { key: { page_name_lower: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_page_rep_start' },
   { key: { countries_lower: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_countries_rep_start' },
-  // OTHER ($ne 'vn'): countries_lower dung $ne nen khong dung duoc prefix
-  // cua idx_countries_rep_start; can equality is_group_rep + range
-  // last_seen dung truoc, countries_lower kiem tra tu index (COUNT_SCAN).
-  { key: { is_group_rep: 1, last_seen: -1, countries_lower: 1, start_date: -1 }, name: 'idx_other_rep_start' },
+  // OTHER (fix 11/11): $ne 'vn' khong dung duoc index -> dem >25s -> FE
+  // route timeout 25s roi tra 0. Analyzer ghi san co
+  // filter_signals.is_other (khong phai VN, gom ca ad chua co nhan nuoc);
+  // query dung equality boolean tren co (xem buildCountryCondition).
+  // Giu countries_lower trong key de duong fallback $ne (truoc FULL)
+  // van kiem tra tu index. Cung ten, khac key -> deploy PHAI drop index
+  // cu truoc khi chay create-indexes.js (xem ghi chu deploy).
+  { key: { is_group_rep: 1, last_seen: -1, 'filter_signals.is_other': 1, countries_lower: 1, start_date: -1 }, name: 'idx_other_rep_start' },
   { key: { last_seen: -1 }, name: 'idx_last_seen' },
   { key: { duration_days: 1 }, name: 'idx_duration_days' },
   { key: { estimated_spend_usd: -1 }, name: 'spend_usd_sort' },
