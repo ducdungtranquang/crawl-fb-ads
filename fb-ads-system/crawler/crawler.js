@@ -5,7 +5,7 @@ const { MongoClient } = require('mongodb');
 // [R2-THUMBNAIL] Thumbnail ad qua module ./thumbnail.js (tải ảnh -> upload
 // R2, R2-only, không lưu file local). Trạng thái R2 được log 1 dòng khi
 // khởi động ở main IIFE cuối file.
-const { downloadThumbnailForAd, getR2Status } = require('./thumbnail');
+const { downloadThumbnailForAd, getR2Status, hasThumbnail } = require('./thumbnail');
 process.removeAllListeners('warning');
 process.on('warning', (warning) => {
     if (warning.name === 'TimeoutNegativeWarning') return;
@@ -151,6 +151,16 @@ async function saveAdAndDetailDirectly(ad, page, keyword = null, transparencyDat
         // [R2-THUMBNAIL] thumb = { local, r2 } — URL R2 (null nếu R2 tắt/lỗi).
         // Thu het anh roi den preview video, thu tung URL cho den khi co thumb.
         const thumb = await downloadThumbnailForAd(page, ad, ad.ad_archive_id);
+
+        // [THUMB-ONLY-DB] Chi them ad moi vao DB khi upload thumbnail R2
+        // thanh cong. Ad khong co anh khong co gia tri cho tool soi ad (FE
+        // hien anh dai dien); giu lai chi lam loang DB + bang winning
+        // products. Ad bi bo qua se duoc thu lai o lan crawl sau (gap lai
+        // trong list moi — `seen` chi chan trong cung keyword/luot chay).
+        if (!hasThumbnail(thumb)) {
+            console.log(`⏭️ [${keyword || '?'}] Bỏ qua Ad ID: ${ad.ad_archive_id} (không upload được thumbnail R2 — sẽ thử lại lần crawl sau)`);
+            return;
+        }
 
         const newAdDoc = {
             ...ad,
