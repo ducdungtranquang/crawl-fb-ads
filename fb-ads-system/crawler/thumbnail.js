@@ -10,10 +10,19 @@
 //   4. R2 tat (chua cai SDK / chua gan key) thi tra null ngay, KHONG tai
 //      anh (truoc day van tai roi moi tra null, vua ton bang thong vua
 //      lang le lam ad moi mat anh — vu 11/11/2026).
+//   5. Tai anh loi (HTTP 403/404, timeout, ...) thi LOG ly do ra console
+//      (them 11/11/2026 sau vu skip ~44% ad moi: truoc day tai loi tra
+//      null lang le nen khong phan biet duoc voi loi upload R2).
 //
 // Ad cu thieu thumbnail duoc crawl lai thu lay (xem saveAdAndDetailDirectly
 // trong crawler.js), nen khi R2 bat lai thi anh duoc lap dan.
 const { uploadThumbnailToR2, r2ThumbnailExists, thumbnailKeyFor, r2PublicUrl, isR2Enabled, getR2Status } = require('./r2-upload');
+
+// Rut gon URL anh de log: chi giu origin + pathname, bo query (chua token
+// oe/... het han) de log gon va khong lo token ra log.
+function shortUrl(u) {
+    try { const x = new URL(u); return x.origin + x.pathname; } catch { return String(u).slice(0, 80); }
+}
 
 let r2DisabledWarned = false;
 function warnR2DisabledOnce() {
@@ -32,7 +41,10 @@ async function downloadThumbnail(page, imageUrl, adId) {
         const key = thumbnailKeyFor(imageUrl);
         if (await r2ThumbnailExists(key)) return { local: null, r2: r2PublicUrl(key) };
         const response = await page.request.get(imageUrl, { timeout: 5000 });
-        if (!response.ok()) return { local: null, r2: null };
+        if (!response.ok()) {
+            console.warn(`[thumb] Ad ${adId}: tải ảnh lỗi HTTP ${response.status()} (${shortUrl(imageUrl)})`);
+            return { local: null, r2: null };
+        }
         const buffer = await response.body();
         let r2Url = await uploadThumbnailToR2(buffer, key);
         if (!r2Url) {
@@ -42,7 +54,8 @@ async function downloadThumbnail(page, imageUrl, adId) {
         }
         if (r2Url) return { local: null, r2: r2Url };
         return { local: null, r2: null };
-    } catch {
+    } catch (err) {
+        console.warn(`[thumb] Ad ${adId}: tải ảnh lỗi (${err && err.message ? err.message : 'unknown'}) (${shortUrl(imageUrl)})`);
         return { local: null, r2: null };
     }
 }
@@ -68,10 +81,33 @@ function hasThumbnail(thumb) {
     return Boolean(thumb && thumb.r2);
 }
 
+// URL video tot nhat cua ad — cung thu tu uu tien nhu pickVideoUrl ben
+// searchApi (hd truoc, sd sau, roi video_url). Dung lam fallback TAM cho
+// thumbnail_r2 khi ad khong co anh (tai anh loi / khong co URL anh), de
+// ad khong bi mat khoi DB va FE con hien duoc video. Tra '' neu ad khong
+// co video.
+function videoUrlForAd(ad) {
+    if (!ad) return '';
+    const vids = Array.isArray(ad.videos) ? ad.videos : [];
+    const first = vids[0] || {};
+    return first.video_hd_url || first.video_sd_url || first.video_url || ad.video_url || '';
+}
+
+// thumbnail_r2 co phai URL video tam (fallback) khong — nhan dang bang
+// .mp4 (URL video fbcdn dang ...mp4?oe=...; URL anh R2 dang ...jpg).
+// Dung de: ad cu co thumbnail video tam thi van duoc thu lay anh that o
+// lan crawl sau (khong thi URL video het han oe se hong vinh vien).
+function isVideoThumbnailUrl(url) {
+    return /\.mp4(\?|$)/i.test(String(url || ''));
+}
+
 // Thu tung URL ung vien cho den khi co thumbnail.
 // Chi can 1 URL het han / timeout thi thu URL ke tiep, khong bo cuoc ngay.
 async function downloadThumbnailForAd(page, ad, adId) {
     const candidates = thumbnailCandidatesForAd(ad);
+    if (candidates.length === 0) {
+        console.warn(`[thumb] Ad ${adId}: không có URL ảnh ứng viên (không images, không video_preview_image_url)`);
+    }
     for (const url of candidates) {
         const thumb = await downloadThumbnail(page, url, adId);
         if (thumb && (thumb.r2 || thumb.local)) return thumb;
@@ -79,4 +115,4 @@ async function downloadThumbnailForAd(page, ad, adId) {
     return { local: null, r2: null };
 }
 
-module.exports = { downloadThumbnail, thumbnailCandidatesForAd, downloadThumbnailForAd, hasThumbnail, isR2Enabled, getR2Status };
+module.exports = { downloadThumbnail, thumbnailCandidatesForAd, downloadThumbnailForAd, hasThumbnail, videoUrlForAd, isVideoThumbnailUrl, isR2Enabled, getR2Status };
