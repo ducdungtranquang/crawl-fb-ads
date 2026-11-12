@@ -80,6 +80,16 @@ const INDEXES = [
   { key: { domain_lower: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_domain_rep_start' },
   { key: { page_name_lower: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_page_rep_start' },
   { key: { countries_lower: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_countries_rep_start' },
+  // VN + spend (fix 12/11): FE gui estimated_spend la 1 tier
+  // ('VERY HIGH'/'HIGH'/'MEDIUM'/'LOW', xem SPEND_TIER_MAP) qua param
+  // estimated_spend; query VN+spend truoc day khong co index nao chua ca
+  // countries_lower + estimated_spend nen planner phai FETCH tung doc de
+  // loc chieu con lai roi sort start_date trong bo nho -> timeout 25s.
+  // Thu tu key: equality (nuoc, tier, rep) -> sort (start_date) ->
+  // range (last_seen) cuoi. Them 1 index, tran 64: danh sach co 60
+  // entry + _id = 61 -> them index nay thanh 62, van du slot (chi them
+  // 1 index nay, khong them index USD vi FE chi gui tier).
+  { key: { countries_lower: 1, estimated_spend: 1, is_group_rep: 1, start_date: -1, last_seen: -1 }, name: 'idx_country_spend_tier_rep_start' },
   // OTHER (fix 11/11): $ne 'vn' khong dung duoc index -> dem >25s -> FE
   // route timeout 25s roi tra 0. Analyzer ghi san co
   // filter_signals.is_other (khong phai VN, gom ca ad chua co nhan nuoc);
