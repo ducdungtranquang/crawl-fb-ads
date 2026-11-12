@@ -33,6 +33,7 @@ const MAX_ADS_PER_KEYWORD = parseInt(process.env.MAX_ADS_PER_KEYWORD || '700', 1
 const MAX_SCROLLS_PER_KEYWORD = parseInt(process.env.MAX_SCROLLS_PER_KEYWORD || '60', 10);
 const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10);
 const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10);
+const KEYWORD_HARD_TIMEOUT = parseInt(process.env.KEYWORD_HARD_TIMEOUT || '300000', 10);
 const MAX_RETRIES_PER_KEYWORD = 2;
 // [RAM-FIX] Restart browser dinh ky de giai phong RAM Chromium tich luy
 // qua nhieu keyword (1 browser chay het 374 keyword -> RAM phinh toi
@@ -511,6 +512,32 @@ async function scanKeyword(context, keyword, index, total) {
     return true;
 }
 
+// [WATCHDOG 12/11] Chan cung cho moi keyword: vong cuon trong
+// scanKeyword da co KEYWORD_TIMEOUT 180s, nhung page.close() /
+// restartBrowserContext() / handler 'response' (res.text, Mongo
+// findOne/insertOne/updateOne khong co timeout) thi khong co gioi
+// han — ket o do la treo hang gio nhu 'watch' tren crawler-2.
+// Het KEYWORD_HARD_TIMEOUT (mac dinh 5 phut) thi tra false de main
+// loop restart browser va thu lai / bo qua keyword, thay vi dung yen.
+// Luu y: scanKeyword cu van chay nen o background (luu ad trung thi
+// dedupe theo ad ID nen khong mat/khong trung du lieu); lastSavedAt
+// la bien global nen no co the cham vao IDLE cua keyword ke tiep,
+// nhung scanKeyword moi reset lastSavedAt ngay dau nen anh huong nho.
+async function scanKeywordWithWatchdog(context, keyword, index, total) {
+    let timer;
+    const timeoutPromise = new Promise((resolve) => {
+        timer = setTimeout(() => {
+            console.log(`⏱️ [WATCHDOG] [${keyword}] qua ${KEYWORD_HARD_TIMEOUT / 1000}s van chua xong — bo qua keyword nay, restart browser.`);
+            resolve(false);
+        }, KEYWORD_HARD_TIMEOUT);
+    });
+    try {
+        return await Promise.race([scanKeyword(context, keyword, index, total), timeoutPromise]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
 (async () => {
     await initializeInfrastructure();
@@ -522,107 +549,107 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
     let context = await createBrowserContext(isDocker);
 
     const keywords = [
-        // --- Gia dung & Nha cua ---
-        'nhà bếp', 'đồ nấu ăn', 'máy xay sinh tố', 'nồi chiên không dầu', 'máy pha cà phê',
-        'ấm siêu tốc', 'máy hút bụi', 'robot hút bụi', 'máy lọc không khí', 'máy tạo ẩm',
-        'quạt', 'máy sưởi', 'đèn', 'đèn led', 'nội thất',
-        'sofa', 'ghế', 'bàn', 'giường', 'nệm',
-        'chăn ga gối', 'rèm cửa', 'hộp đựng đồ', 'khay đựng', 'dụng cụ vệ sinh',
-        'cây lau nhà', 'chổi', 'nước giặt', 'khuôn làm bánh', 'thớt',
-        'bộ dao', 'nồi', 'chảo', 'bình nước', 'bình giữ nhiệt',
-        'hộp cơm', 'hộp đựng thức ăn', 'đồ dùng nhà bếp', 'đồ gia dụng', 'gia dụng',
-        'nhà thông minh', 'khóa cửa', 'camera an ninh', 'chuông cửa', 'vòi sen',
-        'vòi nước', 'phòng tắm', 'gương', 'thảm', 'thảm trải sàn',
-        'đồ trang trí', 'tranh treo tường', 'chậu cây', 'vườn', 'dụng cụ',
-        'máy khoan', 'hộp dụng cụ', 'thang', 'ổ cắm điện', 'pin',
-        'cục sạc', 'dây cáp',
-        // --- Da nang & Tien ich ---
-        'đa năng', 'đa công dụng', 'tất cả trong một', 'gấp gọn', 'cầm tay',
-        'di động', 'điều chỉnh được', 'tái sử dụng', 'chống nước', 'không dây',
-        'sạc lại được', 'nhỏ gọn', 'mini', 'đồ tiện ích', 'giá đỡ',
-        'chân đế', 'giá treo', 'ốp lưng', '2 trong 1', '3 trong 1',
-        'du lịch', 'ngoài trời',
-        // --- Hat giong & Lam vuon ---
-        'hạt giống', 'hạt giống cây trồng', 'hạt giống rau', 'hạt giống hoa', 'hạt giống thảo mộc',
-        'hạt giống trái cây', 'hạt giống làm vườn', 'hạt giống hữu cơ', 'hạt giống thuần chủng', 'trồng cây',
-        'làm vườn', 'chậu trồng cây', 'đất trồng', 'phân bón', 'nhà kính',
-        'thủy canh', 'mầm', 'bộ trồng cây', 'cây bonsai', 'sen đá',
-        'cây trong nhà',
-        // --- My pham & Lam dep ---
-        'mỹ phẩm', 'trang điểm', 'chăm sóc da', 'serum', 'kem dưỡng ẩm',
-        'kem chống nắng', 'son môi', 'mascara', 'kẻ mắt', 'kem nền',
-        'kem che khuyết điểm', 'phấn má', 'phấn mắt', 'sơn móng tay', 'nước hoa',
-        'hương thơm', 'dầu gội', 'dầu xả', 'chăm sóc tóc', 'dầu dưỡng tóc',
-        'ủ tóc', 'râu', 'cạo râu', 'dao cạo', 'làm trắng răng',
-        'kem đánh răng', 'làm trắng', 'chống lão hóa', 'collagen', 'vitamin c',
-        'retinol', 'mặt nạ', 'sữa rửa mặt', 'toner', 'sữa dưỡng thể',
-        'sữa tắm', 'xà phòng', 'lăn khử mùi', 'làm đẹp', 'làm nail',
-        'nối mi', 'lông mày', 'son bóng', 'máy sấy tóc', 'máy duỗi tóc',
-        'máy uốn tóc', 'tinh dầu',
-        // --- Mua sam & Khuyen mai ---
-        'mua ngay', 'miễn phí vận chuyển', 'freeship', 'giảm giá', 'sale',
-        'khuyến mãi', 'xả kho', 'flash sale', 'bán chạy nhất', 'hàng mới về',
-        'quà tặng', 'ý tưởng quà tặng', 'combo', 'deal', 'ưu đãi',
-        'mã giảm giá', 'giá rẻ', 'đặt hàng ngay', 'giới hạn thời gian', 'độc quyền',
-        'cao cấp', 'đang hot', 'xu hướng', 'viral', 'phải có',
-        'đánh giá cao', 'hoàn tiền', 'mua 1 tặng 1', 'combo ưu đãi', 'hàng về lại',
-        'giảm 50%', 'ưu đãi đặc biệt',
-        // --- Dien tu ---
-        'điện thoại', 'tai nghe', 'tai nghe không dây', 'loa', 'đồng hồ thông minh',
-        'đồng hồ', 'máy tính bảng', 'laptop', 'máy ảnh', 'flycam',
-        'máy chiếu', 'sạc dự phòng', 'bàn phím', 'chuột máy tính', 'màn hình',
-        'tivi', 'loa thanh', 'bluetooth', 'micro',
-        'webcam', 'máy in', 'router', 'wifi', 'tivi thông minh',
-        // --- Thoi trang ---
-        'quần áo', 'giày', 'giày sneaker', 'dép sandal', 'giày boot',
-        'váy', 'đầm', 'áo sơ mi', 'quần', 'quần jean',
-        'áo khoác', 'áo hoodie', 'áo thun', 'đồ lót', 'tất',
-        'mũ', 'mũ lưỡi trai', 'khăn quàng', 'găng tay', 'thắt lưng',
-        'ví', 'túi xách', 'balo', 'vali', 'kính râm',
-        'trang sức', 'dây chuyền', 'nhẫn', 'bông tai', 'vòng tay',
-        'thời trang đường phố', 'thời trang thiết kế', 'đồ thể thao', 'quần legging', 'đồ bơi',
-        'đồ ngủ', 'dép đi trong nhà', 'giày cao gót',
-        // --- Suc khoe & The hinh ---
-        'thực phẩm chức năng', 'vitamin', 'protein', 'men vi sinh', 'dầu cá',
-        'omega', 'magie', 'kẽm', 'thảo dược', 'trà',
-        'mật ong', 'thải độc', 'giảm cân', 'ăn kiêng', 'keto',
-        'thuần chay', 'hữu cơ', 'tốt cho sức khỏe', 'thể hình', 'phòng gym',
-        'yoga', 'tạ tay', 'dây kháng lực', 'máy chạy bộ', 'tập thể dục',
-        'massage', 'tư thế', 'chỉnh hình', 'giảm đau', 'giấc ngủ',
-        'gối', 'chăn', 'thảm yoga', 'súng massage', 'đai chỉnh tư thế',
-        'máy lọc nước',
-        // --- Me & Be ---
-        'em bé', 'quần áo trẻ em', 'đồ chơi trẻ em', 'bỉm', 'xe đẩy',
-        'bình sữa', 'đồ bầu', 'trẻ em', 'đồ ăn dặm', 'chăm sóc bé',
-        'giày trẻ em', 'cặp sách', 'máy theo dõi bé', 'cũi', 'địu em bé',
-        // --- Thu cung ---
-        'thú cưng', 'chó', 'mèo', 'thức ăn cho chó', 'thức ăn cho mèo',
-        'đồ chơi thú cưng', 'chăm sóc thú cưng', 'dây dắt chó', 'vòng cổ thú cưng', 'cát vệ sinh mèo',
-        'chim', 'cá', 'giường thú cưng', 'sữa tắm thú cưng', 'bánh thưởng thú cưng',
-        'bể cá',
-        // --- Thuc pham ---
-        'đồ ăn vặt', 'cà phê', 'sô cô la', 'gia vị', 'nước sốt',
-        'mì', 'gạo', 'trái cây sấy', 'các loại hạt', 'kẹo',
-        'đồ uống', 'nước ép', 'nước tăng lực', 'thanh protein', 'granola',
-        'yến mạch', 'bơ đậu phộng', 'dầu oliu', 'dầu dừa', 'làm bánh',
-        'thực phẩm hữu cơ', 'thực phẩm lành mạnh', 'không gluten',
-        // --- Xe co ---
-        'phụ kiện ô tô', 'camera hành trình', 'rửa xe', 'ghế ô tô', 'lốp xe',
-        'chăm sóc xe', 'xe máy', 'xe đạp', 'mũ bảo hiểm', 'đạp xe',
-        'sạc ô tô', 'giá đỡ điện thoại trên xe', 'bọc ghế xe', 'thảm lót sàn xe', 'sáp đánh bóng xe',
-        // --- The thao & Ngoai troi ---
-        'thể thao', 'chạy bộ', 'leo núi', 'cắm trại', 'câu cá',
-        'bơi lội', 'quần vợt', 'golf', 'bóng rổ', 'bóng đá',
-        'ván trượt', 'lướt sóng', 'trượt tuyết', 'tập luyện', 'thiết bị tập gym',
-        'lều', 'túi ngủ', 'áo mưa', 'ô', 'thùng giữ lạnh',
-        'dã ngoại', 'nướng bbq', 'bếp nướng',
+    // --- Gia dung & Nha cua ---
+    'nhà bếp', 'đồ nấu ăn', 'máy xay', 'nồi chiên', 'máy ép',
+    'ấm siêu tốc', 'máy hút bụi', 'robot hút bụi', 'máy lọc', 'máy tạo ẩm',
+    'quạt', 'máy sưởi', 'đèn', 'đèn led', 'nội thất',
+    'sofa', 'ghế', 'bàn', 'giường', 'nệm',
+    'chăn ga gối', 'rèm cửa', 'hộp đựng đồ', 'khay đựng', 'vệ sinh',
+    'cây lau nhà', 'chổi', 'nước giặt', 'khuôn làm bánh', 'thớt',
+    'bộ dao', 'nồi', 'chảo', 'bình nước', 'bình giữ nhiệt',
+    'hộp cơm', 'kệ bếp', 'đồ bếp', 'đồ gia dụng', 'gia dụng',
+    'nhà thông minh', 'khóa cửa', 'camera an ninh', 'chuông cửa', 'vòi sen',
+    'vòi nước', 'phòng tắm', 'gương', 'thảm', 'thảm trải sàn',
+    'đồ trang trí', 'tranh treo tường', 'chậu cây', 'vườn', 'dụng cụ',
+    'máy khoan', 'hộp dụng cụ', 'thang', 'ổ cắm điện', 'pin',
+    'cục sạc', 'dây cáp',
+    // --- Da nang & Tien ich ---
+    'đa năng', 'đa công dụng', 'tiện lợi', 'gấp gọn', 'cầm tay',
+    'di động', 'điều chỉnh được', 'tái sử dụng', 'chống nước', 'không dây',
+    'sạc lại được', 'nhỏ gọn', 'mini', 'đồ tiện ích', 'giá đỡ',
+    'chân đế', 'giá treo', 'ốp lưng', '2 trong 1', '3 trong 1',
+    'du lịch', 'ngoài trời',
+    // --- Hat giong & Lam vuon ---
+    'hạt giống', 'cây trồng', 'hạt giống rau', 'hạt giống hoa', 'thảo mộc',
+    'trái cây', 'trồng rau', 'giống rau', 'thuần chủng', 'trồng cây',
+    'làm vườn', 'chậu trồng cây', 'đất trồng', 'phân bón', 'nhà kính',
+    'thủy canh', 'mầm', 'bộ trồng cây', 'cây bonsai', 'sen đá',
+    'cây trong nhà',
+    // --- My pham & Lam dep ---
+    'mỹ phẩm', 'trang điểm', 'chăm sóc da', 'serum', 'kem dưỡng ẩm',
+    'kem chống nắng', 'son môi', 'mascara', 'kẻ mắt', 'kem nền',
+    'concealer', 'phấn má', 'phấn mắt', 'sơn móng tay', 'nước hoa',
+    'hương thơm', 'dầu gội', 'dầu xả', 'chăm sóc tóc', 'dầu dưỡng tóc',
+    'ủ tóc', 'râu', 'cạo râu', 'dao cạo', 'làm trắng răng',
+    'kem đánh răng', 'làm trắng', 'chống lão hóa', 'collagen', 'vitamin c',
+    'retinol', 'mặt nạ', 'sữa rửa mặt', 'toner', 'sữa dưỡng thể',
+    'sữa tắm', 'xà phòng', 'lăn khử mùi', 'làm đẹp', 'làm nail',
+    'nối mi', 'lông mày', 'son bóng', 'máy sấy tóc', 'máy duỗi tóc',
+    'máy uốn tóc', 'tinh dầu',
+    // --- Mua sam & Khuyen mai ---
+    'mua ngay', 'ship nhanh', 'freeship', 'giảm giá', 'sale',
+    'khuyến mãi', 'xả kho', 'flash sale', 'bán chạy nhất', 'hàng mới về',
+    'quà tặng', 'quà tết', 'combo', 'deal', 'ưu đãi',
+    'mã giảm giá', 'giá rẻ', 'đặt hàng ngay', 'có hạn', 'độc quyền',
+    'cao cấp', 'đang hot', 'xu hướng', 'siêu sale', 'phải có',
+    'đánh giá cao', 'hoàn tiền', 'deal sốc', 'combo ưu đãi', 'hàng về lại',
+    'giảm 50%', 'giảm sâu',
+    // --- Dien tu ---
+    'điện thoại', 'tai nghe', 'airpod', 'loa', 'loa kéo',
+    'đồng hồ', 'máy tính bảng', 'laptop', 'máy ảnh', 'flycam',
+    'máy chiếu', 'sạc dự phòng', 'bàn phím', 'chuột máy tính', 'màn hình',
+    'tivi', 'loa thanh', 'bluetooth', 'micro', 'webcam',
+    'máy in', 'router', 'wifi', 'tivi thông minh',
+    // --- Thoi trang ---
+    'quần áo', 'giày', 'giày sneaker', 'dép sandal', 'giày boot',
+    'váy', 'đầm', 'áo sơ mi', 'quần', 'quần jean',
+    'áo khoác', 'áo hoodie', 'áo thun', 'đồ lót', 'tất',
+    'mũ', 'mũ lưỡi trai', 'khăn quàng', 'găng tay', 'thắt lưng',
+    'ví', 'túi xách', 'balo', 'vali', 'kính râm',
+    'trang sức', 'dây chuyền', 'nhẫn', 'bông tai', 'vòng tay',
+    'thời trang', 'áo dài', 'đồ thể thao', 'quần legging', 'đồ bơi',
+    'đồ ngủ', 'dép lê', 'giày cao gót',
+    // --- Suc khoe & The hinh ---
+    'dinh dưỡng', 'vitamin', 'protein', 'men vi sinh', 'dầu cá',
+    'omega', 'magie', 'kẽm', 'thảo dược', 'trà',
+    'mật ong', 'thải độc', 'giảm cân', 'ăn kiêng', 'keto',
+    'thuần chay', 'hữu cơ', 'sức khỏe', 'thể hình', 'phòng gym',
+    'yoga', 'tạ tay', 'dây kháng lực', 'máy chạy bộ', 'tập thể dục',
+    'massage', 'tư thế', 'chỉnh hình', 'giảm đau', 'giấc ngủ',
+    'gối', 'chăn', 'thảm yoga', 'súng massage', 'đai lưng',
+    'máy lọc nước',
+    // --- Me & Be ---
+    'em bé', 'sơ sinh', 'đồ chơi', 'bỉm', 'xe đẩy',
+    'bình sữa', 'đồ bầu', 'trẻ em', 'đồ ăn dặm', 'chăm sóc bé',
+    'giày trẻ em', 'cặp sách', 'camera bé', 'cũi', 'địu em bé',
+    // --- Thu cung ---
+    'thú cưng', 'chó', 'mèo', 'hạt chó', 'hạt mèo',
+    'lược chải', 'tắm pet', 'dây dắt chó', 'vòng cổ', 'cát mèo',
+    'chim', 'cá', 'giường thú cưng', 'khay ăn', 'bánh thưởng',
+    'bể cá',
+    // --- Thuc pham ---
+    'đồ ăn vặt', 'cà phê', 'sô cô la', 'gia vị', 'nước sốt',
+    'mì', 'gạo', 'trái cây sấy', 'các loại hạt', 'kẹo',
+    'đồ uống', 'nước ép', 'nước tăng lực', 'thanh protein', 'granola',
+    'yến mạch', 'bơ đậu phộng', 'dầu oliu', 'dầu dừa', 'làm bánh',
+    'rau sạch', 'ăn sạch', 'không gluten',
+    // --- Xe co ---
+    'ô tô', 'camera hành trình', 'rửa xe', 'ghế ô tô', 'lốp xe',
+    'chăm sóc xe', 'xe máy', 'xe đạp', 'mũ bảo hiểm', 'đạp xe',
+    'sạc ô tô', 'kẹp xe', 'bọc ghế xe', 'lót sàn', 'đánh bóng',
+    // --- The thao & Ngoai troi ---
+    'thể thao', 'chạy bộ', 'leo núi', 'cắm trại', 'câu cá',
+    'bơi lội', 'quần vợt', 'golf', 'bóng rổ', 'bóng đá',
+    'ván trượt', 'lướt sóng', 'trượt tuyết', 'tập luyện', 'tập gym',
+    'lều', 'túi ngủ', 'áo mưa', 'ô', 'thùng giữ lạnh',
+    'dã ngoại', 'nướng bbq', 'bếp nướng',
     ];
 
     let keywordRetries = 0;
 
     for (let i = 0; i < keywords.length; i++) {
         const keyword = keywords[i];
-        const success = await scanKeyword(context, keyword, i + 1, keywords.length);
+        const success = await scanKeywordWithWatchdog(context, keyword, i + 1, keywords.length);
 
         if (!success) {
             keywordRetries++;
