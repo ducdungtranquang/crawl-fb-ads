@@ -39,11 +39,11 @@ const FILTER_DEFAULTS = {
     scale_max_days: 7,
     scale_min_duplicates: 2,    // ... + creative đã bị duplicate (đang nhân bản)
     scale_min_scaling_score: 0, // 0 = không ràng buộc scaling_score (chỉ sort theo nó)
-    winner_min_days: 7,         // Weekly Winner: chạy 7-9 ngày không tắt (cửa sổ FE đang ép)
-    winner_max_days: 9,         // 9 = khớp route FE (winner_min_days=7&winner_max_days=9); 0 = không giới hạn trên
+    winner_min_days: 7,         // Weekly Winner: chạy 7-14 ngày không tắt (nới cửa sổ từ 7-9; FE hiện vẫn ép 9)
+    winner_max_days: 14,        // 14 = nới từ 9, khớp PRESET_THRESHOLDS analyzer.js; FE hiện vẫn ép 9 nên cần đổi FE để có hiệu lực trên web; 0 = không giới hạn trên
     winner_min_duplicates: 2,   // ... + có duplicate (duplicates_count tính cả chính ad)
-    winner_min_score: 15,       // ... + (score cao HOẶC trending cao) — nới từ 20/8
-    winner_min_trending: 6,
+    winner_min_score: 12,       // ... + (score cao HOẶC trending cao) — nới từ 15/6
+    winner_min_trending: 5,
     winner_max_seen_age_days: 14, // ... + còn thấy trong 14 ngày qua (nới từ 7; 0 = không ràng buộc)
 };
 
@@ -416,19 +416,24 @@ async function refreshSchemaProbe(adsCol) {
         try {
             const docs = await adsCol.find({})
                 .project({ page_name_lower: 1, domain_lower: 1, countries_lower: 1, industry: 1, creative_rank: 1, filter_signals: 1, is_group_rep: 1, preset_priority: 1 })
-                .sort({ last_seen: -1 }).limit(3).toArray();
+                .sort({ last_seen: -1 }).limit(10).toArray();
             const probe = { lower: true, country: true, industry: true, rank: true, flags: true, groupRep: true, priority: true, otherFlag: true };
             if (!docs.length) {
                 Object.assign(probe, { lower: false, country: false, industry: false, rank: false, flags: false, groupRep: false, priority: false, otherFlag: false });
             } else {
-                probe.lower = docs.every(d => typeof d.page_name_lower === 'string' && typeof d.domain_lower === 'string');
-                probe.country = docs.every(d => Array.isArray(d.countries_lower));
-                probe.industry = docs.every(d => typeof d.industry === 'string' && d.industry.length > 0);
-                probe.rank = docs.every(d => typeof d.creative_rank === 'number');
-                probe.flags = docs.every(d => d.filter_signals && typeof d.filter_signals.is_new_ad === 'boolean');
-                probe.otherFlag = docs.every(d => d.filter_signals && typeof d.filter_signals.is_other === 'boolean');
-                probe.groupRep = docs.every(d => typeof d.is_group_rep === 'boolean');
-                probe.priority = docs.every(d => typeof d.preset_priority === 'number');
+                // Đa số thay vì .every(): 1 doc mới nhất thiếu field không
+                // lật cả probe về fallback chậm ($ne/regex). Lấy tối đa 10 doc
+                // mới nhất, cần >= 8 doc có field (mẫu < 8 doc thì cần tất cả).
+                const need = Math.min(8, docs.length);
+                const has = (fn) => docs.filter(fn).length >= need;
+                probe.lower = has(d => typeof d.page_name_lower === 'string' && typeof d.domain_lower === 'string');
+                probe.country = has(d => Array.isArray(d.countries_lower));
+                probe.industry = has(d => typeof d.industry === 'string' && d.industry.length > 0);
+                probe.rank = has(d => typeof d.creative_rank === 'number');
+                probe.flags = has(d => d.filter_signals && typeof d.filter_signals.is_new_ad === 'boolean');
+                probe.otherFlag = has(d => d.filter_signals && typeof d.filter_signals.is_other === 'boolean');
+                probe.groupRep = has(d => typeof d.is_group_rep === 'boolean');
+                probe.priority = has(d => typeof d.preset_priority === 'number');
             }
             schemaProbeCache = { at: Date.now(), probe };
             return probe;
@@ -726,16 +731,13 @@ function buildTextSearchQuery(keyword, strict, dedupeEs) {
         if (strict) {
             should.push(
                 { match_phrase: { full_text_search: { query: v, boost: 10 } } },
-                { match_phrase: { normalized_text: { query: v, boost: 8 } } },
                 { match: { full_text_search: { query: v, operator: 'and', boost: 5 } } },
-                { match: { normalized_text: { query: v, operator: 'and', boost: 4 } } },
                 { match: { text: { query: v, operator: 'and', boost: 3 } } },
                 { match: { page_name: { query: v, operator: 'and', boost: 2 } } },
             );
         } else {
             should.push(
                 { match: { full_text_search: { query: v, boost: 5 } } },
-                { match: { normalized_text: { query: v, boost: 4 } } },
                 { match: { text: { query: v, boost: 3 } } },
                 { match: { page_name: { query: v, boost: 2 } } },
             );
@@ -902,6 +904,16 @@ function hasAnyParam(q, keys) {
     return keys.some(k => q[k] !== undefined);
 }
 
+// [THUMB-ONLY] Chi ad co anh THAT tren R2 moi vao bang winner/scale:
+// thumbnail_r2 ton tai, khac rong, va KHONG phai URL video tam .mp4
+// (token oe het han sau vai gio). Hai dieu kien tren cung field phai
+// nam trong 2 object rieng cua $and (Mongo cam 2 operator tren 1 field
+// trong 1 object).
+const REAL_THUMBNAIL_COND = { $and: [
+    { thumbnail_r2: { $exists: true, $nin: [null, ''] } },
+    { thumbnail_r2: { $not: /\.mp4/i } },
+] };
+
 function buildPresetConditions(presets, q, opts) {
     const useFlags = !opts || opts.useFlags !== false;
     const conds = [];
@@ -918,6 +930,7 @@ function buildPresetConditions(presets, q, opts) {
         } else if (p === 'ready_to_scale' || p === 'scale') {
             if (useFlags && presetUsesFlag(p, q)) {
                 conds.push({ 'filter_signals.is_ready_to_scale': true });
+                conds.push(REAL_THUMBNAIL_COND);
             } else {
                 // Dấu hiệu sắp scale: còn non (3-7 ngày) nhưng creative đã bị
                 // duplicate — nhà quảng cáo đang nhân bản. scaling_score chỉ dùng
@@ -933,10 +946,12 @@ function buildPresetConditions(presets, q, opts) {
                 const minScaling = numParam(q.scale_min_scaling_score, FILTER_DEFAULTS.scale_min_scaling_score);
                 if (minScaling > 0) cond.scaling_score = { $gte: minScaling };
                 conds.push(cond);
+                conds.push(REAL_THUMBNAIL_COND);
             }
         } else if (p === 'weekly_winner' || p === 'winner') {
             if (useFlags && presetUsesFlag(p, q)) {
                 conds.push({ 'filter_signals.is_weekly_winner': true });
+                conds.push(REAL_THUMBNAIL_COND);
             } else {
                 // Winner kiểu Minea: sống lâu (>= 7 ngày không tắt) + còn chạy +
                 // bị duplicate + (điểm tổng cao HOẶC đà tăng mạnh). Dùng OR cho
@@ -962,6 +977,7 @@ function buildPresetConditions(presets, q, opts) {
                         { is_active: true },
                     ] });
                 }
+                parts.push(REAL_THUMBNAIL_COND);
                 conds.push({ $and: parts });
             }
         }
@@ -1540,6 +1556,17 @@ function initSearchServer(dbInstance) {
                     seenIds.add(key);
                     return true;
                 });
+            }
+
+            // Strip thumbnail video tạm đã hết hạn (token oe hết hạn sau
+            // vài giờ): trả null để FE hiện placeholder thay vì khung đen.
+            // Chỉ strip ở search list (không đụng endpoint video / similar).
+            {
+                const nowSecStrip = Math.floor(Date.now() / 1000);
+                for (const doc of results) {
+                    const t = doc && doc.thumbnail_r2;
+                    if (typeof t === 'string' && /\.mp4/i.test(t) && !videoUrlFresh(t, nowSecStrip)) doc.thumbnail_r2 = null;
+                }
             }
 
             // Echo để FE debug: bộ lọc nào đã áp dụng thật, giá trị nào bị

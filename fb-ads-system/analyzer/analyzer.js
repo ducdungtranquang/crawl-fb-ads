@@ -284,7 +284,7 @@ const HEALTH_CONTEXT_WORDS = ['sức khỏe', 'cơ thể', 'massage', 'thư giã
 // Dung de dua phim ve dung nganh entertainment truoc khi cham diem.
 const MOVIE_STRONG_PATTERNS = [
   /xem phim|lồng tiếng|thuyết minh|vietsub|phim bộ|phim lẻ|phim chiếu rạp|rạp chiếu phim|phim hành động|phim tình cảm|phim hài|phim kinh dị|tập \d+|phụ đề|full hd|phim mới/i,
-  /watch (a |the )?movie|full movie|tv series|tv show|netflix|episode|season \d+|dubbed|subtitle|trailer|cinema|streaming/i,
+  /watch (a |the )?movie|full movie|tv series|tv show|netflix|\bepisode\b|\bdubbed\b|\bsubtitle\b|\btrailer\b|\bcinema\b|\bstreaming\b/i,
 ];
 
 function classifyIndustry(ad) {
@@ -567,9 +567,10 @@ function hashTextKey(s) {
 // Nhóm = cùng page_name (chữ thường) + cùng normalized_text. Text rỗng
 // KHÔNG gom (mỗi ad là nhóm riêng) — cùng quy tắc duplicates_count.
 // Khóa nhóm dùng chung hash 64-bit với textMap để không giữ text dài
-// trong RAM. Ad đại diện = ad chạy sớm nhất (start_date, rồi
-// first_seen); hòa thì ad_archive_id nhỏ hơn thắng để quyết định
-// deterministic dù thứ tự cursor đổi. Crawler không lưu page_id nên
+// trong RAM. Ad đại diện = ad CÓ ẢNH THẬT (.jpg trên R2) chạy sớm nhất
+// (start_date, rồi first_seen); nếu không ad nào trong nhóm có ảnh thật
+// thì ad chạy sớm nhất. Hòa thì ad_archive_id nhỏ hơn thắng để quyết
+// định deterministic dù thứ tự cursor đổi. Crawler không lưu page_id nên
 // dùng page_name làm khóa page (khớp với pageMap hiện có).
 // Text quá ngắn/chung chung (chỉ emoji, "sale", "shop now", ...) không
 // đủ định danh 1 creative: đếm trùng toàn cục theo text đó phình D lên
@@ -603,17 +604,34 @@ function groupStartMsOf(ad) {
   return ms > 0 ? ms : Number.MAX_SAFE_INTEGER;
 }
 
-// Cộng dồn 1 ad vào groupMap: { [key]: { repId, repStart, size } }.
+// Ảnh thật trên R2 = thumbnail_r2 là URL .jpg (bền vững). URL video tạm
+// (.mp4, token oe hết hạn sau vài giờ) KHÔNG tính là ảnh thật.
+function hasRealThumbnail(ad) {
+  const t = ad && ad.thumbnail_r2;
+  return typeof t === 'string' && /\.jpg$/i.test(t);
+}
+
+// Cộng dồn 1 ad vào groupMap: { [key]: { repId, repStart, repHasThumb, size } }.
 function accumulateGroupMap(groupMap, ad, text) {
   const key = groupKeyFor(ad.page_name, text);
   if (!key) return null;
   const id = resolveGroupArchiveId(ad);
   const startMs = groupStartMsOf(ad);
-  const entry = groupMap[key] || (groupMap[key] = { repId: null, repStart: Number.MAX_SAFE_INTEGER, size: 0 });
+  const hasThumb = hasRealThumbnail(ad);
+  const entry = groupMap[key] || (groupMap[key] = { repId: null, repStart: Number.MAX_SAFE_INTEGER, repHasThumb: false, size: 0 });
   entry.size += 1;
-  if (id && (startMs < entry.repStart || (startMs === entry.repStart && (entry.repId === null || String(id) < String(entry.repId))))) {
-    entry.repId = id;
-    entry.repStart = startMs;
+  if (id) {
+    // Ưu tiên đại diện CÓ ảnh thật: ad có .jpg thắng ad không có ảnh
+    // (kể cả khi chạy muộn hơn); trong cùng nhóm có/không ảnh thì ad
+    // chạy sớm nhất thắng (hòa thì id nhỏ hơn thắng).
+    const takeOver = !entry.repId
+      || (hasThumb && !entry.repHasThumb)
+      || (hasThumb === entry.repHasThumb && (startMs < entry.repStart || (startMs === entry.repStart && (entry.repId === null || String(id) < String(entry.repId)))));
+    if (takeOver) {
+      entry.repId = id;
+      entry.repStart = startMs;
+      entry.repHasThumb = hasThumb;
+    }
   }
   return key;
 }
@@ -679,10 +697,10 @@ const PRESET_THRESHOLDS = {
   scale_min_duplicates: 2,
   winner_min_days: 7,
   winner_min_duplicates: 2,
-  winner_min_score: 15,
-  winner_min_trending: 6,
+  winner_min_score: 12,
+  winner_min_trending: 5,
   winner_max_seen_age_days: 14,
-  winner_max_days: 9, // 0 = không giới hạn trên; 9 = khớp cửa sổ 7-9 ngày mà route FE đang ép
+  winner_max_days: 14, // 0 = không giới hạn trên; 14 = nới từ 9 (cửa sổ 7-14 ngày, khớp FILTER_DEFAULTS searchApi.js); FE hiện vẫn ép 9 nên cần đổi FE để có hiệu lực trên web
 };
 
 // ===== CORE ANALYZE PROCESS =====
@@ -805,12 +823,14 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     const isNewAd = durationRounded <= PRESET_THRESHOLDS.new_max_days;
     const isReadyToScale = runDaysRounded >= PRESET_THRESHOLDS.scale_min_days
       && runDaysRounded <= PRESET_THRESHOLDS.scale_max_days
-      && duplicatesCount >= PRESET_THRESHOLDS.scale_min_duplicates;
+      && duplicatesCount >= PRESET_THRESHOLDS.scale_min_duplicates
+      && hasRealThumbnail(ad);
     const isWeeklyWinner = runDaysRounded >= PRESET_THRESHOLDS.winner_min_days
       && (PRESET_THRESHOLDS.winner_max_days <= 0 || runDaysRounded <= PRESET_THRESHOLDS.winner_max_days)
       && duplicatesCount >= PRESET_THRESHOLDS.winner_min_duplicates
       && (score >= PRESET_THRESHOLDS.winner_min_score || trendingScore >= PRESET_THRESHOLDS.winner_min_trending)
-      && seenWithinWeek;
+      && seenWithinWeek
+      && hasRealThumbnail(ad);
 
     const funnelValue = detectFunnel(ad);
     const creativeKind = classifyCreativeKind(ad, funnelValue);
