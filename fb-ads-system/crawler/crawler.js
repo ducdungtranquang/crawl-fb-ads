@@ -33,6 +33,7 @@ const MAX_ADS_PER_KEYWORD = parseInt(process.env.MAX_ADS_PER_KEYWORD || '700', 1
 const MAX_SCROLLS_PER_KEYWORD = parseInt(process.env.MAX_SCROLLS_PER_KEYWORD || '60', 10);
 const KEYWORD_TIMEOUT = parseInt(process.env.KEYWORD_TIMEOUT || '180000', 10);
 const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '40000', 10);
+const KEYWORD_HARD_TIMEOUT = parseInt(process.env.KEYWORD_HARD_TIMEOUT || '300000', 10);
 const MAX_RETRIES_PER_KEYWORD = 2;
 // [RAM-FIX] Restart browser dinh ky de giai phong RAM Chromium tich luy
 // qua nhieu keyword (1 browser chay het 374 keyword -> RAM phinh toi
@@ -472,6 +473,32 @@ async function scanKeyword(context, keyword, index, total) {
     return true;
 }
 
+// [WATCHDOG 12/11] Chan cung cho moi keyword: vong cuon trong
+// scanKeyword da co KEYWORD_TIMEOUT 180s, nhung page.close() /
+// restartBrowserContext() / handler 'response' (res.text, Mongo
+// findOne/insertOne/updateOne khong co timeout) thi khong co gioi
+// han — ket o do la treo hang gio nhu 'watch' tren crawler-2.
+// Het KEYWORD_HARD_TIMEOUT (mac dinh 5 phut) thi tra false de main
+// loop restart browser va thu lai / bo qua keyword, thay vi dung yen.
+// Luu y: scanKeyword cu van chay nen o background (luu ad trung thi
+// dedupe theo ad ID nen khong mat/khong trung du lieu); lastSavedAt
+// la bien global nen no co the cham vao IDLE cua keyword ke tiep,
+// nhung scanKeyword moi reset lastSavedAt ngay dau nen anh huong nho.
+async function scanKeywordWithWatchdog(context, keyword, index, total) {
+    let timer;
+    const timeoutPromise = new Promise((resolve) => {
+        timer = setTimeout(() => {
+            console.log(`⏱️ [WATCHDOG] [${keyword}] qua ${KEYWORD_HARD_TIMEOUT / 1000}s van chua xong — bo qua keyword nay, restart browser.`);
+            resolve(false);
+        }, KEYWORD_HARD_TIMEOUT);
+    });
+    try {
+        return await Promise.race([scanKeyword(context, keyword, index, total), timeoutPromise]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
 (async () => {
     await initializeInfrastructure();
@@ -483,95 +510,110 @@ const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
     let context = await createBrowserContext(isDocker);
 
     const keywords = [
-        // --- Gia dung & Nha cua ---
-        "kitchen", "cookware", "blender", "air fryer", "coffee maker", "kettle",
-        "vacuum", "robot vacuum", "air purifier", "humidifier", "fan", "heater",
-        "lamp", "lighting", "led lights", "furniture", "sofa", "chair",
-        "table", "bed", "mattress", "bedding", "curtains", "storage",
-        "organizer", "cleaning", "mop", "broom", "laundry", "detergent",
-        "bakeware", "cutting board", "knife set", "pots", "pans", "water bottle",
-        "thermos", "lunch box", "food container", "kitchen gadgets", "home appliances", "household",
-        "smart home", "door lock", "security camera", "doorbell", "shower", "faucet",
-        "bathroom", "mirror", "rug", "carpet", "decor", "wall art",
-        "plant pot", "garden", "tools", "drill", "toolbox", "ladder",
-        "power strip", "batteries", "charger", "cable",
-        // --- Da nang & Tien ich ---
-        "versatile", "multipurpose", "multi-purpose", "all-in-one", "foldable", "portable",
-        "adjustable", "reusable", "waterproof", "cordless", "wireless", "rechargeable",
-        "compact", "mini", "gadget", "holder", "stand", "mount",
-        "case", "2-in-1", "3-in-1", "travel", "outdoor",
-        // --- Hat giong & Lam vuon ---
-        "seeds", "seed", "plant seeds", "vegetable seeds", "flower seeds", "herb seeds",
-        "fruit seeds", "garden seeds", "organic seeds", "heirloom seeds", "planting", "gardening",
-        "planter", "soil", "fertilizer", "greenhouse", "hydroponic", "sprout",
-        "grow kit", "bonsai", "succulent", "indoor plants",
-        // --- My pham & Lam dep ---
-        "cosmetics", "makeup", "skincare", "serum", "moisturizer", "sunscreen",
-        "lipstick", "mascara", "eyeliner", "foundation", "concealer", "blush",
-        "eyeshadow", "nail polish", "perfume", "fragrance", "cologne", "shampoo",
-        "conditioner", "hair care", "hair oil", "hair mask", "beard", "shaving",
-        "razor", "teeth whitening", "toothpaste", "whitening", "anti-aging", "collagen",
-        "vitamin c", "retinol", "face mask", "cleanser", "toner", "lotion",
-        "body wash", "soap", "deodorant", "beauty", "nail", "lashes",
-        "brows", "lip gloss", "hair dryer", "straightener", "curling iron", "essential oils",
-        // --- Mua sam & Khuyen mai ---
-        "shop now", "buy now", "free shipping", "freeship", "discount", "sale",
-        "clearance", "flash sale", "best seller", "new arrival", "gift", "gifts",
-        "gift ideas", "bundle", "deal", "offer", "promotion", "coupon",
-        "affordable", "order now", "limited time", "exclusive", "premium", "trending",
-        "viral", "must have", "top rated", "money back", "bundle deal", "50% off",
-        "special offer",
-        // --- Dien tu ---
-        "smartphone", "phone", "headphones", "earbuds", "speaker", "smartwatch",
-        "watch", "tablet", "laptop", "camera", "drone", "projector",
-        "power bank", "keyboard", "mouse", "monitor", "tv", "soundbar",
-        "phone case", "bluetooth", "earphone", "headset", "microphone", "webcam",
-        "printer", "router", "wifi", "smart tv",
-        // --- Thoi trang ---
-        "clothing", "shoes", "sneakers", "sandals", "boots", "dress",
-        "shirt", "pants", "jeans", "jacket", "coat", "hoodie",
-        "t-shirt", "underwear", "socks", "hat", "cap", "scarf",
-        "gloves", "belt", "wallet", "handbag", "backpack", "luggage",
-        "sunglasses", "jewelry", "necklace", "ring", "earrings", "bracelet",
-        "streetwear", "designer fashion", "activewear", "leggings", "swimwear", "pajamas",
-        "slippers", "heels",
-        // --- Suc khoe & The hinh ---
-        "supplements", "vitamins", "protein", "probiotics", "fish oil", "omega",
-        "magnesium", "zinc", "herbal", "tea", "honey", "detox",
-        "weight loss", "diet", "keto", "vegan", "organic", "healthy",
-        "fitness", "gym", "yoga", "dumbbell", "resistance bands", "treadmill",
-        "exercise", "massage", "posture", "orthopedic", "pain relief", "sleep",
-        "pillow", "blanket", "yoga mat", "massage gun", "posture corrector", "water filter",
-        // --- Me & Be ---
-        "baby", "baby clothes", "baby toys", "diapers", "stroller", "bottle",
-        "maternity", "kids", "children", "baby food", "baby care", "kids shoes",
-        "kids clothing", "school bag", "baby monitor", "crib", "baby carrier",
-        // --- Thu cung ---
-        "pet", "dog", "cat", "dog food", "cat food", "pet toys",
-        "pet grooming", "leash", "collar", "litter", "bird", "fish",
-        "pet bed", "pet shampoo", "pet treats", "aquarium", "dog leash", "cat litter",
-        // --- Thuc pham ---
-        "snacks", "coffee", "chocolate", "spices", "sauce", "noodles",
-        "rice", "dried fruit", "nuts", "candy", "beverage", "juice",
-        "energy drink", "protein bar", "granola", "oatmeal", "peanut butter", "olive oil",
-        "coconut oil", "seasoning", "baking", "organic food", "healthy food", "gluten-free",
-        // --- Xe co ---
-        "car accessories", "dash cam", "car wash", "car seat", "tires", "car care",
-        "motorcycle", "bike", "bicycle", "helmet", "cycling", "car charger",
-        "car mount", "seat cover", "floor mat", "car wax",
-        // --- The thao & Ngoai troi ---
-        "sports", "running", "hiking", "camping", "fishing", "swimming",
-        "tennis", "golf", "basketball", "soccer", "football", "skateboard",
-        "surf", "ski", "snowboard", "workout", "fitness equipment", "tent",
-        "sleeping bag", "raincoat", "umbrella", "cooler", "picnic",
-        "barbecue", "grill",
+    // --- The thao & Ngoai troi ---
+    "sports", "running", "hiking", "camping", "fishing",
+    "swimming", "tennis", "golf", "basketball", "soccer",
+    "football", "skateboard", "surf", "ski", "snowboard",
+    "workout", "fitness equipment", "tent", "sleeping bag", "raincoat",
+    "umbrella", "cooler", "picnic", "barbecue", "grill",
+    // --- Xe co ---
+    "car accessories", "dash cam", "car wash", "car seat", "tires",
+    "car care", "motorcycle", "bike", "bicycle", "helmet",
+    "cycling", "car charger", "car mount", "seat cover", "floor mat",
+    "car wax",
+    // --- Thuc pham ---
+    "snacks", "coffee", "chocolate", "spices", "sauce",
+    "noodles", "rice", "dried fruit", "nuts", "candy",
+    "beverage", "juice", "energy drink", "protein bar", "granola",
+    "oatmeal", "peanut butter", "olive oil", "coconut oil", "seasoning",
+    "baking", "organic food", "healthy food", "gluten-free",
+    // --- Thu cung ---
+    "pet", "dog", "cat", "dog food", "cat food",
+    "pet toys", "pet grooming", "leash", "collar", "litter",
+    "bird", "fish", "pet bed", "pet shampoo", "pet treats",
+    "aquarium", "dog harness", "cat tree",
+    // --- Me & Be ---
+    "baby", "baby clothes", "baby toys", "diapers", "stroller",
+    "bottle", "maternity", "kids", "children", "baby food",
+    "baby care", "kids shoes", "kids clothing", "school bag", "baby monitor",
+    "crib", "baby carrier",
+    // --- Suc khoe & The hinh ---
+    "supplements", "vitamins", "protein", "probiotics", "fish oil",
+    "omega", "magnesium", "zinc", "herbal", "tea",
+    "honey", "detox", "weight loss", "diet", "keto",
+    "vegan", "organic", "healthy", "fitness", "gym",
+    "yoga", "dumbbell", "resistance bands", "treadmill", "exercise",
+    "massage", "posture", "orthopedic", "pain relief", "sleep",
+    "pillow", "blanket", "yoga mat", "massage gun", "posture corrector",
+    "water filter",
+    // --- Thoi trang ---
+    "clothing", "shoes", "sneakers", "sandals", "boots",
+    "dress", "shirt", "pants", "jeans", "jacket",
+    "coat", "hoodie", "t-shirt", "underwear", "socks",
+    "hat", "cap", "scarf", "gloves", "belt",
+    "wallet", "handbag", "backpack", "luggage", "sunglasses",
+    "jewelry", "necklace", "ring", "earrings", "bracelet",
+    "fashion", "kimono", "activewear", "leggings", "swimwear",
+    "pajamas", "slippers", "heels",
+    // --- Dien tu ---
+    "smartphone", "chromebook", "headphones", "earbuds", "speaker",
+    "smartwatch", "smart speaker", "tablet", "laptop", "camera",
+    "drone", "projector", "power bank", "keyboard", "mouse",
+    "monitor", "tv", "soundbar", "phone case", "bluetooth",
+    "earphone", "headset", "microphone", "webcam", "printer",
+    "router", "wifi", "smart tv",
+    // --- Mua sam & Khuyen mai ---
+    "shop now", "buy now", "free shipping", "freeship", "discount",
+    "sale", "clearance", "flash sale", "best seller", "new arrival",
+    "gift", "gift card", "gift ideas", "bundle", "deal",
+    "offer", "promotion", "coupon", "affordable", "order now",
+    "limited time", "exclusive", "premium", "hot deal", "super sale",
+    "must have", "top rated", "money back", "bundle deal", "50% off",
+    "special offer",
+    // --- My pham & Lam dep ---
+    "cosmetics", "makeup", "skincare", "serum", "moisturizer",
+    "sunscreen", "lipstick", "mascara", "eyeliner", "foundation",
+    "concealer", "blush", "eyeshadow", "nail polish", "perfume",
+    "fragrance", "cologne", "shampoo", "conditioner", "hair care",
+    "hair oil", "hair mask", "beard", "shaving", "razor",
+    "teeth whitening", "toothpaste", "whitening", "anti-aging", "collagen",
+    "vitamin c", "retinol", "face mask", "cleanser", "toner",
+    "lotion", "body wash", "soap", "deodorant", "beauty",
+    "nail", "lashes", "brows", "lip gloss", "hair dryer",
+    "straightener", "curling iron", "essential oils",
+    // --- Hat giong & Lam vuon ---
+    "seeds", "seedling", "plant seeds", "vegetable seeds", "flower seeds",
+    "herb seeds", "fruit seeds", "garden seeds", "organic seeds", "heirloom seeds",
+    "planting", "gardening", "planter", "soil", "fertilizer",
+    "greenhouse", "hydroponic", "sprout", "grow kit", "bonsai",
+    "succulent", "indoor plants",
+    // --- Da nang & Tien ich ---
+    "versatile", "multipurpose", "multi-purpose", "all-in-one", "foldable",
+    "portable", "adjustable", "reusable", "waterproof", "cordless",
+    "wireless", "rechargeable", "compact", "mini", "gadget",
+    "holder", "stand", "mount", "case", "2-in-1",
+    "3-in-1", "travel", "outdoor",
+    // --- Gia dung & Nha cua ---
+    "kitchen", "cookware", "blender", "air fryer", "coffee maker",
+    "kettle", "vacuum", "robot vacuum", "air purifier", "humidifier",
+    "fan", "heater", "lamp", "lighting", "led lights",
+    "furniture", "sofa", "chair", "table", "bed",
+    "mattress", "bedding", "curtains", "storage", "organizer",
+    "cleaning", "mop", "broom", "laundry", "detergent",
+    "bakeware", "cutting board", "knife set", "pots", "pans",
+    "water bottle", "thermos", "lunch box", "food container", "kitchen gadgets",
+    "home appliances", "household", "smart home", "door lock", "security camera",
+    "doorbell", "shower", "faucet", "bathroom", "mirror",
+    "rug", "carpet", "decor", "wall art", "plant pot",
+    "garden", "tools", "drill", "toolbox", "ladder",
+    "power strip", "batteries", "charger", "cable",
     ];
 
     let keywordRetries = 0;
 
     for (let i = 0; i < keywords.length; i++) {
         const keyword = keywords[i];
-        const success = await scanKeyword(context, keyword, i + 1, keywords.length);
+        const success = await scanKeywordWithWatchdog(context, keyword, i + 1, keywords.length);
 
         if (!success) {
             keywordRetries++;
