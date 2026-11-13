@@ -282,17 +282,59 @@ const LIVESTOCK_WORDS = ['heo', 'lợn', 'gà', 'vịt', 'trâu', 'bò', 'dê', 
 const HEALTH_CONTEXT_WORDS = ['sức khỏe', 'cơ thể', 'massage', 'thư giãn', 'làm đẹp', 'giảm cân'];
 // Cum tu MANH chi ro ad la phim/drama (xem phim, long tieng, vietsub...).
 // Dung de dua phim ve dung nganh entertainment truoc khi cham diem.
+// 13/11: bo 'full hd' (TV/monitor/camera san pham nao cung ghi Full HD —
+// truoc day chi ha rank, gio hide_entertainment bat mac dinh nen gán
+// nham se AN MAT ad san pham); 'tập \d+' them guard khong tinh khi sau
+// so la don vi thoi gian ('tập 30 phút' la gym, khong phai tap phim).
 const MOVIE_STRONG_PATTERNS = [
-  /xem phim|lồng tiếng|thuyết minh|vietsub|phim bộ|phim lẻ|phim chiếu rạp|rạp chiếu phim|phim hành động|phim tình cảm|phim hài|phim kinh dị|tập \d+|phụ đề|full hd|phim mới/i,
+  /xem phim|lồng tiếng|thuyết minh|vietsub|phim bộ|phim lẻ|phim chiếu rạp|rạp chiếu phim|phim hành động|phim tình cảm|phim hài|phim kinh dị|tập \d+\b(?!\s*(phút|phut|giờ|gio|giây|giay))|chương \d+|phụ đề|phim mới|tiểu thuyết|ngôn tình|love story|romance novel|romance story|behind the scenes|movie scene|film scene|drama scene|love scene|cảnh phim|cảnh quay|phân cảnh/i,
   /watch (a |the )?movie|full movie|tv series|tv show|netflix|\bepisode\b|\bdubbed\b|\bsubtitle\b|\btrailer\b|\bcinema\b|\bstreaming\b/i,
 ];
+// Tu don/cum ngan chi ro phim/truyen — phai khop NGUYEN TU (containsWholeWord,
+// Unicode-aware): 'drama' dang substring se bat nham 'dramatic' (mi gia),
+// 'tap' bat nham 'luyen tap', 'chuong' bat nham 'chuong trinh khuyen mai'.
+// 'love'/'scene' dung mot minh KHONG bat (ad san pham nao cung 'you'll love
+// this', 'photo scene') — chi bat cum 'love story', 'love scene',
+// 'movie/film/drama scene' (trong MOVIE_STRONG_PATTERNS).
+const MOVIE_WORDS = ['drama', 'phim', 'film', 'truyện', 'movie', 'cinema', 'episode', 'chapter'];
+// Cum tieng Trung chi ro phim/truyen — tieng Trung khong co dau cach nen
+// khong dung whole-word duoc, dung includes(); chi lay cum >= 2 ky tu,
+// du dac hieu ('剧' mot ky tu thi khong lay vi bat nham qua nhieu).
+const MOVIE_ZH_PHRASES = ['电影', '电视剧', '韩剧', '泰剧', '日剧', '美剧', '爱情剧', '追剧', '看剧', '剧情', '全集', '大结局', '短剧', '网剧', '言情', '小说', '漫画', '动漫', '在线观看', '免费观看'];
+// Veto: 'phim'/'film' trong nghia SAN PHAM (dan kinh, bao ve man hinh,
+// may anh film) — gap cum nay thi tu 'phim'/'film' khong duoc tinh la
+// dau hieu phim nua (cac dau hieu khac nhu drama/truyen/ZH van tinh).
+const PRODUCT_FILM_PHRASES = ['phim cách nhiệt', 'phim dán', 'dán phim', 'phim bảo vệ', 'phim chống nắng', 'phim chống nóng', 'miếng dán', 'film camera', 'camera film', 'window film', 'screen film', 'protective film', 'photo film', '35mm film', 'film roll', 'cuộn film'];
+// Page chuyen truyen/phim (app doc truyen, short drama): ad cua page nay
+// thuong chi co doan truyen (khong tu khoa phim trong text) nen bat theo
+// ten page. Chi ten app/cum dac hieu; 'phim'/'drama'/'truyện' trong ten
+// page phai la nguyen tu.
+const STORY_PAGE_NAMES = ['dreame', 'goodnovel', 'webnovel', 'noveltoon', 'mangatoon', 'pocket fm', 'dramabox', 'reelshort', 'shorttv', 'drama box', 'short drama', 'love story'];
+function hasProductFilmPhrase(text) {
+  return PRODUCT_FILM_PHRASES.some((p) => text.includes(p));
+}
+function isStoryOrMoviePage(pageName) {
+  const name = normalize(pageName || '');
+  if (!name) return false;
+  if (STORY_PAGE_NAMES.some((p) => name.includes(p))) return true;
+  return ['phim', 'drama', 'truyện'].some((w) => containsWholeWord(name, w));
+}
+function hasMovieSign(text) {
+  if (MOVIE_STRONG_PATTERNS.some((re) => re.test(text))) return true;
+  if (MOVIE_ZH_PHRASES.some((p) => text.includes(p))) return true;
+  const filmGated = !hasProductFilmPhrase(text);
+  return MOVIE_WORDS.some((w) => {
+    if ((w === 'phim' || w === 'film') && !filmGated) return false;
+    return containsWholeWord(text, w);
+  });
+}
 
 function classifyIndustry(ad) {
   const fullText = normalize((ad.text || '') + ' ' + (ad.headline || ''));
   // Phim ve dung nganh entertainment NGAY (truoc khi cham diem): ad phim
   // co text mo ta dien vien/trang phuc/canh dep nen hay bi cham diem
   // beauty_health cao hon entertainment -> nhay vao ngach thoi trang/lam dep.
-  if (MOVIE_STRONG_PATTERNS.some((re) => re.test(fullText))) return 'entertainment';
+  if (isStoryOrMoviePage(ad.page_name) || hasMovieSign(fullText)) return 'entertainment';
   // Strip URL + SĐT trước: "điện thoại: (0277) 6501 424" ở cuối ad ghế
   // massage từng kéo cả ad sang electronics.
   const cleanText = normalize(stripUrlsAndPhones(fullText));
@@ -354,6 +396,9 @@ function classifyCreativeKind(ad, funnel) {
   if (hasShopCta || funnel === 'ECOM' || funnel === 'DROPSHIP' || (hasDomain && hasProductToken)) {
     return 'product';
   }
+  // Page truyen/phim hoac dau hieu phim/truyen (VI/EN/ZH) -> entertainment.
+  // Dat SAU check product: ad ban hang (CTA mua / funnel ECOM) van la product.
+  if (isStoryOrMoviePage(ad.page_name) || hasMovieSign(fullText)) return 'entertainment';
   const hasEntertainmentCta = ENTERTAINMENT_CTAS.some((c) => cta.includes(c));
   const hasEntertainmentText = ENTERTAINMENT_TOKENS.some((t) => fullText.includes(t))
     || AI_CONTENT_TOKENS.some((t) => fullText.includes(t));
@@ -1503,7 +1548,6 @@ async function main() {
         { key: { 'filter_signals.is_weekly_winner': 1, creative_rank: 1, score: -1 }, name: "idx_winner_rank_score" },
         { key: { page_name_lower: 1, start_date: -1 }, name: "idx_page_lower_start_date" },
         { key: { domain_lower: 1, start_date: -1 }, name: "idx_domain_lower_start_date" },
-        { key: { countries_lower: 1, start_date: -1 }, name: "idx_countries_lower_start_date" },
         { key: { is_active: 1, start_date: -1 }, name: "idx_is_active_start_date" },
         { key: { industry: 1, start_date: -1 }, name: "idx_industry_start_date" },
         { key: { industry: 1, score: -1 }, name: "idx_industry_score" },
@@ -1530,7 +1574,7 @@ async function main() {
         { key: { scaling_score: -1, is_group_rep: 1, start_date: -1 }, name: "idx_scaling_score_rep_start" },
         { key: { domain_lower: 1, is_group_rep: 1, start_date: -1 }, name: "idx_domain_rep_start" },
         { key: { page_name_lower: 1, is_group_rep: 1, start_date: -1 }, name: "idx_page_rep_start" },
-        { key: { countries_lower: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: "idx_countries_rep_start" },
+        { key: { countries_lower: 1, is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: "idx_countries_rep_start" },
         // OTHER (fix 11/11): cờ filter_signals.is_other thay $ne 'vn' —
         // equality boolean dùng được COUNT_SCAN. Giữ countries_lower trong
         // key để đường fallback $ne (trước FULL) vẫn kiểm tra từ index.
@@ -1543,7 +1587,7 @@ async function main() {
         // va combo new_ads+VN (flag + rep + country + sort) — thieu 2 index
         // nay thi find phai FETCH toan bo doc cua filter (UI Inactive 0 the,
         // combo 20-35s) du count da nhanh.
-        { key: { is_group_rep: 1, last_seen: -1, start_date: -1 }, name: "idx_group_rep_last_seen_start" },
+        { key: { is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: "idx_group_rep_last_seen_start" },
         { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, countries_lower: 1, start_date: -1 }, name: "idx_new_ad_rep_country_start" },
         { key: { image_keys: 1 }, name: "idx_image_keys" },
         { key: { video_keys: 1 }, name: "idx_video_keys" },

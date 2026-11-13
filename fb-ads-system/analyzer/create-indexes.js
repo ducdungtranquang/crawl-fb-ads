@@ -87,7 +87,16 @@ const INDEXES = [
   { key: { scaling_score: -1, is_group_rep: 1, start_date: -1 }, name: 'idx_scaling_score_rep_start' },
   { key: { domain_lower: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_domain_rep_start' },
   { key: { page_name_lower: 1, is_group_rep: 1, start_date: -1 }, name: 'idx_page_rep_start' },
-  { key: { countries_lower: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_countries_rep_start' },
+  // Loc rieng quoc gia (fix 13/11, loi VN=0): query VN mot minh
+  // ({countries_lower, is_group_rep, last_seen} + sort start_date)
+  // khong co index nao cap ca filter + sort — planner chon
+  // idx_countries_lower_start_date (chi cap sort) roi FETCH tung doc
+  // de loc rep/fresh -> 15-30s -> FE timeout 25s -> tra 0. Key moi:
+  // equality (nuoc, rep) -> sort (start_date) -> range (last_seen),
+  // them creative_rank cuoi key de dieu kien an phim ($ne creative_rank)
+  // duoc COUNT_SCAN. Cung ten, khac key -> deploy PHAI dropIndex truoc.
+  // Dong thoi XOA idx_countries_lower_start_date (index xau gay ra loi).
+  { key: { countries_lower: 1, is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: 'idx_countries_rep_start' },
   // 12/11 (PR #41, loi 10a VN+industry): khong index nao chua ca
   // countries_lower + industry — planner chon 1 chieu roi FETCH tung doc
   // kiem tra chieu con lai + sort trong bo nho. Them 1 index to hop:
@@ -95,7 +104,7 @@ const INDEXES = [
   // Can 1 slot: DB dang 64/64 sau PR #40 nen deploy PHAI drop 1 index thua
   // truoc (idx_scale_rep_rank hoac idx_winner_rep_rank — khong con trong
   // list, drop xong khong bi tao lai), roi moi chay file nay.
-  { key: { countries_lower: 1, industry: 1, is_group_rep: 1, start_date: -1, last_seen: -1 }, name: 'idx_country_industry_rep_start' },
+  { key: { countries_lower: 1, industry: 1, is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: 'idx_country_industry_rep_start' },
   // VN + spend (fix 12/11): FE gui estimated_spend la 1 tier
   // ('VERY HIGH'/'HIGH'/'MEDIUM'/'LOW', xem SPEND_TIER_MAP) qua param
   // estimated_spend; query VN+spend truoc day khong co index nao chua ca
@@ -105,7 +114,7 @@ const INDEXES = [
   // range (last_seen) cuoi. Them 1 index, tran 64: danh sach co 60
   // entry + _id = 61 -> them index nay thanh 62, van du slot (chi them
   // 1 index nay, khong them index USD vi FE chi gui tier).
-  { key: { countries_lower: 1, estimated_spend: 1, is_group_rep: 1, start_date: -1, last_seen: -1 }, name: 'idx_country_spend_tier_rep_start' },
+  { key: { countries_lower: 1, estimated_spend: 1, is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: 'idx_country_spend_tier_rep_start' },
   // OTHER (fix 11/11): $ne 'vn' khong dung duoc index -> dem >25s -> FE
   // route timeout 25s roi tra 0. Analyzer ghi san co
   // filter_signals.is_other (khong phai VN, gom ca ad chua co nhan nuoc);
@@ -159,7 +168,8 @@ const INDEXES = [
   // vu fallback khi doc chua migrate — DB da migrate, schema_fallback
   // toan false): giai phong 2 slot tran 64 cho idx_other_rep_start va
   // idx_product_key_score.
-  { key: { countries_lower: 1, start_date: -1 }, name: 'idx_countries_lower_start_date' },
+  // 13/11: XOA idx_countries_lower_start_date (index xau vu VN=0, xem
+  // idx_countries_rep_start) — giai phong them 1 slot (ve 63/64).
   { key: { countries_lower: 1, score: -1 }, name: 'idx_countries_lower_score' },
   { key: { latest_detail_country_lower: 1, start_date: -1 }, name: 'idx_latest_country_lower_start_date' },
   // Lọc ngành nghề.
@@ -183,7 +193,9 @@ const INDEXES = [
   // = last_seen trong (now-30d, now-7d)) dung truoc start_date (sort) nen
   // khong cap duoc sort. Key moi: equality (rep) -> sort (start_date) ->
   // range (last_seen). Cung ten, khac key -> deploy PHAI dropIndex truoc.
-  { key: { is_group_rep: 1, start_date: -1, last_seen: -1 }, name: 'idx_group_rep_last_seen_start' },
+  // 13/11: them creative_rank cuoi key de dieu kien an phim ($ne
+  // creative_rank) o list mac dinh duoc COUNT_SCAN, khong FETCH.
+  { key: { is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: 'idx_group_rep_last_seen_start' },
   { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, countries_lower: 1, start_date: -1 }, name: 'idx_new_ad_rep_country_start' },
   // Đếm media usage: cùng file re-sign vẫn chung image_keys/video_keys.
   { key: { image_keys: 1 }, name: 'idx_image_keys' },
