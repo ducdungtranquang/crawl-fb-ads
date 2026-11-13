@@ -372,6 +372,8 @@ function normalizeQueryParams(raw) {
     if (filter !== undefined) q.filter = filter;
     const industry = firstParam(raw, ['industry', 'category', 'nganh']);
     if (industry !== undefined) q.industry = industry;
+    const hideEnt = firstParam(raw, ['hide_entertainment', 'hideEntertainment', 'no_entertainment', 'exclude_entertainment']);
+    if (hideEnt !== undefined) q.hide_entertainment = hideEnt;
     const sortBy = firstParam(raw, ['sort_by', 'sort', 'order_by', 'sortBy']);
     if (sortBy !== undefined) q.sort_by = sortBy;
     const sortOrder = firstParam(raw, ['sort_order', 'order', 'sortOrder', 'direction']);
@@ -813,6 +815,26 @@ function presetUsesFlag(presetName, q) {
     const canonical = PRESET_ALIASES[presetName] || presetName;
     const keys = PRESET_TUNING_KEYS[canonical] || [];
     return keys.every((k) => q[k] === undefined || Number(q[k]) === FILTER_DEFAULTS[k]);
+}
+
+// Ẩn ad giải trí/phim khỏi kết quả (mặc định BẬT; tắt bằng
+// ?hide_entertainment=0, hoặc tự tắt khi user chọn ngành Giải trí &
+// Game). Chỉ loại theo creative_rank=2 (creative_kind=entertainment —
+// bắt cả ad truyện/phim bị gán nhầm ngành khác, vd truyện ngôn tình
+// gán beauty_health) mà KHÔNG loại theo industry: ad sản phẩm bị gán
+// nhầm industry=entertainment (vd TV 'Full HD', 'phim cách nhiệt'
+// nếu không có veto) vẫn ở lại vì rank của nó là 0/1. $ne khớp cả
+// doc thiếu field nên doc cũ không bị loại oan; creative_rank nằm
+// trong key các index combo preset + index nước/rep (đã bổ sung
+// trailing) nên đếm vẫn COUNT_SCAN, không FETCH.
+function hideEntertainmentEnabled(q, industryValues) {
+    const v = q.hide_entertainment;
+    if (v !== undefined && (v === '0' || v === 'false' || v === 'no' || v === 'off')) return false;
+    if (Array.isArray(industryValues) && industryValues.includes('entertainment')) return false;
+    return true;
+}
+function buildHideEntertainmentCondition() {
+    return { creative_rank: { $ne: 2 } };
 }
 
 // Ưu tiên ad mua sắm/bán sản phẩm (creative_rank 0) lên trước, ad thuần
@@ -1486,6 +1508,8 @@ function initSearchServer(dbInstance) {
             andConds.push(buildFreshAdCondition());
             if (dedupeOn && esRank && !esDedupeAvailable && schema.groupRep) dedupeFallback = 'mongo';
             if (industryCond) andConds.push(industryCond);
+            // Ẩn phim/giải trí (mặc định BẬT, xem hideEntertainmentEnabled).
+            if (hideEntertainmentEnabled(q, industryValues)) andConds.push(buildHideEntertainmentCondition());
             if (scaling_level) {
                 const scalingCond = buildScalingCondition(scaling_level);
                 if (scalingCond) andConds.push(scalingCond);
@@ -1587,6 +1611,7 @@ function initSearchServer(dbInstance) {
                     funnel: funnel ? normalizeFunnelValues(funnel) : [],
                     sort_by: sortInfo.sortOptions,
                     product_first: productFirstEnabled(q),
+                    hide_entertainment: hideEntertainmentEnabled(q, industryValues),
                     dedupe: dedupeOn,
                 },
                 schema_fallback: {
@@ -1626,6 +1651,12 @@ function initSearchServer(dbInstance) {
             for (const name of ['new_ads', 'ready_to_scale', 'weekly_winner']) {
                 const conds = buildPresetConditions(name, {}, { useFlags: schema.flags });
                 const countQuery = conds.length ? { $and: [...conds, freshCond] } : { ...freshCond };
+                // Badge khớp list đã ẩn phim: cùng điều kiện loại giải trí.
+                // (Total chung giữ nguyên — đếm nó không có index cover
+                // creative_rank nên thêm $ne sẽ FETCH toàn bộ doc tươi.)
+                const hideCond = buildHideEntertainmentCondition();
+                if (countQuery.$and) countQuery.$and.push(hideCond);
+                else Object.assign(countQuery, hideCond);
                 // Badge khớp list đã dedupe: chỉ đếm ad đại diện khi field nhóm đã có.
                 if (schema.groupRep) countQuery.is_group_rep = true;
                 presets[name] = await adsCol.countDocuments(countQuery);
@@ -2089,7 +2120,7 @@ function buildMonthlyWinnersPipeline(month, filters = {}) {
     ];
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, isNonProductAd, nonProductTitleRegex, NON_PRODUCT_PATTERNS, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, hideEntertainmentEnabled, buildHideEntertainmentCondition, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, isNonProductAd, nonProductTitleRegex, NON_PRODUCT_PATTERNS, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
