@@ -824,9 +824,11 @@ function presetUsesFlag(presetName, q) {
 // gán beauty_health) mà KHÔNG loại theo industry: ad sản phẩm bị gán
 // nhầm industry=entertainment (vd TV 'Full HD', 'phim cách nhiệt'
 // nếu không có veto) vẫn ở lại vì rank của nó là 0/1. $ne khớp cả
-// doc thiếu field nên doc cũ không bị loại oan; creative_rank nằm
-// trong key các index combo preset + index nước/rep (đã bổ sung
-// trailing) nên đếm vẫn COUNT_SCAN, không FETCH.
+// doc thiếu field nên doc cũ không bị loại oan — NHƯNG 16/11 chứng minh
+// $ne làm planner bỏ index tốt, chọn index hẹp + FETCH ~459k doc rồi
+// timeout 30s (site ra 0 cả ngày 16/11). Đổi sang $in: [0, 1] để Mongo
+// bound được rank; đã kiểm chứng live: đếm $ne và $in đều ra 321.448
+// (ép hint trên DB), nên 2 cách tương đương trên dữ liệu thật.
 function hideEntertainmentEnabled(q, industryValues) {
     const v = q.hide_entertainment;
     if (v !== undefined && (v === '0' || v === 'false' || v === 'no' || v === 'off')) return false;
@@ -834,7 +836,7 @@ function hideEntertainmentEnabled(q, industryValues) {
     return true;
 }
 function buildHideEntertainmentCondition() {
-    return { creative_rank: { $ne: 2 } };
+    return { creative_rank: { $in: [0, 1] } };
 }
 
 // Ưu tiên ad mua sắm/bán sản phẩm (creative_rank 0) lên trước, ad thuần
