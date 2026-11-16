@@ -1561,9 +1561,10 @@ async function main() {
         { key: { 'filter_signals.is_ready_to_scale': 1, preset_priority: 1, scaling_score: -1 }, name: "idx_scale_priority" },
         { key: { 'filter_signals.is_weekly_winner': 1, preset_priority: 1, trending_score: -1 }, name: "idx_winner_priority" },
         // 3 index dem preset + dedupe (da tao truc tiep tren VM 04/11/2026, ghi vao code de build lai khong mat).
-        { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, last_seen: -1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1 }, name: "idx_new_ad_rep_combo" },
-        { key: { 'filter_signals.is_ready_to_scale': 1, is_group_rep: 1, last_seen: -1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1, scaling_score: -1 }, name: "idx_scale_rep_combo" },
-        { key: { 'filter_signals.is_weekly_winner': 1, is_group_rep: 1, last_seen: -1, preset_priority: 1, creative_rank: 1, industry: 1, countries_lower: 1, start_date: -1, trending_score: -1 }, name: "idx_winner_rep_combo" },
+        // 16/11: sync key theo create-indexes.js + dua creative_rank len thu 3 o scale/winner (bound duoc rank cho dieu kien an phim; key cu rank sau range -> FETCH -> timeout).
+        { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, countries_lower: 1, preset_priority: 1, creative_rank: 1, start_date: -1, last_seen: -1, industry: 1 }, name: "idx_new_ad_rep_combo" },
+        { key: { 'filter_signals.is_ready_to_scale': 1, is_group_rep: 1, creative_rank: 1, countries_lower: 1, preset_priority: 1, start_date: -1, scaling_score: -1, last_seen: -1, industry: 1 }, name: "idx_scale_rep_combo" },
+        { key: { 'filter_signals.is_weekly_winner': 1, is_group_rep: 1, creative_rank: 1, countries_lower: 1, preset_priority: 1, start_date: -1, trending_score: -1, last_seen: -1, industry: 1 }, name: "idx_winner_rep_combo" },
         // Index dem/tim cham 05/11: filter + is_group_rep + sort — khong co
         // is_group_rep o giua, Mongo phai FETCH toan bo doc cua filter de
         // loc dai dien (nganh Khac 145k doc -> dem khong xong).
@@ -1578,7 +1579,8 @@ async function main() {
         // equality boolean dùng được COUNT_SCAN. Giữ countries_lower trong
         // key để đường fallback $ne (trước FULL) vẫn kiểm tra từ index.
         // Cùng tên, khác key nên deploy PHẢI drop index cũ trước.
-        { key: { is_group_rep: 1, last_seen: -1, 'filter_signals.is_other': 1, countries_lower: 1, start_date: -1 }, name: "idx_other_rep_start" },
+        // 16/11: chen creative_rank thu 3 — key cu khong co rank, dem OTHER FETCH -> timeout 25s, UI ra 0.
+        { key: { is_group_rep: 1, 'filter_signals.is_other': 1, creative_rank: 1, start_date: -1, last_seen: -1 }, name: "idx_other_rep_start" },
         // 2 index dem/sort khi dedupe bat (truoc day chi co trong
         // create-indexes.js, analyzer FULL khong tu tao).
         { key: { is_group_rep: 1, estimated_spend_usd: 1 }, name: "idx_group_rep_spend" },
