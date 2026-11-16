@@ -47,7 +47,6 @@ const INDEXES = [
   { key: { score: -1, analyzed_at: -1 }, name: 'score_analyzed_sort' },
   // Gom nhóm duplicate (dedupe) + ưu tiên preset (sản phẩm lên trước).
   { key: { duplicate_group_key: 1 }, name: 'idx_group_key' },
-  { key: { is_group_rep: 1, start_date: -1 }, name: 'idx_group_rep_start_date' },
   { key: { preset_priority: 1, creative_rank: 1, start_date: -1 }, name: 'idx_preset_priority' },
   { key: { 'filter_signals.is_new_ad': 1, preset_priority: 1, start_date: -1 }, name: 'idx_new_ad_priority' },
   { key: { 'filter_signals.is_ready_to_scale': 1, preset_priority: 1, scaling_score: -1 }, name: 'idx_scale_priority' },
@@ -195,7 +194,15 @@ const INDEXES = [
   // range (last_seen). Cung ten, khac key -> deploy PHAI dropIndex truoc.
   // 13/11: them creative_rank cuoi key de dieu kien an phim ($ne
   // creative_rank) o list mac dinh duoc COUNT_SCAN, khong FETCH.
-  { key: { is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: 'idx_group_rep_last_seen_start' },
+  // 16/11: SAI — planner khong chon index nay du creative_rank da co
+  // trong key (chon index hep 2-field + FETCH ~459k doc -> timeout
+  // 30s, site ra 0 ca ngay 16/11). Doi key: dua creative_rank len
+  // thu 2 de bound duoc rank (equality -> equality -> sort -> range).
+  // Cung ten, khac key -> deploy PHAI dropIndex truoc (da drop + tao
+  // lai tren DB ngay 16/11, dem $ne khong hint ra 321.448 trong 1,5s).
+  // Xoa luon idx_group_rep_start_date o tren (planner da chon no
+  // truoc tien, gay FETCH).
+  { key: { is_group_rep: 1, creative_rank: 1, start_date: -1, last_seen: -1 }, name: 'idx_group_rep_last_seen_start' },
   { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, countries_lower: 1, start_date: -1 }, name: 'idx_new_ad_rep_country_start' },
   // Đếm media usage: cùng file re-sign vẫn chung image_keys/video_keys.
   { key: { image_keys: 1 }, name: 'idx_image_keys' },

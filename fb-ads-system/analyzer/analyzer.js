@@ -1556,7 +1556,6 @@ async function main() {
         { key: { scaling_level: 1, start_date: -1 }, name: "idx_scaling_start_date" },
         { key: { estimated_spend: 1, start_date: -1 }, name: "idx_spend_tier_start_date" },
         { key: { duplicate_group_key: 1 }, name: "idx_group_key" },
-        { key: { is_group_rep: 1, start_date: -1 }, name: "idx_group_rep_start_date" },
         { key: { preset_priority: 1, creative_rank: 1, start_date: -1 }, name: "idx_preset_priority" },
         { key: { 'filter_signals.is_new_ad': 1, preset_priority: 1, start_date: -1 }, name: "idx_new_ad_priority" },
         { key: { 'filter_signals.is_ready_to_scale': 1, preset_priority: 1, scaling_score: -1 }, name: "idx_scale_priority" },
@@ -1587,7 +1586,8 @@ async function main() {
         // va combo new_ads+VN (flag + rep + country + sort) — thieu 2 index
         // nay thi find phai FETCH toan bo doc cua filter (UI Inactive 0 the,
         // combo 20-35s) du count da nhanh.
-        { key: { is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: "idx_group_rep_last_seen_start" },
+        // 16/11: dua creative_rank len thu 2 (bound duoc rank) — key cu bi planner bo qua, dem timeout 30s.
+        { key: { is_group_rep: 1, creative_rank: 1, start_date: -1, last_seen: -1 }, name: "idx_group_rep_last_seen_start" },
         { key: { 'filter_signals.is_new_ad': 1, is_group_rep: 1, countries_lower: 1, start_date: -1 }, name: "idx_new_ad_rep_country_start" },
         { key: { image_keys: 1 }, name: "idx_image_keys" },
         { key: { video_keys: 1 }, name: "idx_video_keys" },
