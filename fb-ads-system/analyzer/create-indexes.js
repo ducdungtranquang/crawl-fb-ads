@@ -101,7 +101,13 @@ const INDEXES = [
   // them creative_rank cuoi key de dieu kien an phim ($ne creative_rank)
   // duoc COUNT_SCAN. Cung ten, khac key -> deploy PHAI dropIndex truoc.
   // Dong thoi XOA idx_countries_lower_start_date (index xau gay ra loi).
-  { key: { countries_lower: 1, is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: 'idx_countries_rep_start' },
+  // 17/11 (PR #46, dem VN rieng timeout 30s): key cu dat creative_rank
+  // CUOI key, sau range last_seen -> Mongo khong bound duoc rank, phai
+  // FETCH ~123k doc VN de kiem tra rank -> timeout 30s -> FE hien
+  // "Dang dem..." mai. Key moi: equality (nuoc, rep, rank) ->
+  // sort (start_date) -> range (last_seen). Cung ten, khac key ->
+  // deploy PHAI dropIndex truoc.
+  { key: { countries_lower: 1, is_group_rep: 1, creative_rank: 1, start_date: -1, last_seen: -1 }, name: 'idx_countries_rep_start' },
   // 12/11 (PR #41, loi 10a VN+industry): khong index nao chua ca
   // countries_lower + industry — planner chon 1 chieu roi FETCH tung doc
   // kiem tra chieu con lai + sort trong bo nho. Them 1 index to hop:
@@ -109,7 +115,11 @@ const INDEXES = [
   // Can 1 slot: DB dang 64/64 sau PR #40 nen deploy PHAI drop 1 index thua
   // truoc (idx_scale_rep_rank hoac idx_winner_rep_rank — khong con trong
   // list, drop xong khong bi tao lai), roi moi chay file nay.
-  { key: { countries_lower: 1, industry: 1, is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: 'idx_country_industry_rep_start' },
+  // 17/11 (PR #46): cung loi cau truc — creative_rank cuoi key, sau
+  // range last_seen -> khong bound duoc rank khi dem VN+nganh.
+  // Key moi: equality (nuoc, nganh, rep, rank) -> sort -> range.
+  // Cung ten, khac key -> deploy PHAI dropIndex truoc.
+  { key: { countries_lower: 1, industry: 1, is_group_rep: 1, creative_rank: 1, start_date: -1, last_seen: -1 }, name: 'idx_country_industry_rep_start' },
   // VN + spend (fix 12/11): FE gui estimated_spend la 1 tier
   // ('VERY HIGH'/'HIGH'/'MEDIUM'/'LOW', xem SPEND_TIER_MAP) qua param
   // estimated_spend; query VN+spend truoc day khong co index nao chua ca
@@ -119,7 +129,11 @@ const INDEXES = [
   // range (last_seen) cuoi. Them 1 index, tran 64: danh sach co 60
   // entry + _id = 61 -> them index nay thanh 62, van du slot (chi them
   // 1 index nay, khong them index USD vi FE chi gui tier).
-  { key: { countries_lower: 1, estimated_spend: 1, is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: 'idx_country_spend_tier_rep_start' },
+  // 17/11 (PR #46): cung loi cau truc — creative_rank cuoi key, sau
+  // range last_seen -> khong bound duoc rank khi dem VN+spend.
+  // Key moi: equality (nuoc, tier, rep, rank) -> sort -> range.
+  // Cung ten, khac key -> deploy PHAI dropIndex truoc.
+  { key: { countries_lower: 1, estimated_spend: 1, is_group_rep: 1, creative_rank: 1, start_date: -1, last_seen: -1 }, name: 'idx_country_spend_tier_rep_start' },
   // OTHER (fix 11/11): $ne 'vn' khong dung duoc index -> dem >25s -> FE
   // route timeout 25s roi tra 0. Analyzer ghi san co
   // filter_signals.is_other (khong phai VN, gom ca ad chua co nhan nuoc);
