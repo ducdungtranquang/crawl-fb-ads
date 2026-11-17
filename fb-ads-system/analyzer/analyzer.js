@@ -1574,7 +1574,8 @@ async function main() {
         { key: { scaling_score: -1, is_group_rep: 1, start_date: -1 }, name: "idx_scaling_score_rep_start" },
         { key: { domain_lower: 1, is_group_rep: 1, start_date: -1 }, name: "idx_domain_rep_start" },
         { key: { page_name_lower: 1, is_group_rep: 1, start_date: -1 }, name: "idx_page_rep_start" },
-        { key: { countries_lower: 1, is_group_rep: 1, start_date: -1, last_seen: -1, creative_rank: 1 }, name: "idx_countries_rep_start" },
+        // 17/11 (PR #46): creative_rank tu cuoi key len thu 3 — key cu khong bound duoc rank, dem VN rieng FETCH ~123k doc -> timeout 30s.
+        { key: { countries_lower: 1, is_group_rep: 1, creative_rank: 1, start_date: -1, last_seen: -1 }, name: "idx_countries_rep_start" },
         // OTHER (fix 11/11): cờ filter_signals.is_other thay $ne 'vn' —
         // equality boolean dùng được COUNT_SCAN. Giữ countries_lower trong
         // key để đường fallback $ne (trước FULL) vẫn kiểm tra từ index.
