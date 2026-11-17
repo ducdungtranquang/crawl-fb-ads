@@ -456,6 +456,11 @@ function detectFunnel(ad) {
 //   (số ad của page), độ đông của keyword (số ad cùng keyword), độ bền
 //   (seen_count). Page like KHÔNG có trong dữ liệu crawl (Library list
 //   không trả trường này) nên dùng page_ads_count làm tín hiệu quy mô Page.
+// - 17/11: ad mới (1 ngày, 1 bản sao) vẫn trùng vì mọi đầu vào ≈ 1.
+//   Thêm (a) hệ số ngôn ngữ mLang (detect từ text, VN 1.0 / EN 1.15 /
+//   ZH 1.10 / TH 1.05) để ad khác ngôn ngữ ra spend khác nhau, và
+//   (b) domain_ads_count vào diversify (domain nhiều ad = quy mô lớn
+//   hơn); chặn diversify ở 1.30. Page like vẫn KHÔNG có (xem trên).
 // Các hằng số điều chỉnh được tại SPEND_MODEL_CAPS. Công thức gốc
 // (D × T × bBase × mInd × fT) và các tier giữ nguyên.
 const SPEND_MODEL_CAPS = {
@@ -468,7 +473,28 @@ const SPEND_MODEL_CAPS = {
   minPageCapUsd: 5000,
 };
 
-function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1, pageAdsCount = 1, keywordDupCount = 1) {
+// ===== NGÔN NGỮ CỦA AD (17/11) =====
+// Detect ngôn ngữ từ text/headline (không cần crawler đổi gì) để làm
+// hệ số spend: ad tiếng Anh/Trung nhắm tệp hẹp hơn, CPM cao hơn ad
+// tiếng Việt đại chúng. Thứ tự: CJK -> tiếng Trung; Thai -> tiếng Thái;
+// dấu tiếng Việt hoặc từ Việt -> tiếng Việt; chữ Latin -> tiếng Anh;
+// còn lại (toàn emoji, chữ lạ, rỗng) -> 'other'.
+const LANGUAGE_SPEND_MULT = { vn: 1.0, en: 1.15, zh: 1.1, th: 1.05, other: 1.0 };
+const VN_DIACRITICS_RE = /[àáạảãâầấậẩẫăằắặẳẵđèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựỳýỵỷỹ]/i;
+const VN_PHRASES = ['mua ngay', 'đặt hàng', 'khuyến mãi', 'giảm giá', 'freeship', 'giao hàng', 'miễn phí vận chuyển', 'chính hãng', 'bảo hành', 'thời trang', 'làm đẹp', 'sức khỏe', 'cà phê', 'trà sữa', 'quần áo', 'nội thất', 'gia dụng', 'sản phẩm', 'cửa hàng', 'giá chỉ', 'chỉ còn', 'mua 1 tặng'];
+function detectAdLanguage(ad) {
+  const text = String((ad.text || '') + ' ' + (ad.headline || '')).trim();
+  if (!text) return 'other';
+  if (/[\u4E00-\u9FFF]/.test(text)) return 'zh';
+  if (/[\u0E00-\u0E7F]/.test(text)) return 'th';
+  if (VN_DIACRITICS_RE.test(text)) return 'vn';
+  const lower = text.toLowerCase();
+  if (VN_PHRASES.some((p) => lower.includes(p))) return 'vn';
+  if (/[a-z]/.test(lower)) return 'en';
+  return 'other';
+}
+
+function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1, pageAdsCount = 1, keywordDupCount = 1, domainAdsCount = 0, adLanguage = null) {
   const T = Math.min(SPEND_MODEL_CAPS.maxDays, Math.max(SPEND_MODEL_CAPS.minAgeDays, durationDays));
   const D = Math.min(SPEND_MODEL_CAPS.maxCopies, Math.max(1, Math.round(duplicatesCount || ad.seen_count || 1)));
 
@@ -510,21 +536,29 @@ function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1, pageAd
     bBase = 8.0;
   }
 
+  // 2b. Hệ số ngôn ngữ (17/11): ad tiếng Anh/Trung nhắm tệp hẹp hơn,
+  // CPM cao hơn ad tiếng Việt đại chúng. Ngôn ngữ detect từ text (xem
+  // detectAdLanguage); không có thì mặc định 'vn' (1.0).
+  const lang = adLanguage || detectAdLanguage(ad);
+  const mLang = LANGUAGE_SPEND_MULT[lang] || 1.0;
+
   const fT = 1.0 + 0.12 * Math.log(T);
 
   // 3b. Hệ số đa dạng hóa (xem ghi chú ở SPEND_MODEL_CAPS): phá vỡ các cặp
   // spend/reach trùng nhau mà không đổi thứ hạng lớn hay tier. Mỗi thừa số
-  // dùng log1p nên tăng chậm theo tín hiệu (page 100 ad ≈ +9%, keyword
-  // 100 ad ≈ +9%, seen 10 lần ≈ +2%); tích tối đa chặn ở 1.25.
-  const diversify = Math.min(1.25,
-    (1 + 0.02 * Math.log1p(Math.max(0, pageAdsCount || 0))) *
-    (1 + 0.02 * Math.log1p(Math.max(0, keywordDupCount || 0))) *
-    (1 + 0.01 * Math.log1p(Math.max(0, ad.seen_count || 0))));
+  // dùng log1p nên tăng chậm theo tín hiệu. 17/11: thêm domain_ads_count
+  // (domain nhiều ad = quy mô lớn hơn) và tăng nhẹ hệ số page/keyword để
+  // spend phân biệt rõ hơn; tích tối đa chặn ở 1.30.
+  const diversify = Math.min(1.30,
+    (1 + 0.025 * Math.log1p(Math.max(0, pageAdsCount || 0))) *
+    (1 + 0.025 * Math.log1p(Math.max(0, keywordDupCount || 0))) *
+    (1 + 0.012 * Math.log1p(Math.max(0, ad.seen_count || 0))) *
+    (1 + 0.02 * Math.log1p(Math.max(0, domainAdsCount || 0))));
 
   // 4. Tính toán Ngân sách Chi tiêu — trả về KHOẢNG (min–max) thay vì 1 số điểm.
   // Khoảng phản ánh độ bất định lớn nhất của mô hình: việc xếp tier (bBase).
   // min = tier dưới, max = tier trên; ở tier biên thì nhân 0.5 / 1.5.
-  const spendFor = (b) => Math.max(D * T * b * mInd * fT * diversify, SPEND_MODEL_CAPS.spendFloorUsd); // Tối thiểu $1 tuyệt đối
+  const spendFor = (b) => Math.max(D * T * b * mInd * fT * mLang * diversify, SPEND_MODEL_CAPS.spendFloorUsd); // Tối thiểu $1 tuyệt đối
   let estimatedSpend = spendFor(bBase);
   const tierIdx = TIERS.indexOf(bBase);
   const bLow = tierIdx > 0 ? TIERS[tierIdx - 1] : bBase * 0.5;
@@ -565,7 +599,9 @@ function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1, pageAd
     estimated_spend_source: 'model',
     estimated_spend_capped: spendCapped,
     cpm_used: cpm,
-    spend_diversify: Number(diversify.toFixed(3))
+    spend_diversify: Number(diversify.toFixed(3)),
+    spend_lang_mult: mLang,
+    ad_language: lang
   };
 }
 
@@ -788,12 +824,15 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
     // Độ đông của keyword: số ad cùng từ khóa đông nhất mà ad này từng được
     // tìm thấy (keyword_mentions do crawler ghi). Không có keyword -> 1.
     const keywordDupCount = Math.max(1, ...((Array.isArray(ad.keyword_mentions) ? ad.keyword_mentions : []).map((k) => keywordMap[k] || 1)));
-    const spendReachData = estimateSpendAndReach(ad, ageDaysRaw, duplicatesCount, pageMap[ad.page_name] || 0, keywordDupCount);
+    // Tính page/domain/language TRƯỚC khi gọi spend (17/11): spend dùng
+    // domain_ads_count + ngôn ngữ để phân biệt ad.
+    const pageAds = pageMap[ad.page_name] || 0;
+    const domainAds = domainMap[domain] || 0;
+    const adLanguage = detectAdLanguage(ad);
+    const spendReachData = estimateSpendAndReach(ad, ageDaysRaw, duplicatesCount, pageAds, keywordDupCount, domainAds, adLanguage);
 
     let score = 0;
-    const pageAds = pageMap[ad.page_name] || 0;
     const clones = duplicatesCount; // nhất quán với D dùng trong mô hình spend
-    const domainAds = domainMap[domain] || 0;
 
     if (durationDays > 3) score += 2;
     if (durationDays > 7) score += 4;
@@ -939,6 +978,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       estimated_spend_capped: spendReachData.estimated_spend_capped,
       cpm_used: spendReachData.cpm_used,
       spend_diversify: spendReachData.spend_diversify,
+      spend_lang_mult: spendReachData.spend_lang_mult,
       // Tín hiệu thô để sau này build bộ lọc "Quảng cáo mới lên",
       // "Ready to Scale", "Đang chạy mạnh". Ngưỡng chỉ là gợi ý,
       // chỉnh khi build filter thật.
@@ -976,6 +1016,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       fallback_growth: fallback,
       funnel: funnelValue,
       industry: industryValue,
+      ad_language: adLanguage,
       preset_priority: presetPriorityValue,
       creative_kind: creativeKind,
       creative_rank: CREATIVE_KINDS[creativeKind],
@@ -1684,4 +1725,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, normalizeLandingUrl, productKeyFor, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, hasPlaceholderCreative, isNonProductAd, NON_PRODUCT_PATTERNS, hasBuySignal, BUY_SIGNAL_PATTERNS, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, detectAdLanguage, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, normalizeLandingUrl, productKeyFor, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, hasPlaceholderCreative, isNonProductAd, NON_PRODUCT_PATTERNS, hasBuySignal, BUY_SIGNAL_PATTERNS, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
