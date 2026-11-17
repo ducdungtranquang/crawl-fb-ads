@@ -838,6 +838,13 @@ function hideEntertainmentEnabled(q, industryValues) {
 function buildHideEntertainmentCondition() {
     return { creative_rank: { $in: [0, 1] } };
 }
+// Chặn cứng cờ bạc/lừa đảo (creative_rank 3/4, xem analyzer 17/11):
+// KHÔNG BAO GIỜ hiện, kể cả khi tắt ẩn phim (?hide_entertainment=0).
+// Dùng $in [0,1,2] (không dùng $ne) để Mongo bound được rank bằng index,
+// cùng lý do như buildHideEntertainmentCondition (vụ $ne timeout 16/11).
+function buildHideGamblingCondition() {
+    return { creative_rank: { $in: [0, 1, 2] } };
+}
 
 // Ưu tiên ad mua sắm/bán sản phẩm (creative_rank 0) lên trước, ad thuần
 // giải trí (rank 2) xuống sau, trong các preset. Mặc định BẬT; tắt bằng
@@ -1511,7 +1518,11 @@ function initSearchServer(dbInstance) {
             if (dedupeOn && esRank && !esDedupeAvailable && schema.groupRep) dedupeFallback = 'mongo';
             if (industryCond) andConds.push(industryCond);
             // Ẩn phim/giải trí (mặc định BẬT, xem hideEntertainmentEnabled).
+            // Cờ bạc/lừa đảo (rank 3/4) không bao giờ hiện: ẩn phim BẬT thì
+            // [0,1] đã loại cả rank 3/4; ẩn phim TẮT thì dùng [0,1,2] thay
+            // vì bỏ hẳn điều kiện rank (xem fix 17/11).
             if (hideEntertainmentEnabled(q, industryValues)) andConds.push(buildHideEntertainmentCondition());
+            else andConds.push(buildHideGamblingCondition());
             if (scaling_level) {
                 const scalingCond = buildScalingCondition(scaling_level);
                 if (scalingCond) andConds.push(scalingCond);
@@ -1552,7 +1563,7 @@ function initSearchServer(dbInstance) {
                     start_date: 1, seen_count: 1, score: 1, level: 1, trending_score: 1, scaling_score: 1,
                     estimated_spend_usd: 1, estimated_spend_min_usd: 1, estimated_spend_max_usd: 1,
                     estimated_spend: 1, estimated_spend_source: 1, estimated_spend_capped: 1, country_inferred: 1, estimated_reach: 1, estimated_reach_min: 1, estimated_reach_max: 1,
-                    duplicates_count: 1, duration_days: 1, cpm_used: 1, filter_signals: 1, industry: 1, creative_kind: 1, creative_rank: 1, thumbnail_r2: 1, duplicate_group_key: 1, duplicate_group_size: 1, is_group_rep: 1, preset_priority: 1,
+                    duplicates_count: 1, duration_days: 1, cpm_used: 1, spend_diversify: 1, spend_lang_mult: 1, ad_language: 1, filter_signals: 1, industry: 1, creative_kind: 1, creative_rank: 1, thumbnail_r2: 1, duplicate_group_key: 1, duplicate_group_size: 1, is_group_rep: 1, preset_priority: 1,
                     scaling_level: 1, funnel: 1, analyzed_at: 1,
                     thumbnail_local: 1, is_active: 1, images: { $slice: 1 }, videos: { $slice: 1 }
                 })
@@ -2021,6 +2032,8 @@ const NON_PRODUCT_PATTERNS = [
 const NON_PRODUCT_INDUSTRIES = new Set(['entertainment', 'gambling', 'real_estate']);
 function isNonProductAd(ad) {
   if (!ad || typeof ad !== 'object') return false;
+  // Cờ bạc / spam (17/11): không bao giờ thành winning product.
+  if (ad.creative_kind === 'gambling' || ad.creative_kind === 'spam') return true;
   if (ad.industry && NON_PRODUCT_INDUSTRIES.has(String(ad.industry).toLowerCase())) return true;
   const hay = [ad.headline, ad.text, ad.description].filter(Boolean).join(' ').toLowerCase();
   if (!hay) return false;
@@ -2122,7 +2135,7 @@ function buildMonthlyWinnersPipeline(month, filters = {}) {
     ];
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, hideEntertainmentEnabled, buildHideEntertainmentCondition, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, isNonProductAd, nonProductTitleRegex, NON_PRODUCT_PATTERNS, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, hideEntertainmentEnabled, buildHideEntertainmentCondition, buildHideGamblingCondition, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, isNonProductAd, nonProductTitleRegex, NON_PRODUCT_PATTERNS, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
