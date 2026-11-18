@@ -1481,15 +1481,19 @@ async function updateProductsCollection(db, analyzedAds) {
 }
 
 // ===== ELASTICSEARCH SYNC =====
-async function syncToElasticsearch(esClient, analyzedAds) {
-  if (!analyzedAds || analyzedAds.length === 0) return;
-
-  let allOk = true;
-  // Ghi theo lát 1000 để không giữ toàn bộ docs ES của cả batch trong RAM.
-  for (let s = 0; s < analyzedAds.length; s += 1000) {
-    const docs = analyzedAds.slice(s, s + 1000)
-      .filter(ad => ad.ad_archive_id || ad.ad_id || ad.id)
-      .map(ad => ({
+// ===== ELASTICSEARCH DOC BUILDER (Phase 0, 18/11) =====
+// Dung 1 doc analyzed-ad (output cua analyzeAllAdsGlobally) thanh doc ES.
+// Bao quat TAT CA field loc/sort/dem cua searchApi (xem ES-COVERAGE-REPORT.md).
+// Quy uoc kieu (khoe voi mapping ELASTIC_INDEX_MAPPINGS):
+// - last_seen / first_seen / analyzed_at la SO mili-giay (long), KHONG phai
+//   date — Mongo luu chung dang number, so sanh so; map date se sai ngu nghia.
+// - start_date la SO giay (date epoch_second, nhu cu).
+// - analyzed_at KHONG co tren processedAds (analyzer chi set no luc ghi Mongo
+//   trong updateAdsCollection) nen lay Date.now() luc sync = gio chay FULL.
+// - filter_signals.is_credit (PR #49, chua merge): chi ghi khi input co boolean,
+//   khong thi bo qua — mapping da khai bao san de FULL sau merge co du lieu ngay.
+function buildElasticDoc(ad) {
+  return {
       ad_archive_id: String(ad.ad_archive_id || ad.ad_id || ad.id),
       ad_library_url: ad.ad_library_url || '',
       text: ad.text || '',
@@ -1519,8 +1523,54 @@ async function syncToElasticsearch(esClient, analyzedAds) {
       funnel: ad.funnel || '',
       industry: ad.industry || 'other',
       country_inferred: ad.country_inferred === true,
-      scaling_level: ad.scaling_level || ''
-    }));
+      scaling_level: ad.scaling_level || '',
+      // --- Phase 0: field loc/sort/dem (searchApi) ---
+      countries_lower: Array.isArray(ad.countries_lower) ? ad.countries_lower.filter(Boolean).map(String) : [],
+      country_mentions_lower: Array.isArray(ad.country_mentions_lower) ? ad.country_mentions_lower.filter(Boolean).map(String) : [],
+      latest_detail_country_lower: ad.latest_detail_country_lower ? String(ad.latest_detail_country_lower) : '',
+      page_name_lower: ad.page_name_lower || String(ad.page_name || '').toLowerCase(),
+      domain_lower: ad.domain_lower || String(ad.domain || '').toLowerCase(),
+      last_seen: typeof ad.last_seen === 'number' ? ad.last_seen : null,
+      first_seen: typeof ad.first_seen === 'number' ? ad.first_seen : null,
+      analyzed_at: Date.now(),
+      creative_rank: typeof ad.creative_rank === 'number' ? ad.creative_rank : null,
+      creative_kind: ad.creative_kind || '',
+      is_active: ad.is_active === true,
+      ad_language: ad.ad_language || '',
+      spend_diversify: typeof ad.spend_diversify === 'number' ? ad.spend_diversify : 0,
+      spend_lang_mult: typeof ad.spend_lang_mult === 'number' ? ad.spend_lang_mult : 1,
+      cpm_used: typeof ad.cpm_used === 'number' ? ad.cpm_used : 0,
+      thumbnail_r2: ad.thumbnail_r2 || null,
+      thumbnail_local: ad.thumbnail_local || null,
+      link: ad.link || '',
+      product_key: ad.product_key || '',
+      duplicate_group_key: ad.duplicate_group_key || '',
+      image_keys: Array.isArray(ad.image_keys) ? ad.image_keys.filter(Boolean).map(String) : [],
+      video_keys: Array.isArray(ad.video_keys) ? ad.video_keys.filter(Boolean).map(String) : [],
+      normalized_text: ad.normalized_text || '',
+      seen_count: typeof ad.seen_count === 'number' ? ad.seen_count : 0,
+      filter_signals: {
+        is_new_ad: ad.filter_signals?.is_new_ad === true,
+        is_ready_to_scale: ad.filter_signals?.is_ready_to_scale === true,
+        is_weekly_winner: ad.filter_signals?.is_weekly_winner === true,
+        is_other: ad.filter_signals?.is_other === true,
+        is_gambling: ad.filter_signals?.is_gambling === true,
+        is_spam: ad.filter_signals?.is_spam === true,
+        is_recently_seen: ad.filter_signals?.is_recently_seen === true,
+        ...(typeof ad.filter_signals?.is_credit === 'boolean' ? { is_credit: ad.filter_signals.is_credit } : {}),
+      },
+  };
+}
+
+async function syncToElasticsearch(esClient, analyzedAds) {
+  if (!analyzedAds || analyzedAds.length === 0) return;
+
+  let allOk = true;
+  // Ghi theo lát 1000 để không giữ toàn bộ docs ES của cả batch trong RAM.
+  for (let s = 0; s < analyzedAds.length; s += 1000) {
+    const docs = analyzedAds.slice(s, s + 1000)
+      .filter(ad => ad.ad_archive_id || ad.ad_id || ad.id)
+      .map(buildElasticDoc);
     if (!docs.length) continue;
     const operations = docs.flatMap(ad => [
       { index: { _index: ELASTIC_INDEX, _id: ad.ad_archive_id } },
@@ -1541,6 +1591,88 @@ async function syncToElasticsearch(esClient, analyzedAds) {
   return allOk;
 }
 
+// ===== ELASTICSEARCH MAPPINGS (Phase 0, 18/11) =====
+// Chi ap dung khi tao index MOI (ensureIndexExists chi create khi index chua
+// co). Tren ES da co index cu (mapping thieu field), phai xoa index + chay
+// lai FULL (reindex) hoac de dynamic mapping tu map field moi — khong duoc
+// kieu chinh xac. Tren may moi (ES trang) thi mapping nay duoc dung ngay.
+// Quy uoc: keyword cho exact match ($in/equality/prefix range), long cho so
+// nguyen/ms epoch, float cho spend/score thap phan, boolean cho co,
+// date epoch_second CHI cho start_date (giay). last_seen/first_seen/
+// analyzed_at la long (ms), KHONG phai date.
+const ELASTIC_INDEX_MAPPINGS = {
+  properties: {
+    ad_archive_id: { type: 'keyword' },
+    text: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search' },
+    headline: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search' },
+    description: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search' },
+    page_name: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search', fields: { keyword: { type: 'keyword', ignore_above: 256 } } },
+    domain: { type: 'keyword' },
+    score: { type: 'double' },
+    level: { type: 'keyword' },
+    estimated_spend_usd: { type: 'double' },
+    estimated_spend_min_usd: { type: 'double' },
+    estimated_spend_max_usd: { type: 'double' },
+    estimated_reach: { type: 'long' },
+    estimated_reach_min: { type: 'long' },
+    estimated_reach_max: { type: 'long' },
+    estimated_spend: { type: 'keyword' },
+    duplicates_count: { type: 'long' },
+    duplicate_group_size: { type: 'long' },
+    is_group_rep: { type: 'boolean' },
+    preset_priority: { type: 'long' },
+    duration_days: { type: 'double' },
+    scaling_score: { type: 'double' },
+    trending_score: { type: 'double' },
+    ad_library_url: { type: 'keyword' },
+    funnel: { type: 'keyword' },
+    scaling_level: { type: 'keyword' },
+    start_date: { type: 'date', format: 'epoch_second' },
+    full_text_search: { type: 'text', analyzer: 'vietnamese_analyzer' },
+    // --- Phase 0: field loc/sort/dem (searchApi) ---
+    countries_lower: { type: 'keyword' },
+    country_mentions_lower: { type: 'keyword' },
+    latest_detail_country_lower: { type: 'keyword' },
+    page_name_lower: { type: 'keyword' },
+    domain_lower: { type: 'keyword' },
+    last_seen: { type: 'long' },
+    first_seen: { type: 'long' },
+    analyzed_at: { type: 'long' },
+    creative_rank: { type: 'long' },
+    creative_kind: { type: 'keyword' },
+    industry: { type: 'keyword' },
+    country_inferred: { type: 'boolean' },
+    estimated_spend_source: { type: 'keyword' },
+    estimated_spend_capped: { type: 'boolean' },
+    is_active: { type: 'boolean' },
+    ad_language: { type: 'keyword' },
+    spend_diversify: { type: 'float' },
+    spend_lang_mult: { type: 'float' },
+    cpm_used: { type: 'float' },
+    thumbnail_r2: { type: 'keyword' },
+    thumbnail_local: { type: 'keyword' },
+    link: { type: 'keyword' },
+    product_key: { type: 'keyword' },
+    duplicate_group_key: { type: 'keyword' },
+    image_keys: { type: 'keyword' },
+    video_keys: { type: 'keyword' },
+    normalized_text: { type: 'keyword', ignore_above: 32766 },
+    seen_count: { type: 'long' },
+    filter_signals: {
+      properties: {
+        is_new_ad: { type: 'boolean' },
+        is_ready_to_scale: { type: 'boolean' },
+        is_weekly_winner: { type: 'boolean' },
+        is_other: { type: 'boolean' },
+        is_gambling: { type: 'boolean' },
+        is_spam: { type: 'boolean' },
+        is_recently_seen: { type: 'boolean' },
+        is_credit: { type: 'boolean' },
+      },
+    },
+  },
+};
+
 async function ensureIndexExists(esClient) {
   const exists = await esClient.indices.exists({ index: ELASTIC_INDEX });
   if (exists) return false;
@@ -1558,37 +1690,7 @@ async function ensureIndexExists(esClient) {
         }
       }
     },
-    mappings: {
-      properties: {
-        ad_archive_id: { type: 'keyword' },
-        text: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search' },
-        headline: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search' },
-        description: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search' },
-        page_name: { type: 'text', analyzer: 'vietnamese_analyzer', copy_to: 'full_text_search' },
-        domain: { type: 'keyword' },
-        score: { type: 'double' },
-        level: { type: 'keyword' },
-        estimated_spend_usd: { type: 'double' },
-        estimated_spend_min_usd: { type: 'double' },
-        estimated_spend_max_usd: { type: 'double' },
-        estimated_reach: { type: 'long' },
-        estimated_reach_min: { type: 'long' },
-        estimated_reach_max: { type: 'long' },
-        estimated_spend: { type: 'keyword' },
-        duplicates_count: { type: 'long' },
-        duplicate_group_size: { type: 'long' },
-        is_group_rep: { type: 'boolean' },
-        preset_priority: { type: 'long' },
-        duration_days: { type: 'double' },
-        scaling_score: { type: 'double' },
-        trending_score: { type: 'double' },
-        ad_library_url: { type: 'keyword' },
-        funnel: { type: 'keyword' },
-        scaling_level: { type: 'keyword' },
-        start_date: { type: 'date', format: 'epoch_second' },
-        full_text_search: { type: 'text', analyzer: 'vietnamese_analyzer' }
-      }
-    }
+    mappings: ELASTIC_INDEX_MAPPINGS
   });
   return true;
 }
@@ -1796,4 +1898,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, hasGamblingSign, isSpamCreative, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, detectAdLanguage, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, normalizeLandingUrl, productKeyFor, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, hasPlaceholderCreative, isNonProductAd, NON_PRODUCT_PATTERNS, hasBuySignal, BUY_SIGNAL_PATTERNS, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
+module.exports = { buildElasticDoc, ELASTIC_INDEX_MAPPINGS, classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, hasGamblingSign, isSpamCreative, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, detectAdLanguage, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, normalizeLandingUrl, productKeyFor, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, hasPlaceholderCreative, isNonProductAd, NON_PRODUCT_PATTERNS, hasBuySignal, BUY_SIGNAL_PATTERNS, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
