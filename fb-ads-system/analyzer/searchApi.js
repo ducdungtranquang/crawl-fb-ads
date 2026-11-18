@@ -924,6 +924,119 @@ function stripCountExistsConditions(query, sortOptions) {
     return changed ? out : query;
 }
 
+// Đếm tổng cho /api/ads/search: giới hạn 30s như cũ.
+const COUNT_MAX_TIME_MS = 30000;
+// Index phục vụ đếm khi lọc đúng 1 nước (xem isCountryAloneCount).
+const COUNTRY_ALONE_COUNT_INDEX = 'idx_countries_rep_start';
+
+function isNonEmptyParam(v) {
+    if (v === undefined || v === null) return false;
+    if (typeof v === 'string') return v.trim() !== '';
+    if (Array.isArray(v)) return v.some((x) => isNonEmptyParam(x));
+    return true;
+}
+function isFiniteNumberParam(v) {
+    return v !== undefined && v !== null && Number.isFinite(Number(v));
+}
+
+// Đếm VN một mình (18/11): planner chọn SAI index cho câu đếm lọc 1 nước
+// (explain live: idx_other_rep_start, FETCH 355.817 doc, 203 giây) thay vì
+// idx_countries_rep_start (COUNT_SCAN ~2,4s cho 140.429 ad VN) — xóa plan
+// cache rồi vẫn chọn sai nên phải hint. Chỉ hint khi query lọc ĐÚNG 1 nước
+// và không kèm filter nào khác. Scope hẹp là cố ý: combo nước+spend
+// (idx_country_spend_tier_rep_start), nước+ngành
+// (idx_country_industry_rep_start), preset (idx_winner_rep_combo, ...) có
+// index riêng và planner đang chọn đúng cho chúng — hint bừa sẽ làm chậm
+// chúng. Country='other' không có countries_lower nên tự loại (OTHER dùng
+// idx_other_rep_start, đúng index của nó).
+// Kiểm tra 2 lớp: (1) param q — không filter nào khác có hiệu lực;
+// (2) cấu trúc countQuery — top-level chỉ có countries_lower (+ $and mặc
+// định) và mọi nhánh $and đều là điều kiện mặc định (rep / tươi / ẩn rank),
+// để một filter lạ nào đó lọt qua lớp (1) cũng không hint sai.
+function isCountryAloneCount(q, countQuery) {
+    if (!q || typeof q !== 'object') return false;
+    if (!countQuery || typeof countQuery !== 'object' || Array.isArray(countQuery)) return false;
+    // (1a) Đúng 1 mã nước, không phải 'other'.
+    const codes = normalizeCountryCodes(q.country);
+    if (codes.length !== 1 || codes[0] === 'other') return false;
+    // (1b) Không filter nào khác có hiệu lực. min/max_spend_usd cũng chặn:
+    // buildSpendCondition tạo điều kiện chỉ từ 2 số này (không cần tier).
+    if (isNonEmptyParam(q.text)) return false;
+    if (isNonEmptyParam(q.date_from) || isNonEmptyParam(q.date_to)) return false;
+    if (isNonEmptyParam(q.level)) return false;
+    if (normalizeSpendTiers(q.estimated_spend).length) return false;
+    if (isFiniteNumberParam(q.min_spend_usd) || isFiniteNumberParam(q.max_spend_usd)) return false;
+    if (isFiniteNumberParam(q.min_score) || isFiniteNumberParam(q.max_score)) return false;
+    if (isFiniteNumberParam(q.min_trending_score)) return false;
+    if (normalizeFunnelValues(q.funnel).length) return false;
+    if (isNonEmptyParam(q.scaling_level)) return false;
+    if (isNonEmptyParam(q.page_name)) return false;
+    if (isNonEmptyParam(q.domain)) return false;
+    if (q.is_active !== undefined) return false;
+    if (normalizePresetNames(q.filter).length) return false;
+    if (normalizeIndustryValues(q.industry).length) return false;
+    // (2a) countQuery phải có countries_lower dạng object ($in các bí danh).
+    const cl = countQuery.countries_lower;
+    if (!cl || typeof cl !== 'object' || Array.isArray(cl)) return false;
+    // (2b) Top-level chỉ được có countries_lower và $and.
+    for (const k of Object.keys(countQuery)) {
+        if (k !== 'countries_lower' && k !== '$and') return false;
+    }
+    // (2c) Mọi nhánh $and phải là điều kiện mặc định của search list:
+    // is_group_rep, last_seen tươi, hoặc creative_rank $in (ẩn phim/cờ bạc).
+    const ands = countQuery.$and;
+    if (!Array.isArray(ands) || !ands.length) return false;
+    for (const c of ands) {
+        if (!c || typeof c !== 'object' || Array.isArray(c)) return false;
+        const keys = Object.keys(c);
+        if (keys.length !== 1) return false;
+        if (keys[0] === 'is_group_rep') { if (c.is_group_rep !== true) return false; continue; }
+        if (keys[0] === 'last_seen') {
+            const v = c.last_seen;
+            if (!v || typeof v !== 'object' || !Number.isFinite(v.$gte)) return false;
+            continue;
+        }
+        if (keys[0] === 'creative_rank') {
+            const v = c.creative_rank;
+            if (!v || typeof v !== 'object' || !Array.isArray(v.$in) || !v.$in.length) return false;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+// Options cho countDocuments của /api/ads/search: luôn maxTimeMS 30s;
+// thêm hint idx_countries_rep_start chỉ khi đếm VN một mình.
+function resolveCountOptions(countQuery, q) {
+    const opts = { maxTimeMS: COUNT_MAX_TIME_MS };
+    if (isCountryAloneCount(q, countQuery)) opts.hint = COUNTRY_ALONE_COUNT_INDEX;
+    return opts;
+}
+
+function isCountTimeoutError(err) {
+    if (!err || typeof err !== 'object') return false;
+    if (err.code === 50) return true; // MaxTimeMSExpired
+    const msg = typeof err.message === 'string' ? err.message : '';
+    return /timed out|exceeded time limit|MaxTimeMS/i.test(msg);
+}
+
+// Đếm tổng cho /api/ads/search (thay cho countDocuments trực tiếp ở
+// handler). Nếu lần đếm có hint lỗi (vd index bị đổi tên/xóa) thì đếm lại
+// 1 lần KHÔNG hint; lỗi timeout thì không đếm lại (đếm lại cũng timeout,
+// chỉ tốn thêm 30s). Cả hai lần đều lỗi thì ném lỗi để handler đặt
+// countTimeout=true như cũ.
+async function countSearchTotal(col, countQuery, q) {
+    const opts = resolveCountOptions(countQuery, q);
+    try {
+        return await col.countDocuments(countQuery, opts);
+    } catch (err) {
+        if (!opts.hint || isCountTimeoutError(err)) throw err;
+        console.warn('[Search API] count hint lỗi, fallback không hint:', err && err.message);
+        return await col.countDocuments(countQuery, { maxTimeMS: COUNT_MAX_TIME_MS });
+    }
+}
+
 // Trả về mảng điều kiện Mongo cho preset (kết hợp AND với các filter khác).
 // presets: chuỗi 'new_ads,ready_to_scale' (chấp nhận alias new/scale/winner).
 // Đường nhanh: dùng cờ filter_signals.* tính sẵn bởi analyzer (1 field
@@ -1542,14 +1655,17 @@ function initSearchServer(dbInstance) {
             // với total=null để FE hiện kết quả thay vì lỗi 500 (FE phải
             // chịu được total=null, xem FE brief). Query đếm bỏ $exists
             // trên field rank (xem stripCountExistsConditions) để Mongo
-            // dùng COUNT_SCAN thay vì FETCH toàn bộ doc.
+            // dùng COUNT_SCAN thay vì FETCH toàn bộ doc. Đếm qua
+            // countSearchTotal để hint idx_countries_rep_start khi lọc
+            // đúng 1 nước (planner chọn sai index cho shape này, xem
+            // isCountryAloneCount); hint lỗi thì đếm lại không hint.
             let total = null;
             let countTimeout = false;
             const countQuery = stripCountExistsConditions(query, sortInfo.sortOptions);
             try {
                 total = Object.keys(countQuery).length === 0
                     ? await adsCol.estimatedDocumentCount()
-                    : await adsCol.countDocuments(countQuery, { maxTimeMS: 30000 });
+                    : await countSearchTotal(adsCol, countQuery, q);
             } catch (countErr) {
                 console.warn('[Search API] countDocuments timeout/lỗi:', countErr.message);
                 countTimeout = true;
@@ -2135,7 +2251,7 @@ function buildMonthlyWinnersPipeline(month, filters = {}) {
     ];
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, hideEntertainmentEnabled, buildHideEntertainmentCondition, buildHideGamblingCondition, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, isNonProductAd, nonProductTitleRegex, NON_PRODUCT_PATTERNS, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, hideEntertainmentEnabled, buildHideEntertainmentCondition, buildHideGamblingCondition, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, isNonProductAd, nonProductTitleRegex, NON_PRODUCT_PATTERNS, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS, isCountryAloneCount, resolveCountOptions, countSearchTotal, COUNTRY_ALONE_COUNT_INDEX, COUNT_MAX_TIME_MS };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
