@@ -261,11 +261,13 @@ const ACTIVE_WINDOW_MS = 7 * 24 * 3600 * 1000;
 // thừa ad cũ cũng đúng vì ad cũ không còn "đang" vít nữa).
 const SCALING_HARD_MAX_RUN_DAYS = 35;
 
-// Ad chết cũ (không thấy > 30 ngày) là vô giá trị: ẩn khỏi mọi list
+// Ad chết cũ (không thấy > 45 ngày) là vô giá trị: ẩn khỏi mọi list
 // (search, similar, page ads) + số đếm preset. Dùng last_seen thay vì cờ
 // is_active vì cờ có thể cũ; last_seen mới là sự thật (analyzer/crawler
 // luôn ghi last_seen cho mọi doc — đã kiểm chứng missing = 0).
-const STALE_AD_MAX_AGE_DAYS = 30;
+// Nới từ 30 ngày lên 45 ngày ngày 19/11/2026 theo yêu cầu Bryan để hiện
+// nhiều ad hơn (ad chỉ bị ẩn khi last_seen quá 45 ngày).
+const STALE_AD_MAX_AGE_DAYS = 45;
 const STALE_AD_MAX_AGE_MS = STALE_AD_MAX_AGE_DAYS * 24 * 3600 * 1000;
 function buildFreshAdCondition(nowMs = Date.now()) {
     return { last_seen: { $gte: nowMs - STALE_AD_MAX_AGE_MS } };
@@ -1249,7 +1251,7 @@ function buildSimilarTiers(sourceAd, adId, nowMs = Date.now()) {
     // rep của nó cũng là cùng 1 creative, không được hiện lại.
     const repOnly = { is_group_rep: { $ne: false } };
     const noOwnGroup = sourceAd.duplicate_group_key ? { duplicate_group_key: { $ne: sourceAd.duplicate_group_key } } : {};
-    // Ad chết cũ (last_seen > 30 ngày) không vào similar: ảnh hết hạn,
+    // Ad chết cũ (last_seen > 45 ngày) không vào similar: ảnh hết hạn,
     // vô giá trị dù điểm cao.
     const freshOnly = buildFreshAdCondition(nowMs);
     const tiers = [];
@@ -1624,7 +1626,7 @@ function initSearchServer(dbInstance) {
                 if (schema.groupRep) andConds.push({ is_group_rep: true });
                 else dedupeFallback = 'schema';
             }
-            // Ad chết cũ (last_seen > 30 ngày) là vô giá trị: ẩn khỏi
+            // Ad chết cũ (last_seen > 45 ngày) là vô giá trị: ẩn khỏi
             // mọi list search + đếm (total khớp list). Dùng last_seen thay
             // vì cờ is_active vì cờ có thể cũ.
             andConds.push(buildFreshAdCondition());
@@ -1771,7 +1773,7 @@ function initSearchServer(dbInstance) {
     app.get('/api/ads/filter-stats', async (req, res) => {
         try {
             const schema = await refreshSchemaProbe(adsCol);
-            // Total + badge preset chỉ đếm ad tươi (last_seen <= 30 ngày)
+            // Total + badge preset chỉ đếm ad tươi (last_seen <= 45 ngày)
             // để khớp với list đã ẩn ad chết cũ; total cũ dùng
             // estimatedDocumentCount đếm cả ad chết nên lệch với list.
             const freshCond = buildFreshAdCondition();
@@ -1948,7 +1950,7 @@ function initSearchServer(dbInstance) {
                     ? { $nin: [excludeId, Number(excludeId)] }
                     : { $ne: excludeId };
             }
-            // Ad chết cũ (last_seen > 30 ngày) không hiện trong list page
+            // Ad chết cũ (last_seen > 45 ngày) không hiện trong list page
             // nữa (ảnh hết hạn, vô giá trị) — cả count lẫn list dùng chung
             // query này nên total khớp số creative tươi thật.
             Object.assign(query, buildFreshAdCondition());
