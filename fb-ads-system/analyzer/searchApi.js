@@ -821,9 +821,9 @@ function presetUsesFlag(presetName, q) {
 
 // Ẩn ad giải trí/phim khỏi kết quả (mặc định BẬT; tắt bằng
 // ?hide_entertainment=0, hoặc tự tắt khi user chọn ngành Giải trí &
-// Game). Chỉ loại theo creative_rank=2 (creative_kind=entertainment —
-// bắt cả ad truyện/phim bị gán nhầm ngành khác, vd truyện ngôn tình
-// gán beauty_health) mà KHÔNG loại theo industry: ad sản phẩm bị gán
+// Game). Chỉ loại theo creative_rank=2 (creative_kind=entertainment/credit —
+// bắt cả ad truyện/phim/tín dụng bị gán nhầm ngành khác, vd truyện ngôn tình
+// gán beauty_health, ad vay gán fashion) mà KHÔNG loại theo industry: ad sản phẩm bị gán
 // nhầm industry=entertainment (vd TV 'Full HD', 'phim cách nhiệt'
 // nếu không có veto) vẫn ở lại vì rank của nó là 0/1. $ne khớp cả
 // doc thiếu field nên doc cũ không bị loại oan — NHƯNG 16/11 chứng minh
@@ -2150,8 +2150,8 @@ const NON_PRODUCT_PATTERNS = [
 const NON_PRODUCT_INDUSTRIES = new Set(['entertainment', 'gambling', 'real_estate']);
 function isNonProductAd(ad) {
   if (!ad || typeof ad !== 'object') return false;
-  // Cờ bạc / spam (17/11): không bao giờ thành winning product.
-  if (ad.creative_kind === 'gambling' || ad.creative_kind === 'spam') return true;
+  // Cờ bạc / spam (17/11) + tín dụng (18/11): không bao giờ thành winning product.
+  if (ad.creative_kind === 'gambling' || ad.creative_kind === 'spam' || ad.creative_kind === 'credit') return true;
   if (ad.industry && NON_PRODUCT_INDUSTRIES.has(String(ad.industry).toLowerCase())) return true;
   const hay = [ad.headline, ad.text, ad.description].filter(Boolean).join(' ').toLowerCase();
   if (!hay) return false;
