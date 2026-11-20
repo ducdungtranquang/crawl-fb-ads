@@ -821,9 +821,9 @@ function presetUsesFlag(presetName, q) {
 
 // Ẩn ad giải trí/phim khỏi kết quả (mặc định BẬT; tắt bằng
 // ?hide_entertainment=0, hoặc tự tắt khi user chọn ngành Giải trí &
-// Game). Chỉ loại theo creative_rank=2 (creative_kind=entertainment —
-// bắt cả ad truyện/phim bị gán nhầm ngành khác, vd truyện ngôn tình
-// gán beauty_health) mà KHÔNG loại theo industry: ad sản phẩm bị gán
+// Game). Chỉ loại theo creative_rank=2 (creative_kind=entertainment/credit —
+// bắt cả ad truyện/phim/tín dụng bị gán nhầm ngành khác, vd truyện ngôn tình
+// gán beauty_health, ad vay gán fashion) mà KHÔNG loại theo industry: ad sản phẩm bị gán
 // nhầm industry=entertainment (vd TV 'Full HD', 'phim cách nhiệt'
 // nếu không có veto) vẫn ở lại vì rank của nó là 0/1. $ne khớp cả
 // doc thiếu field nên doc cũ không bị loại oan — NHƯNG 16/11 chứng minh
@@ -1464,6 +1464,7 @@ function initSearchServer(dbInstance) {
                 is_active,     // Lọc theo trạng thái quảng cáo (true/false)
                 filter,        // Preset kiểu Minea: new_ads | ready_to_scale | weekly_winner
                 industry,      // Lọc theo ngành nghề: beauty_health,fashion,... (xem INDUSTRIES)
+                win_tier,      // Lọc theo tầng win GĐ1: win_manh | win_ben | ung_vien
             } = q;
 
             const page = Math.max(parseInt(q.page, 10) || 1, 1);
@@ -1642,6 +1643,13 @@ function initSearchServer(dbInstance) {
                 const scalingCond = buildScalingCondition(scaling_level);
                 if (scalingCond) andConds.push(scalingCond);
             }
+            // Tầng win GĐ1 (19/11): lọc theo win_tier đã tính sẵn ở analyzer.
+            // Giá trị lạ -> bỏ qua, không lọc. Tầng win đều là ad product
+            // (rank 0) nên không xung đột với điều kiện ẩn phim/giải trí.
+            if (win_tier) {
+                const t = String(win_tier).toLowerCase().trim();
+                if (t === 'win_manh' || t === 'win_ben' || t === 'ung_vien') andConds.push({ win_tier: t });
+            }
             // Sort theo rank chỉ có nghĩa khi doc đã có creative_rank
             // (probe rank=false -> bỏ rank, không thêm điều kiện $exists
             // làm preset trả rỗng như bản cũ khi analyzer chưa chạy lại).
@@ -1682,6 +1690,7 @@ function initSearchServer(dbInstance) {
                     estimated_spend_usd: 1, estimated_spend_min_usd: 1, estimated_spend_max_usd: 1,
                     estimated_spend: 1, estimated_spend_source: 1, estimated_spend_capped: 1, country_inferred: 1, estimated_reach: 1, estimated_reach_min: 1, estimated_reach_max: 1,
                     duplicates_count: 1, duration_days: 1, cpm_used: 1, spend_diversify: 1, spend_lang_mult: 1, ad_language: 1, filter_signals: 1, industry: 1, creative_kind: 1, creative_rank: 1, thumbnail_r2: 1, duplicate_group_key: 1, duplicate_group_size: 1, is_group_rep: 1, preset_priority: 1,
+                    win_tier: 1, win_reasons: 1, win_reason_text: 1, win_needs_verify: 1, page_density: 1, creative_pages: 1,
                     scaling_level: 1, funnel: 1, analyzed_at: 1,
                     thumbnail_local: 1, is_active: 1, images: { $slice: 1 }, videos: { $slice: 1 }
                 })
@@ -2150,8 +2159,8 @@ const NON_PRODUCT_PATTERNS = [
 const NON_PRODUCT_INDUSTRIES = new Set(['entertainment', 'gambling', 'real_estate']);
 function isNonProductAd(ad) {
   if (!ad || typeof ad !== 'object') return false;
-  // Cờ bạc / spam (17/11): không bao giờ thành winning product.
-  if (ad.creative_kind === 'gambling' || ad.creative_kind === 'spam') return true;
+  // Cờ bạc / spam (17/11) + tín dụng (18/11): không bao giờ thành winning product.
+  if (ad.creative_kind === 'gambling' || ad.creative_kind === 'spam' || ad.creative_kind === 'credit') return true;
   if (ad.industry && NON_PRODUCT_INDUSTRIES.has(String(ad.industry).toLowerCase())) return true;
   const hay = [ad.headline, ad.text, ad.description].filter(Boolean).join(' ').toLowerCase();
   if (!hay) return false;
