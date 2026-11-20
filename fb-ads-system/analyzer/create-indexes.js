@@ -172,6 +172,10 @@ const INDEXES = [
   { key: { 'filter_signals.is_weekly_winner': 1, creative_rank: 1, trending_score: -1 }, name: 'idx_winner_rank' },
   { key: { 'filter_signals.is_weekly_winner': 1, creative_rank: 1, start_date: -1 }, name: 'idx_winner_rank_start' },
   { key: { 'filter_signals.is_weekly_winner': 1, creative_rank: 1, score: -1 }, name: 'idx_winner_rank_score' },
+  // Win tier GĐ1 (19/11): lọc ?win_tier=... — equality (tier, rep) -> sort -> range.
+  // Ngân sách index: 62/64 trước đổi này (union 61 + _id); thêm 1 này thành 63/64 (còn 1 slot).
+  // Đồng bộ ensureIndexes trong analyzer.js (cùng tên, cùng key).
+  { key: { win_tier: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_win_tier_rep_start' },
   // Lọc page_name/domain KHÔNG phân biệt hoa thường: range trên *_lower.
   { key: { page_name_lower: 1, start_date: -1 }, name: 'idx_page_lower_start_date' },
   { key: { page_name_lower: 1, score: -1 }, name: 'idx_page_lower_score' },
