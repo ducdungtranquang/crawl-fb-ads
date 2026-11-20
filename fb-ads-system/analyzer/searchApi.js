@@ -306,11 +306,34 @@ const SORT_FIELD_ALIASES = {
     'luot tiep can uoc tinh': 'estimated_reach',
     last_seen: 'last_seen', seen_count: 'seen_count', 'luot quet thay': 'last_seen',
     analyzed_at: 'analyzed_at', first_seen: 'first_seen',
+    relevance: 'relevance', 'lien quan nhat': 'relevance',
 };
 function normalizeSortField(sortBy) {
     const key = normKey(sortBy);
     if (ALLOWED_SORT_FIELDS.has(String(sortBy))) return String(sortBy);
     return SORT_FIELD_ALIASES[key] || null;
+}
+
+// Clamp limit phân trang: parseInt||fallback (0/NaN -> fallback), chặn
+// dưới 1, chặn trên max. Dùng cho /api/products/search (trước đây không
+// chặn: ?limit=100000) và /api/pages/:page_name/ads (trước đây không chặn
+// dưới: limit=-5 -> Mongo limit(-5)).
+function normalizePageLimit(value, fallback, max) {
+    const n = parseInt(value, 10);
+    const base = Number.isFinite(n) && n !== 0 ? n : fallback;
+    return Math.min(Math.max(base, 1), max);
+}
+
+// Sort cho /api/products/search: chỉ field có thật trên doc products,
+// lạ -> 'product_score'. 'score' map về 'product_score' cho tiện.
+const PRODUCT_SORT_FIELD_BY_KEY = {
+    'product score': 'product_score', productscore: 'product_score', score: 'product_score',
+    'winning ads': 'winning_ads', winningads: 'winning_ads',
+    'total ads': 'total_ads', totalads: 'total_ads',
+    title: 'title', domain: 'domain', category: 'category',
+};
+function normalizeProductSortField(sortBy) {
+    return PRODUCT_SORT_FIELD_BY_KEY[normKey(sortBy)] || 'product_score';
 }
 function normalizeSortOrder(sortOrder) {
     if (sortOrder === undefined || sortOrder === null || sortOrder === '') return -1;
@@ -725,34 +748,64 @@ function textSearchLimit(page, limit, multiplier) {
 // Query text search cho ES. strict=true: match_phrase (cụm đúng thứ tự) +
 // match operator AND (đủ mọi token) — loại kết quả trúng 1 token lẻ
 // ("Đà Nẵng", "Đa năng" khi tìm "Thực phẩm chức năng").
-// strict=false: OR như cũ, chỉ dùng fallback khi strict trả về 0 hit.
+// strict=false (fallback khi strict 0 hit): token-AND — mỗi token phải khớp
+// ở ít nhất 1 field, và phải đủ tối thiểu max(2, ceil(2/3 số token)) token
+// (1 token thì giữ OR như cũ). Test 20/11: OR cũ (minimum_should_match 1)
+// trả "tài xỉu" -> "Cute xỉu", "đồng hồ nam" -> VinFast/du học — vì chỉ cần
+// trúng 1 token lẻ. Token-AND vẫn cho phép token nằm khác field nhau
+// (vd "tài" trong page_name, "xỉu" trong text) nên lỏng hơn match AND
+// trong 1 field nhưng chặt hơn OR. 0 hit thì handler rơi tiếp sang regex
+// Mongo khớp đúng cụm.
 function buildTextSearchQuery(keyword, strict, dedupeEs) {
     const kw = String(keyword).trim();
     const kwAscii = stripViDiacritics(kw);
     const variants = kwAscii !== kw ? [kw, kwAscii] : [kw];
-    const should = [];
-    for (const v of variants) {
-        if (strict) {
+    // Lọc đại diện nhóm ngay trong ES (chỉ khi probe mapping ES đã có field
+    // này): total + thứ hạng + phân trang giữ chính xác.
+    const filter = dedupeEs ? [{ term: { is_group_rep: true } }] : null;
+    const wrap = (should, minimum_should_match) => filter
+        ? { bool: { filter, should, minimum_should_match } }
+        : { bool: { should, minimum_should_match } };
+    if (strict) {
+        const should = [];
+        for (const v of variants) {
             should.push(
                 { match_phrase: { full_text_search: { query: v, boost: 10 } } },
                 { match: { full_text_search: { query: v, operator: 'and', boost: 5 } } },
                 { match: { text: { query: v, operator: 'and', boost: 3 } } },
                 { match: { page_name: { query: v, operator: 'and', boost: 2 } } },
             );
-        } else {
+        }
+        return wrap(should, 1);
+    }
+    // Non-strict: tách keyword thành token, mỗi token 1 nhóm should
+    // (khớp ở field nào cũng được, kể cả biến thể không dấu).
+    const tokens = [...new Set(kw.split(/\s+/).filter(Boolean))];
+    if (tokens.length <= 1) {
+        const should = [];
+        for (const v of variants) {
             should.push(
                 { match: { full_text_search: { query: v, boost: 5 } } },
                 { match: { text: { query: v, boost: 3 } } },
                 { match: { page_name: { query: v, boost: 2 } } },
             );
         }
+        return wrap(should, 1);
     }
-    if (dedupeEs) {
-        // Lọc đại diện nhóm ngay trong ES: total + thứ hạng + phân trang
-        // giữ chính xác. Chỉ bật khi probe mapping ES đã có field này.
-        return { bool: { filter: [{ term: { is_group_rep: true } }], should, minimum_should_match: 1 } };
-    }
-    return { bool: { should, minimum_should_match: 1 } };
+    const required = Math.max(2, Math.ceil(tokens.length * 2 / 3));
+    const groups = tokens.map((tok) => {
+        const vs = [...new Set([tok, stripViDiacritics(tok)])];
+        const should = [];
+        for (const v of vs) {
+            should.push(
+                { match: { full_text_search: { query: v, boost: 5 } } },
+                { match: { text: { query: v, boost: 3 } } },
+                { match: { page_name: { query: v, boost: 2 } } },
+            );
+        }
+        return { bool: { should, minimum_should_match: 1 } };
+    });
+    return wrap(groups, required);
 }
 
 // Dedupe list: mặc định BẬT — list chỉ hiện 1 ad gốc mỗi nhóm duplicate
@@ -872,6 +925,9 @@ function resolveSearchSort(presets, q, opts) {
     const hasPresetPriority = opts && opts.hasPresetPriority === true;
     const presetSort = resolvePresetSort(presets, q.sort_by !== undefined);
     const normalizedField = q.sort_by !== undefined ? normalizeSortField(q.sort_by) : null;
+    // sort_by=relevance: Mongo vẫn sort theo score (ổn định), thứ hạng ES
+    // được áp lại ở handler bằng esRank (xem sortInfo.relevance).
+    const relevanceRequested = normalizedField === 'relevance';
     const requestedSort = presetSort ? presetSort.field : (normalizedField || 'score');
     const requestedOrder = presetSort ? presetSort.order : normalizeSortOrder(q.sort_order);
     const safeSortField = ALLOWED_SORT_FIELDS.has(String(requestedSort)) ? String(requestedSort) : 'score';
@@ -884,9 +940,9 @@ function resolveSearchSort(presets, q, opts) {
         if (hasPresetPriority) sortOptions.preset_priority = 1;
         if (hasCreativeRank) sortOptions.creative_rank = 1;
         sortOptions[safeSortField] = requestedOrder;
-        return { sortOptions, rankFirst: true };
+        return { sortOptions, rankFirst: true, relevance: relevanceRequested };
     }
-    return { sortOptions: { [safeSortField]: requestedOrder }, rankFirst: false };
+    return { sortOptions: { [safeSortField]: requestedOrder }, rankFirst: false, relevance: relevanceRequested };
 }
 
 // Query ĐẾM: bỏ điều kiện $exists trên field rank (preset_priority /
@@ -928,6 +984,13 @@ function stripCountExistsConditions(query, sortOptions) {
 
 // Đếm tổng cho /api/ads/search: giới hạn 30s như cũ.
 const COUNT_MAX_TIME_MS = 30000;
+// List search: chặn find() tối đa 20s (FE timeout 25s) — từ vô nghĩa rơi sang
+// regex Mongo COLLSCAN từng kẹt >30s (test 20/11: xyzabc123). Hết giờ thì
+// handler trả 500 có giới hạn thay vì treo vô hạn.
+const SEARCH_FIND_MAX_TIME_MS = 20000;
+// Đếm + list của /api/products/search: chặn 15s (collection products nhỏ hơn
+// analyzed_ads nhiều, 15s là đủ; hết giờ thì trả 500 thay vì treo).
+const PRODUCTS_SEARCH_MAX_TIME_MS = 15000;
 // Index phục vụ đếm khi lọc đúng 1 nước (xem isCountryAloneCount).
 const COUNTRY_ALONE_COUNT_INDEX = 'idx_countries_rep_start';
 
@@ -1694,11 +1757,12 @@ function initSearchServer(dbInstance) {
                     scaling_level: 1, funnel: 1, analyzed_at: 1,
                     thumbnail_local: 1, is_active: 1, images: { $slice: 1 }, videos: { $slice: 1 }
                 })
-                .sort(sortOptions).skip(skip).limit(limit).toArray();
+                .sort(sortOptions).skip(skip).limit(limit).maxTimeMS(SEARCH_FIND_MAX_TIME_MS).toArray();
 
-            // Khi search text mà user không chọn sort_by: giữ thứ hạng relevance
+            // Khi search text mà user không chọn sort_by, hoặc chọn
+            // sort_by=relevance ("Liên quan nhất"): giữ thứ hạng relevance
             // của ES thay vì để analyzer score quyết định thứ tự.
-            if (esRank && q.sort_by === undefined) {
+            if (esRank && (q.sort_by === undefined || sortInfo.relevance)) {
                 const priorityFirst = sortInfo.rankFirst && 'preset_priority' in sortInfo.sortOptions;
                 if (sortInfo.rankFirst) {
                     results.sort((a, b) => (priorityFirst ? (a.preset_priority ?? 1) - (b.preset_priority ?? 1) : 0) || ((a.creative_rank ?? 1) - (b.creative_rank ?? 1)) || ((esRank.get(String(a.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER) - (esRank.get(String(b.ad_archive_id)) ?? Number.MAX_SAFE_INTEGER)));
@@ -1941,7 +2005,7 @@ function initSearchServer(dbInstance) {
     app.get('/api/pages/:page_name/ads', async (req, res) => {
         try {
             const pageName = req.params.page_name;
-            const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+            const limit = normalizePageLimit(req.query.limit, 20, 100);
             const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
             const skip = (page - 1) * limit;
             // Dedupe mặc định BẬT (như search): 1 creative chỉ hiện 1 lần
@@ -1998,14 +2062,20 @@ function initSearchServer(dbInstance) {
             const { sort_by = 'product_score', sort_order = -1 } = req.query;
             const query = buildProductsSearchQuery(req.query);
 
-            const page = parseInt(req.query.page, 10) || 1;
-            const limit = parseInt(req.query.limit, 10) || 50;
+            // Vá 20/11: limit trước đây không chặn trên (?limit=100000 trả
+            // 100k product 1 lúc), page không chặn dưới (page<=0 -> skip âm
+            // -> 500), sort_by là tên field do user nhập thẳng vào .sort()
+            // (sort field chưa index + limit lớn = sort nặng trong RAM).
+            const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+            const limit = normalizePageLimit(req.query.limit, 50, 100);
             const skip = (page - 1) * limit;
+            const sortField = normalizeProductSortField(sort_by);
+            const sortDir = parseInt(sort_order, 10) === 1 ? 1 : -1;
 
-            const total = await productsCol.countDocuments(query);
+            const total = await productsCol.countDocuments(query, { maxTimeMS: PRODUCTS_SEARCH_MAX_TIME_MS });
             const results = await productsCol.find(query)
-                .sort({ [sort_by]: parseInt(sort_order, 10) })
-                .skip(skip).limit(limit).toArray();
+                .sort({ [sortField]: sortDir })
+                .skip(skip).limit(limit).maxTimeMS(PRODUCTS_SEARCH_MAX_TIME_MS).toArray();
 
             return res.json({ success: true, pagination: { total, page, limit, pages: Math.ceil(total / limit) }, data: results });
         } catch (error) {
@@ -2262,7 +2332,7 @@ function buildMonthlyWinnersPipeline(month, filters = {}) {
     ];
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, hideEntertainmentEnabled, buildHideEntertainmentCondition, buildHideGamblingCondition, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, isNonProductAd, nonProductTitleRegex, NON_PRODUCT_PATTERNS, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS, isCountryAloneCount, resolveCountOptions, countSearchTotal, COUNTRY_ALONE_COUNT_INDEX, COUNT_MAX_TIME_MS };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, hideEntertainmentEnabled, buildHideEntertainmentCondition, buildHideGamblingCondition, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, isNonProductAd, nonProductTitleRegex, NON_PRODUCT_PATTERNS, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS, isCountryAloneCount, resolveCountOptions, countSearchTotal, COUNTRY_ALONE_COUNT_INDEX, COUNT_MAX_TIME_MS, SEARCH_FIND_MAX_TIME_MS, PRODUCTS_SEARCH_MAX_TIME_MS, normalizePageLimit, normalizeProductSortField };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
