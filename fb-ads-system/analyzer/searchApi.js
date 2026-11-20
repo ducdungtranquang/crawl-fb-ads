@@ -930,6 +930,8 @@ function stripCountExistsConditions(query, sortOptions) {
 const COUNT_MAX_TIME_MS = 30000;
 // Index phục vụ đếm khi lọc đúng 1 nước (xem isCountryAloneCount).
 const COUNTRY_ALONE_COUNT_INDEX = 'idx_countries_rep_start';
+// Index phục vụ đếm khi lọc đúng 1 ngành (xem isIndustryAloneCount).
+const INDUSTRY_ALONE_COUNT_INDEX = 'idx_industry_rep_start';
 
 function isNonEmptyParam(v) {
     if (v === undefined || v === null) return false;
@@ -1008,11 +1010,76 @@ function isCountryAloneCount(q, countQuery) {
     return true;
 }
 
+// Đếm ngành một mình (20/11): cùng shape lỗi như đếm VN 18/11 — câu đếm lọc
+// 1 ngành là $and {industry, is_group_rep, last_seen tươi, creative_rank $in}
+// nhưng idx_industry_rep_start cũ không có creative_rank nên planner phải
+// FETCH từng doc để lọc rank (Làm đẹp 36.516 ad tải 15-30s, Thời trang 24.885
+// ad tải 10-25s ngày 20/11; hôm 19/11 Thời trang còn <5s — tập ad tươi nở
+// thêm sau #51 + bot quét căng 100k+ ad nên chi phí FETCH vượt ngưỡng).
+// Sau khi redefine index (creative_rank thứ 3) thì hint ép planner dùng đúng
+// index đó cho COUNT. Scope hẹp như VN: chỉ hint khi lọc ĐÚNG 1 ngành và
+// không kèm filter nào khác (combo ngành+nước có idx_country_industry_rep_start
+// riêng, preset có index riêng, planner đang chọn đúng cho chúng).
+// Kiểm tra 2 lớp như isCountryAloneCount: (1) param q, (2) cấu trúc countQuery.
+function isIndustryAloneCount(q, countQuery) {
+    if (!q || typeof q !== 'object') return false;
+    if (!countQuery || typeof countQuery !== 'object' || Array.isArray(countQuery)) return false;
+    // (1a) Đúng 1 giá trị ngành.
+    const values = normalizeIndustryValues(q.industry);
+    if (values.length !== 1) return false;
+    // (1b) Không filter nào khác có hiệu lực.
+    if (isNonEmptyParam(q.text)) return false;
+    if (isNonEmptyParam(q.date_from) || isNonEmptyParam(q.date_to)) return false;
+    if (isNonEmptyParam(q.level)) return false;
+    if (normalizeSpendTiers(q.estimated_spend).length) return false;
+    if (isFiniteNumberParam(q.min_spend_usd) || isFiniteNumberParam(q.max_spend_usd)) return false;
+    if (isFiniteNumberParam(q.min_score) || isFiniteNumberParam(q.max_score)) return false;
+    if (isFiniteNumberParam(q.min_trending_score)) return false;
+    if (normalizeFunnelValues(q.funnel).length) return false;
+    if (isNonEmptyParam(q.scaling_level)) return false;
+    if (isNonEmptyParam(q.page_name)) return false;
+    if (isNonEmptyParam(q.domain)) return false;
+    if (q.is_active !== undefined) return false;
+    if (normalizePresetNames(q.filter).length) return false;
+    if (normalizeCountryCodes(q.country).length) return false;
+    // (2a) countQuery phải có industry dạng object ($in các giá trị).
+    const ind = countQuery.industry;
+    if (!ind || typeof ind !== 'object' || Array.isArray(ind)) return false;
+    // (2b) Top-level chỉ được có industry và $and.
+    for (const k of Object.keys(countQuery)) {
+        if (k !== 'industry' && k !== '$and') return false;
+    }
+    // (2c) Mọi nhánh $and phải là điều kiện mặc định của search list:
+    // is_group_rep, last_seen tươi, hoặc creative_rank $in (ẩn phim/cờ bạc).
+    const ands = countQuery.$and;
+    if (!Array.isArray(ands) || !ands.length) return false;
+    for (const c of ands) {
+        if (!c || typeof c !== 'object' || Array.isArray(c)) return false;
+        const keys = Object.keys(c);
+        if (keys.length !== 1) return false;
+        if (keys[0] === 'is_group_rep') { if (c.is_group_rep !== true) return false; continue; }
+        if (keys[0] === 'last_seen') {
+            const v = c.last_seen;
+            if (!v || typeof v !== 'object' || !Number.isFinite(v.$gte)) return false;
+            continue;
+        }
+        if (keys[0] === 'creative_rank') {
+            const v = c.creative_rank;
+            if (!v || typeof v !== 'object' || !Array.isArray(v.$in) || !v.$in.length) return false;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 // Options cho countDocuments của /api/ads/search: luôn maxTimeMS 30s;
-// thêm hint idx_countries_rep_start chỉ khi đếm VN một mình.
+// thêm hint idx_countries_rep_start chỉ khi đếm VN một mình,
+// hint idx_industry_rep_start chỉ khi đếm ngành một mình.
 function resolveCountOptions(countQuery, q) {
     const opts = { maxTimeMS: COUNT_MAX_TIME_MS };
-    if (isCountryAloneCount(q, countQuery)) opts.hint = COUNTRY_ALONE_COUNT_INDEX;
+    if (isIndustryAloneCount(q, countQuery)) opts.hint = INDUSTRY_ALONE_COUNT_INDEX;
+    else if (isCountryAloneCount(q, countQuery)) opts.hint = COUNTRY_ALONE_COUNT_INDEX;
     return opts;
 }
 
@@ -2262,7 +2329,7 @@ function buildMonthlyWinnersPipeline(month, filters = {}) {
     ];
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, hideEntertainmentEnabled, buildHideEntertainmentCondition, buildHideGamblingCondition, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, isNonProductAd, nonProductTitleRegex, NON_PRODUCT_PATTERNS, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS, isCountryAloneCount, resolveCountOptions, countSearchTotal, COUNTRY_ALONE_COUNT_INDEX, COUNT_MAX_TIME_MS };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, hideEntertainmentEnabled, buildHideEntertainmentCondition, buildHideGamblingCondition, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, isNonProductAd, nonProductTitleRegex, NON_PRODUCT_PATTERNS, buildProductsSearchQuery, monthRange, parseMonthParam, buildMonthlyWinnersPipeline, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS, isCountryAloneCount, isIndustryAloneCount, resolveCountOptions, countSearchTotal, COUNTRY_ALONE_COUNT_INDEX, INDUSTRY_ALONE_COUNT_INDEX, COUNT_MAX_TIME_MS };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
