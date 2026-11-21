@@ -972,29 +972,8 @@ function countIntoMaps(maps, ad) {
     const k = hashTextKey(canonicalGroupText(text));
     if (maps.textMap[k] === undefined) maps.textKeys = (maps.textKeys || 0) + 1;
     maps.textMap[k] = (maps.textMap[k] || 0) + 1; // text rỗng không đếm (tránh phình D)
-    // Lan truyền creative (5.4): đếm số Page ĐỘC LẬP cùng creative — KHÁC
-    // groupMap (groupMap gom theo page + text nên 1 nhóm chỉ có 1 Page).
-    // Lưu first + extra Set (chỉ tạo Set khi có Page thứ 2) để đỡ RAM:
-    // đa số creative chỉ chạy trên 1 Page.
-    const ce = maps.creativePagesMap[k] || (maps.creativePagesMap[k] = { first: pageName, extra: null });
-    if (pageName !== ce.first) {
-      if (!ce.extra) ce.extra = new Set([pageName]);
-      else ce.extra.add(pageName);
-    }
   }
   if (domain) maps.domainMap[domain] = (maps.domainMap[domain] || 0) + 1;
-  // Win tier (19/11): mật độ ads cùng sản phẩm trên 1 Page (5.3) + tuổi
-  // và số lượng của sản phẩm (Ứng viên mới). productKeyFor = URL landing
-  // đã chuẩn hóa (cùng khóa với bảng winning products).
-  const pKey = productKeyFor(ad, domain);
-  if (pKey) {
-    const ppKey = pageName + '\0' + pKey;
-    maps.pageProductMap[ppKey] = (maps.pageProductMap[ppKey] || 0) + 1;
-    const pe = maps.productMap[pKey] || (maps.productMap[pKey] = { count: 0, firstSeenMs: Number.MAX_SAFE_INTEGER });
-    pe.count += 1;
-    const firstMs = (ad.first_seen || (ad.start_date ? ad.start_date * 1000 : 0)) || 0;
-    if (firstMs > 0 && firstMs < pe.firstSeenMs) pe.firstSeenMs = firstMs;
-  }
   // Đếm độ đông của keyword: mỗi keyword trong keyword_mentions (crawler
   // ghi lại từ khóa nào tìm thấy ad) đếm +1 — dùng cho hệ số đa dạng hóa
   // spend/reach (keyword càng đông ad thì ad càng nhích nhẹ).
@@ -1009,7 +988,7 @@ function countIntoMaps(maps, ad) {
 }
 
 function emptyMaps() {
-  return { pageMap: {}, textMap: {}, domainMap: {}, keywordMap: {}, textKeys: 0, groupMap: {}, pageProductMap: {}, creativePagesMap: {}, productMap: {} };
+  return { pageMap: {}, textMap: {}, domainMap: {}, keywordMap: {}, textKeys: 0, groupMap: {} };
 }
 
 // ===== NGƯỠNG PRESET (MINEA-STYLE) — phải khớp FILTER_DEFAULTS trong searchApi.js =====
@@ -1029,78 +1008,6 @@ const PRESET_THRESHOLDS = {
   winner_max_days: 14, // 0 = không giới hạn trên; 14 = nới từ 9 (cửa sổ 7-14 ngày, khớp FILTER_DEFAULTS searchApi.js); FE hiện vẫn ép 9 nên cần đổi FE để có hiệu lực trên web
 };
 
-// ===== WINNING PRODUCT TIERS GĐ1 — ĐẶC TẢ 18/11/2026 (§4–6, §10) =====
-// Nguyên tắc: nhận diện đúng "đây là hàng vật lý" TRƯỚC (Tầng A), chấm
-// tín hiệu win SAU (Tầng B). Ngưỡng là ĐIỂM KHỞI ĐIỂM (§9), hiệu chỉnh
-// sau khi kiểm chứng trên ~20 sản phẩm biết kết quả thực tế.
-// Tầng A (passedLayerA): creative_kind === 'product' (CTA mua / funnel
-// ECOM / token giá — proxy cho 4.2 vì chưa tải trang đích ở FULL, xem
-// ghi chú ở analyzeAllAdsGlobally) VÀ không khớp blocklist dịch vụ.
-// Nhãn ngành CHỈ là tín hiệu phụ (§4.3), không bao giờ quyết định một
-// mình — ad kem chống nắng nhãn Electronics vẫn qua Tầng A nếu có tín
-// hiệu mua (test §8.5).
-// Tuổi chạy dùng durationDays (ngày hiện tại − ngày bắt đầu, §5.1) —
-// KHÔNG dùng runDaysRounded (last_seen − start): ad Active nhưng lần quét
-// cuối cách 4 ngày vẫn được tính đủ tuổi (test §8.2: 30 ngày + last scan
-// 4 ngày → Win bền; dùng runDays chỉ còn 26 ngày → rớt oan). Độ tươi
-// (last scan) đã có cổng C3 + cờ kiểm chứng riêng để xử lý ad "ma"
-// (§8.3), nên tuổi không cần trừ thêm.
-const WIN_TIER_THRESHOLDS = {
-  manh_min_age_days: 21,       // Win mạnh: tuổi ≥ 21 ngày
-  manh_min_copies: 3,          // bản sao > 3 (HOẶC mật độ Page ≥ 5)
-  manh_min_page_density: 5,
-  manh_max_scan_days: 3,       // Win mạnh: last scan ≤ 3 ngày
-  ben_min_age_days: 30,        // Win bền: tuổi ≥ 30 ngày
-  ben_max_scan_days: 5,        // Win bền: last scan ≤ 5 ngày, không yêu cầu bản sao
-  ung_min_age_days: 7,         // Ứng viên: tuổi 7–14 ngày
-  ung_max_age_days: 14,
-  ung_min_copies: 2,           // (bản sao ≥ 2 HOẶC ≥ 2 Page cùng creative)
-  ung_min_creative_pages: 2,
-  new_max_product_age_days: 2, // Ứng viên mới: sản phẩm ≤ 2 ngày tuổi
-  new_min_product_ads: 4,      // và đã có ≥ 4 ads
-  fresh_max_scan_days: 3,      // C3: ≤ 3 ngày = tin cậy đầy đủ
-  verify_max_scan_days: 7,     // C3: 4–7 ngày = xếp tầng được + cờ kiểm chứng; > 7 ngày = không xếp tầng
-};
-const WIN_TIER_LABELS = { win_manh: 'Win mạnh', win_ben: 'Win bền', ung_vien: 'Ứng viên' };
-// Mẫu câu hiển thị (§10): FE nối các lý do bằng ' · '. FRESH_STALE là cờ
-// kiểm chứng (không phải lý do win) nhưng vẫn nằm trong danh sách lý do
-// để FE hiển thị cùng lúc (§7).
-const WIN_REASON_TEMPLATES = {
-  AGE_RUN: (p) => `Chạy liên tục ${p.days} ngày`,
-  COPIES: (p) => `${p.n} bản sao`,
-  PAGE_DENSITY: (p) => `Page đang chạy ${p.n} ads cho sản phẩm này`,
-  CREATIVE_SPREAD: (p) => `${p.n} Page cùng chạy creative này`,
-  FRESH_STALE: (p) => `Dữ liệu quét cách đây ${p.days} ngày — nên kiểm chứng trên Meta Ad Library`,
-};
-// s: {isActive, passedLayerA, ageDays, copies, pageDensity, creativePages,
-// lastScanAgeDays, productAgeDays, productAdCount}
-// Trả {tier: 'win_manh'|'win_ben'|'ung_vien'|null, reasons: [{code, ...}],
-// needsVerify: bool, reasonText: string}. Thứ tự ưu tiên: Win mạnh >
-// Win bền > Ứng viên. Ad không qua cổng cứng (không Active / rớt Tầng A /
-// last scan > 7 ngày) thì tier null và reasons rỗng (chỉ hiển thị dạng
-// dữ liệu tham khảo, không vào danh sách win).
-function computeWinTier(s) {
-  const T = WIN_TIER_THRESHOLDS;
-  const age = s.ageDays, copies = s.copies, pd = s.pageDensity, cp = s.creativePages, scan = s.lastScanAgeDays;
-  const needsVerify = scan > T.fresh_max_scan_days && scan <= T.verify_max_scan_days;
-  const reasons = [];
-  if (age >= 14) reasons.push({ code: 'AGE_RUN', days: Math.round(age) });
-  if (copies > T.manh_min_copies) reasons.push({ code: 'COPIES', n: copies });
-  if (pd >= 3) reasons.push({ code: 'PAGE_DENSITY', n: pd });
-  if (cp >= T.ung_min_creative_pages) reasons.push({ code: 'CREATIVE_SPREAD', n: cp });
-  if (needsVerify) reasons.push({ code: 'FRESH_STALE', days: Math.round(scan) });
-  let tier = null;
-  if (s.isActive && s.passedLayerA && scan <= T.verify_max_scan_days) {
-    if (scan <= T.manh_max_scan_days && age >= T.manh_min_age_days && (copies > T.manh_min_copies || pd >= T.manh_min_page_density)) tier = 'win_manh';
-    else if (age >= T.ben_min_age_days && scan <= T.ben_max_scan_days) tier = 'win_ben';
-    else if ((age >= T.ung_min_age_days && age <= T.ung_max_age_days && (copies >= T.ung_min_copies || cp >= T.ung_min_creative_pages))
-      || (s.productAgeDays <= T.new_max_product_age_days && s.productAdCount >= T.new_min_product_ads)) tier = 'ung_vien';
-  }
-  if (!tier) return { tier: null, reasons: [], needsVerify, reasonText: '' };
-  const reasonText = reasons.map((r) => WIN_REASON_TEMPLATES[r.code](r)).join(' · ');
-  return { tier, reasons, needsVerify, reasonText };
-}
-
 // ===== CORE ANALYZE PROCESS =====
 function analyzeAllAdsGlobally(ads, globalMaps) {
   const now = Date.now();
@@ -1112,9 +1019,6 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
   }
   const { pageMap, textMap, domainMap, keywordMap = {} } = maps;
   const groupMap = maps.groupMap || {};
-  const pageProductMap = maps.pageProductMap || {};
-  const creativePagesMap = maps.creativePagesMap || {};
-  const productMap = maps.productMap || {};
 
   return ads.map(ad => {
     const text = ad.normalized_text || normalize(ad.text || '');
@@ -1238,30 +1142,7 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
 
     const funnelValue = detectFunnel(ad);
     const creativeKind = classifyCreativeKind(ad, funnelValue);
-    // Win tier (19/11, đặc tả GĐ1 §4–6): Tầng A = ad bán hàng vật lý
-    // (creative_kind product) VÀ không khớp blocklist dịch vụ; Tầng B chấm
-    // tuổi chạy/bản sao/mật độ Page/lan truyền creative/độ tươi.
-    // 4.2 (tải trang đích kiểm tra giá + form đặt hàng) CHƯA làm ở FULL
-    // (quá nặng cho toàn kho — đặc tả cho phép dời sang tập ứng viên);
-    // proxy hiện tại là creative_kind product (CTA mua/funnel ECOM/token
-    // giá) + product_key từ link landing.
-    const serviceSign = hasServiceSign(ad);
-    const passedLayerA = creativeKind === 'product' && !serviceSign;
-    const productKey = productKeyFor(ad, domain);
-    const pageDensity = pageProductMap[(ad.page_name || 'unknown') + '\0' + productKey] || 1;
-    const textKeyForSpread = text && !isGenericCreativeText(text) ? hashTextKey(canonicalGroupText(text)) : null;
-    const spreadEntry = textKeyForSpread ? creativePagesMap[textKeyForSpread] : null;
-    const creativePages = spreadEntry ? 1 + (spreadEntry.extra ? spreadEntry.extra.size : 0) : 1;
-    const productEntry = productKey ? productMap[productKey] : null;
-    const productAdCount = productEntry ? productEntry.count : 0;
-    const productAgeDays = productEntry && productEntry.firstSeenMs !== Number.MAX_SAFE_INTEGER
-      ? (now - productEntry.firstSeenMs) / (1000 * 3600 * 24) : Infinity;
-    const lastScanAgeDays = recentMinutes / (24 * 60);
     const isActive = recentMinutes <= 7 * 24 * 60;
-    const win = computeWinTier({
-      isActive, passedLayerA, ageDays: durationRounded, copies: duplicatesCount,
-      pageDensity, creativePages, lastScanAgeDays, productAgeDays, productAdCount,
-    });
     // Quốc gia chuẩn hóa (chữ thường, trim) để API lọc bằng equality thay
     // vì regex 'i' + $or: regex không phân biệt hoa thường không dùng được
     // index (bài học page_name: 314168 docs / 50.7s). countries_lower là
@@ -1295,7 +1176,6 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       last_seen: ad.last_seen || ad.first_seen || null,
       ad_archive_id: archiveId,
       domain,
-      product_key: productKey,
       ad_library_url: archiveId ? `https://www.facebook.com/ads/library/?id=${archiveId}` : null,
       score,
       duration_days: runDaysRounded,
@@ -1371,15 +1251,6 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       preset_priority: presetPriorityValue,
       creative_kind: creativeKind,
       creative_rank: CREATIVE_KINDS[creativeKind],
-      // Win tier GĐ1 (§6–7): tầng + lý do + cờ kiểm chứng + tín hiệu thô.
-      // win_blocked_reason chỉ để log rà soát (§4.1, §11), FE không hiển thị.
-      win_tier: win.tier,
-      win_reasons: win.reasons,
-      win_reason_text: win.reasonText,
-      win_needs_verify: win.needsVerify,
-      page_density: pageDensity,
-      creative_pages: creativePages,
-      win_blocked_reason: serviceSign || null,
       // "Đang chạy" = còn thấy trong 7 ngày qua (last_seen, ms). Quy tắc
       // này PHẢI khớp buildActiveCondition trong searchApi.js (cùng 7
       // ngày). Trước đây analyzer không ghi is_active nên lọc trạng thái
@@ -1463,89 +1334,11 @@ function mediaKeys(media) {
   return out;
 }
 
-// Gom số liệu products theo domain — chỉ giữ TỔNG, không giữ ad (nhẹ RAM,
-// gom xuyên suốt bao nhiêu batch cũng được, ghi 1 lần cuối vòng).
-// Ghi thêm dữ liệu cho trang product detail: title + landing + category lấy
-// từ ad có score cao nhất của domain, publication_date = start_date sớm
-// nhất, active_ads = số ad còn thấy trong 7 ngày.
-// Domain san TMDT / mang xa hoi / video — khong tinh la "san pham" de dua
-// len bang winning products. Gom theo domain thi ca san gom thanh 1 product
-// (vd shopee.vn gom hang trieu mat hang) va diem tong de be dan, nen bang
-// toan hien ten san thay vi san pham cu the. Muon them/bot: sua list nay.
-// Giu dong bo voi EXCLUDED_PRODUCT_DOMAINS trong searchApi.js (cung list).
-const EXCLUDED_PRODUCT_DOMAINS = [
-  // San TMDT
-  'shopee.vn', 'shopee.com', 'shopee.ph', 'shopee.sg', 'shopee.com.my', 'shopee.co.th', 'shopee.co.id', 'shopee.com.br', 'shopee.tw', 'shopee.com.mx', 'shopee.cl',
-  'lazada.vn', 'lazada.com', 'lazada.com.my', 'lazada.sg', 'lazada.co.th', 'lazada.co.id', 'lazada.ph',
-  'tiki.vn', 'sendo.vn',
-  'alibaba.com', 'aliexpress.com', 'aliexpress.us', '1688.com', 'taobao.com', 'tmall.com', 'jd.com', 'dhgate.com',
-  'amazon.com', 'amazon.ca', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.com.au', 'amazon.in', 'amazon.co.jp', 'amazon.com.mx', 'amazon.com.br',
-  'ebay.com', 'etsy.com', 'walmart.com',
-  // San TMDT moi
-  'temu.com', 'shein.com', 'wish.com',
-  // App store (app cai dat, khong phai san pham ban)
-  'play.google.com', 'itunes.apple.com', 'apps.apple.com',
-  // Link rut gon / redirect (khong phai landing that)
-  'fb.me', 'fb.watch', 'l.facebook.com',
-  // Mang quang cao (domain quang cao, khong phai san pham)
-  'doubleclick.net', 'googleadservices.com', 'googlesyndication.com',
-  // Mang xa hoi / nhan tin / video
-  'facebook.com', 'fb.com', 'instagram.com', 'tiktok.com', 'youtube.com', 'messenger.com', 'whatsapp.com', 'zalo.me', 'telegram.org', 'twitter.com', 'x.com', 'pinterest.com', 'linkedin.com', 'snapchat.com', 'threads.net',
-];
-// true neu domain la (hoac la subdomain cua) 1 domain trong blocklist.
-// Khong phan biet hoa thuong, bo 'www.' dau. 'notshopee.vn' hay
-// 'shopee.vn.fake.com' -> false (chi khop dung domain hoac '.domain').
-function isExcludedProductDomain(domain) {
-  if (!domain || typeof domain !== 'string') return false;
-  const d = domain.trim().toLowerCase().replace(/^www\./, '');
-  if (!d) return false;
-  for (const base of EXCLUDED_PRODUCT_DOMAINS) {
-    if (d === base || d.endsWith('.' + base)) return true;
-  }
-  return false;
-}
-// true neu domain la Shopify: *.myshopify.com (subdomain mac dinh).
-// Store dung domain rieng (custom domain) khong nhan duoc tu URL — can
-// fetch HTML de check fingerprint Shopify (buoc enrich rieng, chua lam).
-function isShopifyDomain(domain) {
-  if (!domain || typeof domain !== 'string') return false;
-  const d = domain.trim().toLowerCase().replace(/^www\./, '');
-  return d === 'myshopify.com' || d.endsWith('.myshopify.com');
-}
-// true neu text/headline/description chua placeholder template {{...}}
-// (vd {{product.name}}, {{product.brand}}) — ad chay template chua render,
-// title lay tu do se ro ri placeholder ra bang.
-function hasPlaceholderCreative(text) {
-  return typeof text === 'string' && /\{\{[^}]*\}\}/.test(text);
-}
-// --- Loc ad KHONG phai san pham ban duoc (chi lay product that) ---
-// Cac cum tu chi ro ad la phim, khoa hoc, game, app, tai chinh, dich vu
-// — tieng Viet + tieng Anh. Dung de loai khoi bang winning products.
-// Chi dung cum tu (khong dung tu don chung chung nhu "hoc", "phim",
-// "game", "app") de tranh loai nham san pham that (vd "game" trong ten
-// san pham, "app" trong "tai app de mua hang").
-const NON_PRODUCT_PATTERNS = [
-  // Phim / xem phim / drama
-  /xem phim|lồng tiếng|thuyết minh|vietsub|phim lẻ|phim bộ|phim chiếu rạp|rạp chiếu phim|phim hành động|phim tình cảm|phim hài|phim kinh dị|phim mới|tập \d+|diễn viên|phụ đề/i,
-  /watch (a |the )?movie|full movie|watch free|tv series|tv show|netflix|episode|season \d+|dubbed|subtitle|trailer|cinema|streaming/i,
-  // Khoa hoc / giao duc
-  /khóa học|lớp học|học online|học trực tuyến|đào tạo|giảng viên|khóa đào tạo|luyện thi|ôn thi|chứng chỉ|bằng cấp|trường học|đại học|cao đẳng|trung tâm|giáo dục|học phí|đăng ký học|học tiếng anh|học viên|khóa học miễn phí|lớp học đầu tư/i,
-  /online course|free course|learn english|masterclass|webinar|sign up (for|to) (the )?course|enroll(ment)?|certification|degree|academy|coaching/i,
-  // Game / co bac
-  /chơi game|tải game|game mobile|game online|giftcode|nạp game|game thủ|esport|liên quân|pubg|free fire|cờ bạc|cá cược|cá độ|sòng bạc|đánh bài|xóc đĩa|tài xỉu|lô đề|xổ số/i,
-  /play (a |the )?game|download (a |the )?game|mobile game|online game|gamer|esports|free spins|slots|casino|poker|betting|gambling|jackpot|lottery/i,
-  // App (san pham la app, khong phai hang hoa)
-  /tải app|tải ứng dụng|cài đặt app|download app|install app|get the app|app store|google play|download now|install now/i,
-  // Tai chinh / dau tu / vay
-  /đầu tư|chứng khoán|forex|tiền ảo|bitcoin|vay tiền|cho vay|tín dụng|bảo hiểm|kiếm tiền|làm giàu|thu nhập thụ động/i,
-  /invest(ment)?|trading|forex|crypto|bitcoin|stock market|loan|credit|insurance|make money|passive income|earn money|get rich/i,
-];
-// --- Tin hieu MUA (loc TICH CUC: chi lay product that) ---
+// --- Tin hieu MUA ---
 // Cum tu chi ro ad la quang cao BAN HANG (co y dinh mua): Buy, Sale, Mua,
-// Dat hang, Them vao gio, Giam gia, Freeship... — Viet + Anh. Phim, khoa
-// hoc, game, app thuong KHONG co cum tu nay (no noi "xem ngay", "hoc ngay",
-// "choi ngay", "tai app"). Dung kem loc loai tru: ad phai VUOT ca 2 (khong
-// phai non-product VA co tin hieu mua) moi duoc tinh la product.
+// Dat hang, Them vao gio, Giam gia, Freeship... — Viet + Anh.
+// Chi con dung o isSpamCreative (phan loai search): ad co tin hieu mua thi
+// KHONG phai spam — tranh danh nham ad ban hang co nhieu emoji.
 const BUY_SIGNAL_PATTERNS = [
   /mua ngay|mua hàng|đặt hàng|đặt mua|mua 1 tặng 1|mua 1 được 1|giỏ hàng|thêm vào giỏ|thanh toán|giảm giá|khuyến mãi|freeship|miễn phí vận chuyển|giao hàng|giao nhanh|ship cod|\bcod\b|chỉ còn|số lượng có hạn|ưu đãi|giá chỉ|giá sale|chính hãng|bảo hành|đổi trả|đặt mua ngay|mua tại|mua ở|mua online/i,
   /buy now|buy today|shop now|order now|add to cart|free shipping|\bshipping\b|\bcheckout\b|limited offer|get yours|order today|save \d+%|\d+% off|\bdeal\b|\bsale\b|\bdiscount\b|only \$\d+|\bprice\b|\bbuy\b/i,
@@ -1557,218 +1350,6 @@ function hasBuySignal(ad) {
   if (!hay) return false;
   for (const re of BUY_SIGNAL_PATTERNS) if (re.test(hay)) return true;
   return false;
-}
-// Nganh hang khong phai san pham ban duoc (theo phan loai industry cua analyzer).
-const NON_PRODUCT_INDUSTRIES = new Set(['entertainment', 'gambling', 'real_estate']);
-// true neu ad KHONG phai san pham ban duoc: nganh loai tru, hoac
-// headline/text/description chua cum tu non-product (Viet + Anh).
-function isNonProductAd(ad) {
-  if (!ad || typeof ad !== 'object') return false;
-  // Cờ bạc / spam (17/11) + tín dụng (18/11) + dịch vụ (19/11): không bao giờ thành winning product.
-  if (ad.creative_kind === 'gambling' || ad.creative_kind === 'spam' || ad.creative_kind === 'credit' || ad.creative_kind === 'service') return true;
-  if (ad.industry && NON_PRODUCT_INDUSTRIES.has(String(ad.industry).toLowerCase())) return true;
-  const hay = [ad.headline, ad.text, ad.description].filter(Boolean).join(' ').toLowerCase();
-  if (!hay) return false;
-  for (const re of NON_PRODUCT_PATTERNS) if (re.test(hay)) return true;
-  return false;
-}
-// Regex dung cho query Mongo ($not): khop dung isExcludedProductDomain.
-function excludedProductDomainRegex() {
-  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp('(^|\\.)(' + EXCLUDED_PRODUCT_DOMAINS.map(esc).join('|') + ')$', 'i');
-}
-
-// Param tracking loai khi chuan hoa landing URL (giua lai param dinh danh
-// san pham that, vd ?id= / ?product_id= / ?sku=).
-const LANDING_TRACKING_PARAMS = new Set(['fbclid', 'gclid', 'gbraid', 'wbraid', 'msclkid', 'igshid', 'mc_cid', 'mc_eid', '_ga', '_gl', 'vero_id', 'vero_conv', 'fb_action_ids', 'fb_source']);
-// Chuan hoa URL landing ve 1 dang duy nhat de gom nhom: https, bo www.,
-// bo #fragment, bo utm_* + param tracking, sap xep param con lai, bo '/'
-// cuoi (tru root). URL loi / khong phai http(s) -> ''.
-function normalizeLandingUrl(raw) {
-  if (!raw || typeof raw !== 'string') return '';
-  let u;
-  try { u = new URL(raw.trim()); } catch { return ''; }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
-  u.protocol = 'https:';
-  u.hostname = u.hostname.toLowerCase().replace(/^www\./, '');
-  const kept = [];
-  for (const [k, v] of u.searchParams.entries()) {
-    const lk = k.toLowerCase();
-    if (lk.startsWith('utm_') || LANDING_TRACKING_PARAMS.has(lk)) continue;
-    kept.push([k, v]);
-  }
-  kept.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
-  u.search = kept.length ? '?' + kept.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&') : '';
-  u.hash = '';
-  if (u.pathname.length > 1) u.pathname = u.pathname.replace(/\/+$/, '');
-  return u.toString();
-}
-// Khoa gom nhom san pham: URL landing da chuan hoa NEU la trang cu the
-// (co path khac '/' hoac co query dinh danh san pham); trang chu /
-// khong co URL thi fallback 'domain:<domain>' (giu hanh vi cu cho ad
-// khong co link cu the). Vi du: 2 ad cung ghe-massage-g63 khac utm_
-// gom ve 1 product; kingsport.vn/ghe-massage-g63 va /ghe-massage-g79
-// la 2 product khac nhau; shopee.vn/product/397.../232... la 1 product
-// (nhung van bi blocklist PR #22 loai neu domain nam trong list).
-function productKeyFor(ad, domainOverride) {
-  if (!ad) return '';
-  const raw = ad.landing_url || ad.link || '';
-  const url = normalizeLandingUrl(raw);
-  const domain = String(domainOverride || ad.domain || extractDomain(raw) || '').toLowerCase();
-  if (url) {
-    let path = '', search = '';
-    try { const u = new URL(url); path = u.pathname; search = u.search; } catch { /* bo qua */ }
-    if ((path && path !== '/') || search) return url;
-  }
-  return domain ? 'domain:' + domain : '';
-}
-
-const PRODUCT_ACTIVE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-function accumulateProductStats(map, analyzedAds, nowMs = Date.now()) {
-  for (const ad of analyzedAds) {
-    const key = productKeyFor(ad);
-    if (!key) continue;
-    const domain = String(ad.domain || extractDomain(ad.landing_url || ad.link || '') || '').toLowerCase();
-    if (isExcludedProductDomain(domain)) continue;
-    // Ad chay template chua render ({{product.name}}, {{product.brand}},
-    // ...) khong vao bang: title lay tu headline se ro ri placeholder.
-    if (hasPlaceholderCreative(ad.text) || hasPlaceholderCreative(ad.headline) || hasPlaceholderCreative(ad.description)) continue;
-    // Ad phim / khoa hoc / game / app / tai chinh / dich vu khong vao bang
-    // (chi lay san pham ban duoc: me & be, gia dung, tien ich, ...).
-    if (isNonProductAd(ad)) continue;
-    let s = map[key];
-    if (!s) s = map[key] = { key, domain, landingUrl: key.startsWith('http') ? key : '', platform: isShopifyDomain(domain) ? 'shopify' : 'other', countries: new Set(), totalAds: 0, pages: new Set(), totalScore: 0, winningAdsCount: 0, winningTotalScore: 0, buySignalAds: 0, totalSpendUsd: 0, activeAds: 0, firstStartDate: null, topAdScore: -Infinity, topAdHeadline: '', topAdText: '', topAdId: null, topAdLandingUrl: '', topAdIndustry: '', topAdThumbnail: null };
-    s.totalAds++;
-    s.pages.add(ad.page_name);
-    s.totalScore += ad.score || 0;
-    if (Array.isArray(ad.countries_lower)) for (const c of ad.countries_lower) if (c) s.countries.add(String(c).toLowerCase());
-    if (ad.level === '🔥 WINNER' || ad.level === '🏆 LEGEND') { s.winningAdsCount++; s.winningTotalScore += ad.score || 0; }
-    if (hasBuySignal(ad)) s.buySignalAds++;
-    s.totalSpendUsd += ad.estimated_spend_usd || 0;
-    if (ad.last_seen && (nowMs - ad.last_seen) <= PRODUCT_ACTIVE_WINDOW_MS) s.activeAds++;
-    if (typeof ad.start_date === 'number' && (s.firstStartDate === null || ad.start_date < s.firstStartDate)) s.firstStartDate = ad.start_date;
-    if (!s.topAdThumbnail && ad.thumbnail_r2) s.topAdThumbnail = ad.thumbnail_r2;
-    if ((ad.score || 0) > s.topAdScore) {
-      s.topAdScore = ad.score || 0;
-      s.topAdHeadline = (ad.headline || '').trim();
-      s.topAdText = (ad.text || '').trim();
-      s.topAdId = ad.ad_archive_id != null ? String(ad.ad_archive_id) : null;
-      s.topAdLandingUrl = ad.landing_url || ad.ad_library_url || '';
-      s.topAdIndustry = ad.industry || '';
-      // Anh dai dien: thumbnail_r2 (URL R2 ben) cua ad top score. Ad top
-      // chua co thumb (crawl truoc fix thumbnail) thi giu anh dau tien co
-      // thumb trong nhom o duoi, khong de product mat anh oan.
-      s.topAdThumbnail = ad.thumbnail_r2 || s.topAdThumbnail || null;
-    }
-  }
-  // Chi giu PRODUCT THAT: co it nhat 1 ad co tin hieu mua VA it nhat 1 ad
-  // thang. Ad phim/khoa hoc/game/app da bi loai o tren (isNonProductAd);
-  // day la cua loc TICH CUC thu 2. So luong xuat hien (winning_ads /
-  // total_ads) hien tren bang va dung de xep hang, khong dat nguong cung 2.
-  for (const k of Object.keys(map)) {
-    const s = map[k];
-    if ((s.buySignalAds || 0) < 1 || (s.winningAdsCount || 0) < 1) delete map[k];
-  }
-  return map;
-}
-
-// Title hiển thị của product: headline của ad top score; nếu rỗng thì cắt
-// text của ad đó (tối đa 120 ký tự). Không có cả hai -> '' (FE fallback
-// sang domain).
-function productTitleFor(s) {
-  if (s.topAdHeadline) return s.topAdHeadline;
-  if (s.topAdText) return s.topAdText.length > 120 ? s.topAdText.slice(0, 120) : s.topAdText;
-  return '';
-}
-
-// product_score = DIEM TRUNG BINH cua ad WIN (khong phai tong). Thuong cho
-// chat luong win, khong thuong so luong: san co 1 ad win diem 80 thang
-// domain co 47k ad win diem TB 25. Khong co ad win thi dung TB tat ca ad.
-function computeProductScore(s) {
-  const winAvg = s.winningAdsCount > 0 ? (s.winningTotalScore || 0) / s.winningAdsCount : 0;
-  const avg = s.totalAds > 0 ? s.totalScore / s.totalAds : 0;
-  return Number((s.winningAdsCount > 0 ? winAvg : avg).toFixed(1));
-}
-
-// Snapshot top 30 product thắng của ngày chạy (theo product_score, chỉ
-// tính product có >=1 ad thắng). Ghi đè theo ngày nên chạy lại cùng ngày
-// không tạo bản sao. Ngày tính theo +07 (giờ chạy analyzer 11h).
-const DAILY_WINNERS_LIMIT = 30;
-function dailyWinnersDateString(nowMs = Date.now()) {
-  return new Date(nowMs + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
-}
-function buildDailyWinners(map, dateStr, limit = DAILY_WINNERS_LIMIT) {
-  return Object.values(map)
-    .filter((s) => s.winningAdsCount > 0)
-    .map((s) => ({ product_key: s.key, domain: s.domain, landing_url: s.landingUrl || s.topAdLandingUrl || null, category: s.topAdIndustry || null, title: productTitleFor(s), thumbnail_r2: s.topAdThumbnail || null, product_score: computeProductScore(s), winning_ads: s.winningAdsCount, buy_signal_ads: s.buySignalAds || 0, total_ads: s.totalAds, total_pages: s.pages.size, total_spend_usd: Number(s.totalSpendUsd.toFixed(1)), platform: s.platform || 'other', is_vn: s.countries.has('vn'), countries: [...s.countries] }))
-    .sort((a, b) => b.product_score - a.product_score || b.winning_ads - a.winning_ads || a.product_key.localeCompare(b.product_key))
-    .slice(0, limit)
-    .map((w, i) => ({ date: dateStr, rank: i + 1, ...w }));
-}
-async function writeDailyWinnersSnapshot(db, map, nowMs = Date.now()) {
-  const dateStr = dailyWinnersDateString(nowMs);
-  const winners = buildDailyWinners(map, dateStr);
-  const col = db.collection('product_winners_daily');
-  await col.deleteMany({ date: dateStr });
-  if (winners.length) await col.insertMany(winners);
-  console.log(`🏆 [DB Daily Winners] ${dateStr}: ${winners.length} sản phẩm thắng.`);
-  return winners.length;
-}
-
-// Ghi map products đã gom đủ — $set toàn bộ (không $inc).
-async function flushProductsCollection(db, map) {
-  const col = db.collection('products');
-  const bulk = Object.values(map).map(s => {
-    const pages = s.pages.size;
-    const productScore = computeProductScore(s);
-    return {
-      updateOne: {
-        filter: { product_key: s.key },
-        update: {
-          $set: {
-            updated_at: Date.now(),
-            product_key: s.key,
-            domain: s.domain,
-            total_spend_usd: Number(s.totalSpendUsd.toFixed(1)),
-            total_ads: s.totalAds,
-            total_pages: pages,
-            total_score: Number(s.totalScore.toFixed(1)),
-            winning_ads: s.winningAdsCount,
-            buy_signal_ads: s.buySignalAds || 0,
-            product_score: productScore,
-            title: productTitleFor(s),
-            platform: s.platform || 'other',
-            is_vn: s.countries.has('vn'),
-            countries: [...s.countries],
-            avg_winning_score: s.winningAdsCount > 0 ? Number(((s.winningTotalScore || 0) / s.winningAdsCount).toFixed(1)) : null,
-            avg_score: s.totalAds > 0 ? Number((s.totalScore / s.totalAds).toFixed(1)) : null,
-            top_ad_id: s.topAdId,
-            thumbnail_r2: s.topAdThumbnail || null,
-            landing_url: s.landingUrl || s.topAdLandingUrl || null,
-            category: s.topAdIndustry || null,
-            publication_date: s.firstStartDate,
-            active_ads: s.activeAds
-          }
-        },
-        upsert: true
-      }
-    };
-  });
-
-  if (bulk.length) {
-    await col.bulkWrite(bulk);
-    console.log(`🔥 [DB Products] Đã tổng hợp ${bulk.length} sản phẩm (gom theo landing URL).`);
-  }
-  // Don doc cu gom theo domain (khong co product_key) — neu khong, bang
-  // search se hien ca dong domain cu lan dong product moi. Chi chay 1
-  // lan co tac dung (FULL dau tien sau deploy); cac FULL sau tra ve 0.
-  const legacy = await col.deleteMany({ product_key: { $exists: false } });
-  if (legacy.deletedCount) console.log(`🧹 [DB Products] Đã xóa ${legacy.deletedCount} doc cũ gom theo domain.`);
-}
-
-async function updateProductsCollection(db, analyzedAds) {
-  // Wrapper giữ tương thích: gom rồi ghi ngay (dùng khi xử lý 1 cục, không batch).
-  await flushProductsCollection(db, accumulateProductStats({}, analyzedAds));
 }
 
 // ===== ELASTICSEARCH SYNC =====
@@ -1811,10 +1392,6 @@ async function syncToElasticsearch(esClient, analyzedAds) {
       industry: ad.industry || 'other',
       country_inferred: ad.country_inferred === true,
       scaling_level: ad.scaling_level || '',
-      win_tier: ad.win_tier || null,
-      win_needs_verify: ad.win_needs_verify === true,
-      page_density: ad.page_density || 1,
-      creative_pages: ad.creative_pages || 1
     }));
     if (!docs.length) continue;
     const operations = docs.flatMap(ad => [
@@ -1880,13 +1457,6 @@ async function ensureIndexExists(esClient) {
         ad_library_url: { type: 'keyword' },
         funnel: { type: 'keyword' },
         scaling_level: { type: 'keyword' },
-        // Win tier GĐ1 (19/11): chỉ hiệu lực khi tạo index MỚI (mapping cũ
-        // không tự thêm field; xem Phase 0: mapping đầy đủ 56 field ở nhánh
-        // es-migration-phase0 cần bổ sung tương tự).
-        win_tier: { type: 'keyword' },
-        win_needs_verify: { type: 'boolean' },
-        page_density: { type: 'long' },
-        creative_pages: { type: 'long' },
         start_date: { type: 'date', format: 'epoch_second' },
         full_text_search: { type: 'text', analyzer: 'vietnamese_analyzer' }
       }
@@ -2047,11 +1617,9 @@ async function main() {
     const BATCH_SIZE = 750; // tang tu 500 len 750 (11/11: chay nhanh hon); ha xuong 200 neu RAM van cang (doc nang)
     let batch = [];
     let totalProcessed = 0;
-    const productStats = {};
 
     const flushBatch = async () => {
       const processedAds = analyzeAllAdsGlobally(batch, maps);
-      accumulateProductStats(productStats, processedAds);
       await updateAdsCollection(analyzedAdsCol, processedAds);
       await syncToElasticsearch(esClient, processedAds);
       totalProcessed += batch.length;
@@ -2070,16 +1638,6 @@ async function main() {
     if (batch.length > 0) {
       console.log(`📊 [Analyzer] Đang xử lý mẻ cuối cùng gồm ${batch.length} quảng cáo...`);
       await flushBatch();
-    }
-
-    // Products: ghi 1 lần duy nhất, đủ toàn bộ lượt quét
-    await flushProductsCollection(analyzerDb, productStats);
-    // Snapshot top 30 product thắng của ngày (phục vụ monthly winner).
-    // Phụ trợ: lỗi ở đây chỉ cảnh báo, không làm fail cả lượt chạy.
-    try {
-      await writeDailyWinnersSnapshot(analyzerDb, productStats);
-    } catch (snapErr) {
-      console.error('⚠️ [DB Daily Winners] Không ghi được snapshot (bỏ qua):', snapErr.message);
     }
 
     if (totalProcessed > 0) {
@@ -2101,4 +1659,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, hasGamblingSign, isSpamCreative, hasCreditSign, hasServiceSign, SERVICE_BLOCKLIST, computeWinTier, WIN_TIER_THRESHOLDS, WIN_REASON_TEMPLATES, WIN_TIER_LABELS, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, detectAdLanguage, inferCountryFromVietnamese, accumulateProductStats, flushProductsCollection, productTitleFor, computeProductScore, buildDailyWinners, normalizeLandingUrl, productKeyFor, dailyWinnersDateString, writeDailyWinnersSnapshot, EXCLUDED_PRODUCT_DOMAINS, isExcludedProductDomain, excludedProductDomainRegex, isShopifyDomain, hasPlaceholderCreative, isNonProductAd, NON_PRODUCT_PATTERNS, hasBuySignal, BUY_SIGNAL_PATTERNS, DAILY_WINNERS_LIMIT, PRODUCT_ACTIVE_WINDOW_MS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, hasGamblingSign, isSpamCreative, hasCreditSign, hasServiceSign, SERVICE_BLOCKLIST, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, detectAdLanguage, inferCountryFromVietnamese, hasBuySignal, BUY_SIGNAL_PATTERNS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
