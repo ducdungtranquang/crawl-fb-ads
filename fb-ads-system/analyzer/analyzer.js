@@ -1556,7 +1556,8 @@ async function main() {
         // Index dem/tim cham 05/11: filter + is_group_rep + sort — khong co
         // is_group_rep o giua, Mongo phai FETCH toan bo doc cua filter de
         // loc dai dien (nganh Khac 145k doc -> dem khong xong).
-        { key: { industry: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: "idx_industry_rep_start" },
+        // 20/11 (fix cham nganh): sync key theo create-indexes.js — chen creative_rank len thu 3 (kieu PR #46).
+        { key: { industry: 1, is_group_rep: 1, creative_rank: 1, start_date: -1, last_seen: -1 }, name: "idx_industry_rep_start" },
         // 26/11: sync key theo create-indexes.js — chen creative_rank thu 3, start_date truoc last_seen (dem spend covered).
         { key: { estimated_spend: 1, is_group_rep: 1, creative_rank: 1, start_date: -1, last_seen: -1 }, name: "idx_spend_tier_rep_start" },
         { key: { scaling_level: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: "idx_scaling_rep_start" },
