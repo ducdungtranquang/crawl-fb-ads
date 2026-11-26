@@ -299,7 +299,6 @@ const SORT_FIELD_ALIASES = {
     trending_score: 'trending_score', trendingscore: 'trending_score', trending: 'trending_score',
     start_date: 'start_date', startdate: 'start_date', newest: 'start_date', 'moi nhat': 'start_date',
     published: 'start_date', 'moi xuat ban nhat': 'start_date',
-    duration_days: 'duration_days', duration: 'duration_days', 'chay lau nhat': 'duration_days',
     estimated_spend_usd: 'estimated_spend_usd', spend: 'estimated_spend_usd',
     'chi tieu uoc tinh cao nhat': 'estimated_spend_usd', 'chi tieu': 'estimated_spend_usd',
     estimated_reach: 'estimated_reach', reach: 'estimated_reach',
@@ -379,8 +378,6 @@ function normalizeQueryParams(raw) {
     if (maxSpend !== undefined) q.max_spend_usd = maxSpend;
     const funnel = firstParam(raw, ['funnel', 'funnel_stage']);
     if (funnel !== undefined) q.funnel = funnel;
-    const scaling = firstParam(raw, ['scaling_level', 'scaling', 'scalingLevel']);
-    if (scaling !== undefined) q.scaling_level = scaling;
     const filter = firstParam(raw, ['filter', 'preset', 'strategy', 'filter_type']);
     if (filter !== undefined) q.filter = filter;
     const industry = firstParam(raw, ['industry', 'category', 'nganh']);
@@ -838,7 +835,7 @@ async function refreshEsDedupeProbe(esClient) {
 }
 
 // Các field sort được phép (dùng chung cho handler + resolveSearchSort).
-const ALLOWED_SORT_FIELDS = new Set(['score', 'trending_score', 'start_date', 'seen_count', 'analyzed_at', 'first_seen', 'last_seen', 'scaling_score', 'estimated_spend_usd', 'duration_days', 'estimated_spend_max_usd', 'estimated_spend_min_usd', 'estimated_reach']);
+const ALLOWED_SORT_FIELDS = new Set(['score', 'trending_score', 'start_date', 'seen_count', 'analyzed_at', 'first_seen', 'last_seen', 'scaling_score', 'estimated_spend_usd', 'estimated_spend_max_usd', 'estimated_spend_min_usd', 'estimated_reach']);
 
 // Param tinh chỉnh theo từng preset. Một preset dùng đường nhanh cờ khi
 // user không truyền param nào, HOẶC mọi param đã truyền đều BẰNG đúng giá
@@ -1504,7 +1501,6 @@ function initSearchServer(dbInstance) {
                 estimated_spend,
                 min_trending_score,
                 funnel,
-                scaling_level,
                 page_name,     // Lọc theo tên Page
                 domain,        // Lọc theo tên miền
                 is_active,     // Lọc theo trạng thái quảng cáo (true/false)
@@ -1642,8 +1638,7 @@ function initSearchServer(dbInstance) {
             }
 
             // level: regex $in trên giá trị có prefix emoji (xem
-            // buildLevelCondition). scaling_level: map nhãn FE về 3 giá trị
-            // thật của DB (xem buildScalingCondition).
+            // buildLevelCondition).
             if (level) {
                 const levelCond = buildLevelCondition(level);
                 if (levelCond) Object.assign(query, levelCond);
@@ -1684,10 +1679,13 @@ function initSearchServer(dbInstance) {
             // vì bỏ hẳn điều kiện rank (xem fix 17/11).
             if (hideEntertainmentEnabled(q, industryValues)) andConds.push(buildHideEntertainmentCondition());
             else andConds.push(buildHideGamblingCondition());
-            if (scaling_level) {
-                const scalingCond = buildScalingCondition(scaling_level);
-                if (scalingCond) andConds.push(scalingCond);
-            }
+            // 26/11: lọc "Mức độ Scaling" (scaling_level) ĐÃ BỎ theo yêu
+            // cầu của Bryan — load chậm, kết hợp filter khác thì hỏng.
+            // Param scaling_level FE còn gửi sẽ bị bỏ qua (không lọc,
+            // không lỗi). buildScalingCondition giữ lại (export + test)
+            // để khôi phục nhanh nếu cần, nhưng handler không gọi nữa.
+            // Lưu ý: sort theo scaling_score ("Điểm Scaling") và preset
+            // ready_to_scale KHÔNG bị bỏ — đó là cơ chế khác.
             // Sort theo rank chỉ có nghĩa khi doc đã có creative_rank
             // (probe rank=false -> bỏ rank, không thêm điều kiện $exists
             // làm preset trả rỗng như bản cũ khi analyzer chưa chạy lại).
@@ -1707,17 +1705,21 @@ function initSearchServer(dbInstance) {
             // countSearchTotal để hint idx_countries_rep_start khi lọc
             // đúng 1 nước (planner chọn sai index cho shape này, xem
             // isCountryAloneCount); hint lỗi thì đếm lại không hint.
-            let total = null;
-            let countTimeout = false;
             const countQuery = stripCountExistsConditions(query, sortInfo.sortOptions);
-            try {
-                total = Object.keys(countQuery).length === 0
-                    ? await adsCol.estimatedDocumentCount()
-                    : await countSearchTotal(adsCol, countQuery, q);
-            } catch (countErr) {
-                console.warn('[Search API] countDocuments timeout/lỗi:', countErr.message);
-                countTimeout = true;
-            }
+            // 26/11: đếm và lấy list chạy SONG SONG (trước đây đếm xong mới
+            // find — tổng thời gian = count + find, dễ vượt timeout 25s của
+            // FE). Lỗi đếm vẫn nuốt như cũ: total=null + count_timeout.
+            const countPromise = (async () => {
+                try {
+                    const t = Object.keys(countQuery).length === 0
+                        ? await adsCol.estimatedDocumentCount()
+                        : await countSearchTotal(adsCol, countQuery, q);
+                    return { total: t, countTimeout: false };
+                } catch (countErr) {
+                    console.warn('[Search API] countDocuments timeout/lỗi:', countErr.message);
+                    return { total: null, countTimeout: true };
+                }
+            })();
 
             const sortOptions = sortInfo.sortOptions;
 
@@ -1732,6 +1734,8 @@ function initSearchServer(dbInstance) {
                     thumbnail_local: 1, is_active: 1, images: { $slice: 1 }, videos: { $slice: 1 }
                 })
                 .sort(sortOptions).skip(skip).limit(limit).maxTimeMS(SEARCH_FIND_MAX_TIME_MS).toArray();
+
+            const { total, countTimeout } = await countPromise;
 
             // Khi search text mà user không chọn sort_by, hoặc chọn
             // sort_by=relevance ("Liên quan nhất"): giữ thứ hạng relevance
