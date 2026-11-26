@@ -91,7 +91,11 @@ const INDEXES = [
   // Index dem/tim cham 05/11: filter + is_group_rep + sort — khong co
   // is_group_rep o giua, Mongo phai FETCH toan bo doc cua filter de loc
   // dai dien (nganh Khac 145k doc -> dem khong xong).
-  { key: { industry: 1, is_group_rep: 1, last_seen: -1, start_date: -1 }, name: 'idx_industry_rep_start' },
+  // 20/11 (fix cham nganh): chen creative_rank len thu 3 (kieu PR #46) —
+  // key cu khong bound duoc dieu kien an phim $in [0,1] nen dem/list nganh
+  // mot minh FETCH tung doc de loc rank (Lam dep 15-30s, Thoi trang
+  // 10-25s ngay 20/11). Cung ten, khac key -> deploy PHAI dropIndex truoc.
+  { key: { industry: 1, is_group_rep: 1, creative_rank: 1, start_date: -1, last_seen: -1 }, name: 'idx_industry_rep_start' },
   // 26/11: chen creative_rank thu 3 + dua start_date truoc last_seen — key cu
   // thieu creative_rank nen dem spend phai FETCH tung doc de loc rank (cung
   // benh idx_industry_rep_start truoc #53). Key moi dem covered COUNT_SCAN,
