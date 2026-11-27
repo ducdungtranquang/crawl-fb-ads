@@ -80,6 +80,8 @@ const COUNTRY_NAME_TO_CODE = {
   my: 'us', // từ 'Mỹ' strip dấu — chỉ tới được đây khi raw KHÔNG phải mã 'MY' (mã ISO được ưu tiên ở dưới)
   'nhat ban': 'jp', japan: 'jp', jp: 'jp',
   'thai lan': 'th', thailand: 'th', th: 'th',
+  campuchia: 'kh', cambodia: 'kh', kh: 'kh',
+  lao: 'la', laos: 'la', la: 'la',
   philippines: 'ph', 'phi lip pin': 'ph', ph: 'ph',
   malaysia: 'my', 'ma lai xi a': 'my',
   indonesia: 'id', 'in do ne xi a': 'id', id: 'id',
@@ -163,6 +165,58 @@ function inferCountryFromVietnamese(ad, domain) {
     }
   }
   if ((marks >= 1 && hits >= 1) || hits >= 2) return 'vn';
+  return null;
+}
+// Các nước có bộ lọc riêng trên FE (27/11/2026): VN + Thái Lan +
+// Campuchia + Lào. OTHER = phần còn lại (gồm EU/Mỹ và ad chưa có nhãn
+// nước). Đổi danh sách này thì đổi cả SPECIFIC_COUNTRY_CODES trong
+// searchApi.js.
+const SPECIFIC_COUNTRY_CODES = ['vn', 'th', 'kh', 'la'];
+function isOtherCountry(countriesLower) {
+  return !SPECIFIC_COUNTRY_CODES.some((c) => countriesLower.includes(c));
+}
+
+// Suy luận nước Đông Nam Á theo script chữ (27/11/2026): chữ Khmer
+// (U+1780-U+17FF) chỉ dùng ở Campuchia, chữ Thái (U+0E00-U+0E7F) ở Thái
+// Lan, chữ Lào (U+0E80-U+0EFF) ở Lào — 3 script không trùng nhau nên đếm
+// ký tự là đủ tin cậy. Tín hiệu phụ khi không có script: tên miền
+// .kh/.th/.la, giá tiền theo tiền tệ bản địa (ký hiệu ₭ không nằm trong
+// block Lào nên phải bắt riêng; ៛/฿ nằm trong block Khmer/Thái), mã điện
+// thoại +855/+66/+856. Chỉ chạy khi countries_lower RỖNG (không ghi đè
+// nhãn Meta), kết quả đánh dấu country_inferred=true như suy luận VN.
+const KHMER_SCRIPT_RE = /[\u1780-\u17FF]/g;
+const THAI_SCRIPT_RE = /[\u0E00-\u0E7F]/g;
+const LAO_SCRIPT_RE = /[\u0E80-\u0EFF]/g;
+const SEA_PRICE_RES = [
+  { code: 'kh', re: /\d[\d.,]*\s*(៛|KHR)(?!\p{L})/iu },
+  { code: 'th', re: /\d[\d.,]*\s*(฿|THB)(?!\p{L})/iu },
+  { code: 'la', re: /\d[\d.,]*\s*(₭|LAK)(?!\p{L})/iu },
+];
+const SEA_PHONE_RES = [
+  { code: 'kh', re: /\+855[\s.\-]?\d/ },
+  { code: 'th', re: /\+66[\s.\-]?\d/ },
+  { code: 'la', re: /\+856[\s.\-]?\d/ },
+];
+function inferCountryFromSeaScript(ad, domain) {
+  const rawText = normalize(
+    (ad.text || '') + ' ' + (ad.headline || '') + ' ' + (ad.description || '') + ' ' + (ad.page_name || '')
+  ) || '';
+  const dom = String(domain || ad.domain || extractDomain(ad.link) || '').toLowerCase();
+  if (dom.endsWith('.kh')) return 'kh';
+  if (dom.endsWith('.th')) return 'th';
+  if (dom.endsWith('.la')) return 'la';
+  const counts = [
+    { code: 'kh', n: (rawText.match(KHMER_SCRIPT_RE) || []).length },
+    { code: 'th', n: (rawText.match(THAI_SCRIPT_RE) || []).length },
+    { code: 'la', n: (rawText.match(LAO_SCRIPT_RE) || []).length },
+  ].sort((a, b) => b.n - a.n);
+  if (counts[0].n >= 3) return counts[0].code;
+  for (const { code, re } of SEA_PRICE_RES) {
+    if (re.test(rawText)) return code;
+  }
+  for (const { code, re } of SEA_PHONE_RES) {
+    if (re.test(rawText)) return code;
+  }
   return null;
 }
 function extractDomain(url) {
@@ -703,13 +757,15 @@ const SPEND_MODEL_CAPS = {
 // tiếng Việt đại chúng. Thứ tự: CJK -> tiếng Trung; Thai -> tiếng Thái;
 // dấu tiếng Việt hoặc từ Việt -> tiếng Việt; chữ Latin -> tiếng Anh;
 // còn lại (toàn emoji, chữ lạ, rỗng) -> 'other'.
-const LANGUAGE_SPEND_MULT = { vn: 1.0, en: 1.15, zh: 1.1, th: 1.05, other: 1.0 };
+const LANGUAGE_SPEND_MULT = { vn: 1.0, en: 1.15, zh: 1.1, th: 1.05, km: 1.0, lo: 1.0, other: 1.0 };
 const VN_DIACRITICS_RE = /[àáạảãâầấậẩẫăằắặẳẵđèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựỳýỵỷỹ]/i;
 const VN_PHRASES = ['mua ngay', 'đặt hàng', 'khuyến mãi', 'giảm giá', 'freeship', 'giao hàng', 'miễn phí vận chuyển', 'chính hãng', 'bảo hành', 'thời trang', 'làm đẹp', 'sức khỏe', 'cà phê', 'trà sữa', 'quần áo', 'nội thất', 'gia dụng', 'sản phẩm', 'cửa hàng', 'giá chỉ', 'chỉ còn', 'mua 1 tặng'];
 function detectAdLanguage(ad) {
   const text = String((ad.text || '') + ' ' + (ad.headline || '')).trim();
   if (!text) return 'other';
   if (/[\u4E00-\u9FFF]/.test(text)) return 'zh';
+  if (/[\u1780-\u17FF]/.test(text)) return 'km';
+  if (/[\u0E80-\u0EFF]/.test(text)) return 'lo';
   if (/[\u0E00-\u0E7F]/.test(text)) return 'th';
   if (VN_DIACRITICS_RE.test(text)) return 'vn';
   const lower = text.toLowerCase();
@@ -731,7 +787,7 @@ function estimateSpendAndReach(ad, durationDays = 1, duplicatesCount = 1, pageAd
     US: 18.0, CA: 16.0,
     UK: 10.0, DE: 9.5, FR: 9.0, SG: 11.0, EU: 9.0,
     RO: 5.0, BR: 4.5, MX: 4.0, TH: 3.5,
-    VN: 2.0, PH: 1.8, ID: 1.5
+    VN: 2.0, PH: 1.8, ID: 1.5, KH: 1.8, LA: 1.5
   };
 
   let sumCpm = 0;
@@ -1160,11 +1216,15 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
       canonicalizeCountryValue(detailSummary.latest_detail_country),
     ].filter(Boolean))];
     // Fallback suy luận (chỉ khi rỗng — không ghi đè nhãn Meta). Ghi dấu
-    // country_inferred để phân biệt với nhãn thật (xem inferCountryFromVietnamese).
+    // country_inferred để phân biệt với nhãn thật (xem
+    // inferCountryFromVietnamese + inferCountryFromSeaScript).
     let countryInferred = false;
-    if (countriesLower.length === 0 && inferCountryFromVietnamese(ad, domain) === 'vn') {
-      countriesLower.push('vn');
-      countryInferred = true;
+    if (countriesLower.length === 0) {
+      const inferredCountry = inferCountryFromVietnamese(ad, domain) || inferCountryFromSeaScript(ad, domain);
+      if (inferredCountry) {
+        countriesLower.push(inferredCountry);
+        countryInferred = true;
+      }
     }
     const industryValue = classifyIndustry(ad);
     const presetPriorityValue = presetPriority(industryValue, creativeKind);
@@ -1215,12 +1275,13 @@ function analyzeAllAdsGlobally(ads, globalMaps) {
         is_new_ad: isNewAd,
         is_ready_to_scale: isReadyToScale,
         is_weekly_winner: isWeeklyWinner,
-        // OTHER = không phải VN (gồm cả ad chưa có nhãn nước): cờ tính sẵn
-        // để API lọc bằng equality boolean thay vì $ne 'vn' (xem fix
-        // OTHER 11/11: $ne không dùng được index -> đếm >25s -> FE timeout
-        // rồi trả 0). Tính SAU fallback suy luận VN nên ad suy luận 'vn'
-        // không lọt vào OTHER.
-        is_other: !countriesLower.includes('vn'),
+        // OTHER = ngoài VN/Thái/Campuchia/Lào (gồm EU/Mỹ và ad chưa có
+        // nhãn nước; chốt 27/11/2026): cờ tính sẵn để API lọc bằng
+        // equality boolean thay vì $ne/$nin (xem fix OTHER 11/11: $ne
+        // không dùng được index -> đếm >25s -> FE timeout rồi trả 0).
+        // Tính SAU fallback suy luận nên ad suy luận VN/TH/KH/LA không
+        // lọt vào OTHER.
+        is_other: isOtherCountry(countriesLower),
         // Cờ bạc / spam (17/11): analyzer gán theo creativeKind để API chặn cứng khỏi kết quả.
         is_gambling: creativeKind === 'gambling',
         is_spam: creativeKind === 'spam',
@@ -1663,4 +1724,4 @@ main().then(() => process.exit(0)).catch((err) => {
 
 
 // Export để test (không đổi hành vi chạy standalone: main() đã chạy ở trên).
-module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, hasGamblingSign, isSpamCreative, hasCreditSign, hasServiceSign, SERVICE_BLOCKLIST, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, detectAdLanguage, inferCountryFromVietnamese, hasBuySignal, BUY_SIGNAL_PATTERNS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
+module.exports = { classifyIndustry, INDUSTRY_CATEGORIES, PRESET_THRESHOLDS, classifyCreativeKind, CREATIVE_KINDS, hasGamblingSign, isSpamCreative, hasCreditSign, hasServiceSign, SERVICE_BLOCKLIST, presetPriority, PRESET_PRIORITY_INDUSTRIES, groupKeyFor, canonicalGroupText, stripUrlsAndPhones, GROUP_TEXT_PREFIX_LEN, accumulateGroupMap, selectGroupInfo, analyzeAllAdsGlobally, canonicalizeCountryValue, isGenericCreativeText, stripDiacritics, estimateSpendAndReach, SPEND_MODEL_CAPS, detectAdLanguage, inferCountryFromVietnamese, inferCountryFromSeaScript, isOtherCountry, SPECIFIC_COUNTRY_CODES, hasBuySignal, BUY_SIGNAL_PATTERNS, mediaItemUrl, mediaKey, mediaKeys, cappedScalingScore, scalingLevelFor, SCALING_HARD_MAX_RUN_DAYS, SCALING_HARD_MAX_SCORE };
