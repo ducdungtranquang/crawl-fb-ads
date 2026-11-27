@@ -95,6 +95,8 @@ const COUNTRY_NAME_MAP = {
     'hoa ky': 'us', 'united states': 'us', usa: 'us', 'us': 'us', 'my': 'us',
     'nhat ban': 'jp', japan: 'jp', 'jp': 'jp',
     'thai lan': 'th', thailand: 'th', 'th': 'th',
+    'campuchia': 'kh', cambodia: 'kh', 'kh': 'kh',
+    'lao': 'la', laos: 'la', 'la': 'la',
     'philippines': 'ph', 'phi lip pin': 'ph', 'ph': 'ph',
     'malaysia': 'my', 'ma lai xi a': 'my',
     'indonesia': 'id', 'in do ne xi a': 'id', 'id': 'id',
@@ -118,7 +120,11 @@ const COUNTRY_NAME_MAP = {
     'nga': 'ru', russia: 'ru', 'ru': 'ru',
     'tho nhi ky': 'tr', turkey: 'tr', 'tr': 'tr',
 };
-const COUNTRY_CODE_TO_NAME = { vn: 'vietnam', us: 'united states', jp: 'japan', th: 'thailand', ph: 'philippines', my: 'malaysia', id: 'indonesia', sg: 'singapore', kr: 'korea', gb: 'united kingdom', de: 'germany', fr: 'france', ca: 'canada', au: 'australia', br: 'brazil', mx: 'mexico', ae: 'uae', tw: 'taiwan', hk: 'hong kong', cn: 'china', in: 'india', es: 'spain', it: 'italy', nl: 'netherlands', ru: 'russia', tr: 'turkey' };
+const COUNTRY_CODE_TO_NAME = { vn: 'vietnam', us: 'united states', jp: 'japan', th: 'thailand', kh: 'cambodia', la: 'laos', ph: 'philippines', my: 'malaysia', id: 'indonesia', sg: 'singapore', kr: 'korea', gb: 'united kingdom', de: 'germany', fr: 'france', ca: 'canada', au: 'australia', br: 'brazil', mx: 'mexico', ae: 'uae', tw: 'taiwan', hk: 'hong kong', cn: 'china', in: 'india', es: 'spain', it: 'italy', nl: 'netherlands', ru: 'russia', tr: 'turkey' };
+
+// Các nước có bộ lọc riêng (27/11/2026) — OTHER = phần còn lại (gồm
+// EU/Mỹ). Đồng bộ SPECIFIC_COUNTRY_CODES trong analyzer.js.
+const SPECIFIC_COUNTRY_CODES = ['vn', 'th', 'kh', 'la'];
 
 // Các dạng tên/bí danh có thể đã lưu trong countries_lower của doc cũ
 // (analyzer cũ ghi nguyên giá trị thô, vd 'usa', 'united states') — đảo
@@ -276,6 +282,39 @@ function buildActiveCondition(activeBool) {
     const cutoff = Date.now() - ACTIVE_WINDOW_MS;
     if (activeBool === true) return { last_seen: { $gte: cutoff } };
     return { last_seen: { $lt: cutoff } };
+}
+
+// Bug 5 (26/11): nhãn Active/Paused trên card phải khớp điều kiện lọc.
+// Bộ lọc dùng last_seen (buildActiveCondition) nhưng doc trả về mang
+// is_active do analyzer ghi tại thời điểm FULL — cờ cũ dần theo ngày,
+// nên lọc "Đã tắt" (is_active=false) vẫn hiện toàn nhãn Active.
+// Tính lại is_active từ last_seen ngay trước khi trả response để nhãn
+// luôn đúng quy tắc 7 ngày, bất kể FULL chạy lúc nào. Doc thiếu
+// last_seen dạng số thì giữ nguyên is_active đã lưu.
+function computeIsActive(lastSeenMs, nowMs = Date.now()) {
+    if (typeof lastSeenMs !== 'number' || !Number.isFinite(lastSeenMs)) return undefined;
+    return lastSeenMs >= nowMs - ACTIVE_WINDOW_MS;
+}
+function refreshIsActive(docs, nowMs = Date.now()) {
+    if (!Array.isArray(docs)) return docs;
+    for (const doc of docs) {
+        if (!doc || typeof doc !== 'object') continue;
+        const v = computeIsActive(doc.last_seen, nowMs);
+        if (v !== undefined) doc.is_active = v;
+    }
+    return docs;
+}
+
+// Bug 6 (26/11): strip thumbnail video tạm (.mp4) đã hết hạn token oe
+// trước khi trả về — FE hiện placeholder thay vì khung đen. Trước đây
+// chỉ search list strip; similar + page ads trả thẳng URL hết hạn.
+function stripExpiredVideoThumbs(docs, nowSec = Math.floor(Date.now() / 1000)) {
+    if (!Array.isArray(docs)) return docs;
+    for (const doc of docs) {
+        const t = doc && doc.thumbnail_r2;
+        if (typeof t === 'string' && /\.mp4/i.test(t) && !videoUrlFresh(t, nowSec)) doc.thumbnail_r2 = null;
+    }
+    return docs;
 }
 
 // Ngày: nhận ISO (2026-10-27), MM/DD/YYYY, hoặc epoch giây/ms (số thuần).
@@ -536,7 +575,8 @@ function buildIndustryCondition(industryParam, schema) {
 function buildCountryCondition(countryParam, schema) {
     const codes = normalizeCountryCodes(countryParam);
     if (!codes.length) return null;
-    // 'other' = không phải Việt Nam: {countries_lower: {$ne: 'vn'}} khớp
+    // 'other' = ngoài VN/Thái/Campuchia/Lào (chốt 27/11/2026): fallback
+    // {countries_lower: {$nin: [vn, th, kh, la + bí danh]}} khớp
     // cả doc có nhãn nước khác VN lẫn doc chưa có nhãn nước (field rỗng
     // hoặc thiếu — $ne khớp cả trường vắng mặt). Giả định: countries_lower
     // đã chuẩn hóa ISO (migrate PR #7 + analyzer ghi ISO).
@@ -548,7 +588,7 @@ function buildCountryCondition(countryParam, schema) {
         // (analyzer chưa FULL bản mới) thì fallback $ne cũ.
         const otherCond = (schema && schema.otherFlag)
             ? { 'filter_signals.is_other': true }
-            : { countries_lower: { $ne: 'vn' } };
+            : { countries_lower: { $nin: SPECIFIC_COUNTRY_CODES.flatMap(countryMatchValues) } };
         const rest = codes.filter((c) => c !== 'other');
         if (!rest.length) return otherCond;
         return { $or: [otherCond, { countries_lower: { $in: rest.flatMap(countryMatchValues) } }] };
@@ -930,6 +970,19 @@ function resolveSearchSort(presets, q, opts) {
     return { sortOptions: { [safeSortField]: requestedOrder }, rankFirst: false, relevance: relevanceRequested };
 }
 
+// Bug 4 (26/11): sort "Điểm Scaling" thuần (không preset) không qua
+// buildPresetConditions nên không có REAL_THUMBNAIL_COND — điểm scaling
+// tích lũy theo thời gian đẩy ad cũ/Paused/ảnh hết hạn lên top (retest
+// 26/11: 0/10 ảnh thật, 20/20 trang 1 placeholder). Khi sort cuối cùng
+// là scaling_score mà KHÔNG có preset nào, ép thêm điều kiện ảnh thật
+// như preset ready_to_scale. Có preset thì giữ nguyên ngữ nghĩa preset
+// (ready_to_scale/weekly_winner đã tự ép ảnh; new_ads không ép).
+function shouldForceThumbnailForScalingSort(sortInfo, presetList) {
+    if (!sortInfo || !sortInfo.sortOptions || typeof sortInfo.sortOptions !== 'object') return false;
+    if (Array.isArray(presetList) && presetList.length) return false;
+    return Object.prototype.hasOwnProperty.call(sortInfo.sortOptions, 'scaling_score');
+}
+
 // Query ĐẾM: bỏ điều kiện $exists trên field rank (preset_priority /
 // creative_rank) khỏi bản sao của query — $exists chặn COUNT_SCAN nên đếm
 // phải FETCH toàn bộ doc khớp (đo thực tế trên VM: đếm new_ads có $exists
@@ -977,6 +1030,8 @@ const SEARCH_FIND_MAX_TIME_MS = 20000;
 const COUNTRY_ALONE_COUNT_INDEX = 'idx_countries_rep_start';
 // Index phục vụ đếm khi lọc đúng 1 ngành (xem isIndustryAloneCount).
 const INDUSTRY_ALONE_COUNT_INDEX = 'idx_industry_rep_start';
+// Index phục vụ đếm khi lọc OTHER + mức chi tiêu (xem isOtherSpendCount).
+const OTHER_SPEND_COUNT_INDEX = 'idx_other_rep_start';
 
 function isNonEmptyParam(v) {
     if (v === undefined || v === null) return false;
@@ -1118,13 +1173,79 @@ function isIndustryAloneCount(q, countQuery) {
     return true;
 }
 
+// Đếm OTHER + mức chi tiêu (bug 2, retest 26/11 vẫn kẹt "Đang đếm..."):
+// câu đếm gồm {filter_signals.is_other: true, estimated_spend: {$in},
+// is_group_rep, last_seen tươi, creative_rank $in} — mọi field đều nằm
+// trong idx_other_rep_start {is_group_rep, is_other, creative_rank,
+// start_date, last_seen, estimated_spend} nên đếm covered được. Nhưng
+// planner có thể chọn idx_spend_tier_rep_start (estimated_spend đứng
+// đầu) rồi FETCH từng doc để kiểm tra is_other (field không có trong
+// index đó) — spend một mình nhanh, OTHER một mình nhanh, combo kẹt.
+// Ép hint idx_other_rep_start cho đúng combo này, cùng mẫu 2 lớp kiểm
+// tra như đếm VN/ngành một mình. CHỈ áp cho câu ĐẾM; list find() giữ
+// nguyên planner (đo lại bằng explain sau deploy trước khi đụng find).
+function isOtherSpendCount(q, countQuery) {
+    if (!q || typeof q !== 'object') return false;
+    if (!countQuery || typeof countQuery !== 'object' || Array.isArray(countQuery)) return false;
+    // (1a) Đúng nước 'other' và có ít nhất 1 mức chi tiêu (tier).
+    const codes = normalizeCountryCodes(q.country);
+    if (codes.length !== 1 || codes[0] !== 'other') return false;
+    if (!normalizeSpendTiers(q.estimated_spend).length) return false;
+    // (1b) Không filter nào khác có hiệu lực.
+    if (isNonEmptyParam(q.text)) return false;
+    if (isNonEmptyParam(q.date_from) || isNonEmptyParam(q.date_to)) return false;
+    if (isNonEmptyParam(q.level)) return false;
+    if (isFiniteNumberParam(q.min_spend_usd) || isFiniteNumberParam(q.max_spend_usd)) return false;
+    if (isFiniteNumberParam(q.min_score) || isFiniteNumberParam(q.max_score)) return false;
+    if (isFiniteNumberParam(q.min_trending_score)) return false;
+    if (normalizeFunnelValues(q.funnel).length) return false;
+    if (isNonEmptyParam(q.scaling_level)) return false;
+    if (isNonEmptyParam(q.page_name)) return false;
+    if (isNonEmptyParam(q.domain)) return false;
+    if (q.is_active !== undefined) return false;
+    if (normalizePresetNames(q.filter).length) return false;
+    if (normalizeIndustryValues(q.industry).length) return false;
+    // (2a) countQuery phải có cờ is_other=true và estimated_spend $in.
+    if (countQuery['filter_signals.is_other'] !== true) return false;
+    const spend = countQuery.estimated_spend;
+    if (!spend || typeof spend !== 'object' || Array.isArray(spend)) return false;
+    if (!Array.isArray(spend.$in) || !spend.$in.length) return false;
+    // (2b) Top-level chỉ được có is_other, estimated_spend và $and.
+    for (const k of Object.keys(countQuery)) {
+        if (k !== 'filter_signals.is_other' && k !== 'estimated_spend' && k !== '$and') return false;
+    }
+    // (2c) Mọi nhánh $and phải là điều kiện mặc định của search list.
+    const ands = countQuery.$and;
+    if (!Array.isArray(ands) || !ands.length) return false;
+    for (const c of ands) {
+        if (!c || typeof c !== 'object' || Array.isArray(c)) return false;
+        const keys = Object.keys(c);
+        if (keys.length !== 1) return false;
+        if (keys[0] === 'is_group_rep') { if (c.is_group_rep !== true) return false; continue; }
+        if (keys[0] === 'last_seen') {
+            const v = c.last_seen;
+            if (!v || typeof v !== 'object' || !Number.isFinite(v.$gte)) return false;
+            continue;
+        }
+        if (keys[0] === 'creative_rank') {
+            const v = c.creative_rank;
+            if (!v || typeof v !== 'object' || !Array.isArray(v.$in) || !v.$in.length) return false;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 // Options cho countDocuments của /api/ads/search: luôn maxTimeMS 30s;
 // thêm hint idx_countries_rep_start chỉ khi đếm VN một mình,
-// hint idx_industry_rep_start chỉ khi đếm ngành một mình.
+// hint idx_industry_rep_start chỉ khi đếm ngành một mình,
+// hint idx_other_rep_start chỉ khi đếm OTHER + mức chi tiêu.
 function resolveCountOptions(countQuery, q) {
     const opts = { maxTimeMS: COUNT_MAX_TIME_MS };
     if (isIndustryAloneCount(q, countQuery)) opts.hint = INDUSTRY_ALONE_COUNT_INDEX;
     else if (isCountryAloneCount(q, countQuery)) opts.hint = COUNTRY_ALONE_COUNT_INDEX;
+    else if (isOtherSpendCount(q, countQuery)) opts.hint = OTHER_SPEND_COUNT_INDEX;
     return opts;
 }
 
@@ -1520,6 +1641,9 @@ function initSearchServer(dbInstance) {
     async function fetchSimilarAds(sourceAd, adId, page, limit) {
         const tiers = buildSimilarTiers(sourceAd, adId);
         const similarAds = await fillSimilarAds(adsCol, tiers, page, limit, SIMILAR_PROJECTION, similarDupTextOf(sourceAd));
+        // Bug 6: thumbnail video tạm hết hạn -> null (placeholder thay
+        // vì khung đen), cùng cách search list đã làm.
+        stripExpiredVideoThumbs(similarAds);
         let total;
         if (similarAds.length < limit) {
             // Fill đã cạn mọi tầng (số đã lấy < need) -> total chính xác
@@ -1761,6 +1885,10 @@ function initSearchServer(dbInstance) {
                 if ('preset_priority' in sortInfo.sortOptions) andConds.push({ preset_priority: { $exists: true } });
                 if ('creative_rank' in sortInfo.sortOptions) andConds.push({ creative_rank: { $exists: true } });
             }
+            // Bug 4: sort scaling_score thuần (không preset) ép ảnh thật
+            // như preset ready_to_scale — xem shouldForceThumbnailForScalingSort.
+            const scalingSortThumbOnly = shouldForceThumbnailForScalingSort(sortInfo, presetList);
+            if (scalingSortThumbOnly) andConds.push(REAL_THUMBNAIL_COND);
             if (andConds.length) query.$and = [...(query.$and || []), ...andConds];
 
             // Đếm: countDocuments trên query chậm (regex/$or) có thể vượt
@@ -1833,14 +1961,10 @@ function initSearchServer(dbInstance) {
 
             // Strip thumbnail video tạm đã hết hạn (token oe hết hạn sau
             // vài giờ): trả null để FE hiện placeholder thay vì khung đen.
-            // Chỉ strip ở search list (không đụng endpoint video / similar).
-            {
-                const nowSecStrip = Math.floor(Date.now() / 1000);
-                for (const doc of results) {
-                    const t = doc && doc.thumbnail_r2;
-                    if (typeof t === 'string' && /\.mp4/i.test(t) && !videoUrlFresh(t, nowSecStrip)) doc.thumbnail_r2 = null;
-                }
-            }
+            stripExpiredVideoThumbs(results);
+            // Bug 5: tính lại is_active từ last_seen để nhãn trên card
+            // khớp điều kiện lọc (cờ analyzer ghi lúc FULL đã cũ).
+            refreshIsActive(results);
 
             // Echo để FE debug: bộ lọc nào đã áp dụng thật, giá trị nào bị
             // bỏ (lạ), đường fallback nào đang chạy. Chỉ thêm field, không
@@ -1859,6 +1983,7 @@ function initSearchServer(dbInstance) {
                     estimated_spend: normalizeSpendTiers(estimated_spend),
                     funnel: funnel ? normalizeFunnelValues(funnel) : [],
                     sort_by: sortInfo.sortOptions,
+                    scaling_sort_thumbnail_only: scalingSortThumbOnly,
                     product_first: productFirstEnabled(q),
                     hide_entertainment: hideEntertainmentEnabled(q, industryValues),
                     dedupe: dedupeOn,
@@ -2077,7 +2202,12 @@ function initSearchServer(dbInstance) {
             const ads = await adsCol.find(query)
                 .project({
                     ad_archive_id: 1, ad_library_url: 1, text: { $substrCP: ["$text", 0, 150] }, score: 1, level: 1,
-                    is_active: 1, start_date: 1, estimated_spend_usd: 1, estimated_reach: 1,
+                    // Bug 6 (26/11): trước đây projection THIẾU thumbnail_r2
+                    // nên mục "cùng Fanpage" chỉ có URL fbcdn gốc đã hết
+                    // hạn -> 20/20 mất ảnh. Trả thêm thumbnail R2 bền +
+                    // last_seen để tính lại is_active (bug 5).
+                    is_active: 1, last_seen: 1, start_date: 1, estimated_spend_usd: 1, estimated_reach: 1,
+                    thumbnail_r2: 1, thumbnail_local: 1,
                     images: { $slice: 1 }, videos: { $slice: 1 }
                 })
                 // Active lên trước (ad đã dừng/không còn trong Library
@@ -2088,6 +2218,12 @@ function initSearchServer(dbInstance) {
                 .skip(skip)
                 .limit(limit)
                 .toArray();
+
+            // Bug 6 + bug 5: strip video tạm hết hạn, tính lại is_active
+            // từ last_seen (sort ở trên vẫn theo cờ đã lưu — chỉ nhãn
+            // hiển thị được làm tươi, thứ tự list không đổi).
+            stripExpiredVideoThumbs(ads);
+            refreshIsActive(ads);
 
             return res.json({
                 success: true,
@@ -2108,7 +2244,7 @@ function initSearchServer(dbInstance) {
     });
 }
 
-module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, hideEntertainmentEnabled, buildHideEntertainmentCondition, buildHideGamblingCondition, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS, isCountryAloneCount, isIndustryAloneCount, resolveCountOptions, countSearchTotal, COUNTRY_ALONE_COUNT_INDEX, INDUSTRY_ALONE_COUNT_INDEX, COUNT_MAX_TIME_MS, SEARCH_FIND_MAX_TIME_MS, normalizePageLimit };
+module.exports = { initSearchServer, buildPresetConditions, resolvePresetSort, resolveSearchSort, presetUsesFlag, productFirstEnabled, hideEntertainmentEnabled, buildHideEntertainmentCondition, buildHideGamblingCondition, FILTER_DEFAULTS, buildTextSearchQuery, textSearchLimit, stripViDiacritics, INDUSTRIES, buildIndustryCondition, buildCountryCondition, buildDomainCondition, prefixRegex, escapeRegExp, lowerPrefixRange, normalizeQueryParams, normalizeCountryCodes, countryMatchValues, normalizeIndustryValues, normalizeSpendTiers, normalizeFunnelValues, parseActiveParam, buildActiveCondition, parseDateParam, normalizeSortField, normalizeSortOrder, normalizePresetNames, buildLevelCondition, buildScalingCondition, buildSpendCondition, buildIndustryTextCondition, refreshSchemaProbe, dedupeEnabled, buildSimilarTiers, buildSimilarCountQuery, fillSimilarAds, SIMILAR_TEXT_PREFIX_LEN, countSimilarTotal, pickVideoUrl, videoUrlFresh, refreshEsDedupeProbe, stripCountExistsConditions, countMediaUsage, buildFreshAdCondition, SCALING_HARD_MAX_RUN_DAYS, STALE_AD_MAX_AGE_DAYS, STALE_AD_MAX_AGE_MS, isCountryAloneCount, isIndustryAloneCount, isOtherSpendCount, resolveCountOptions, countSearchTotal, COUNTRY_ALONE_COUNT_INDEX, INDUSTRY_ALONE_COUNT_INDEX, OTHER_SPEND_COUNT_INDEX, COUNT_MAX_TIME_MS, SEARCH_FIND_MAX_TIME_MS, normalizePageLimit, computeIsActive, refreshIsActive, stripExpiredVideoThumbs, shouldForceThumbnailForScalingSort, ACTIVE_WINDOW_MS };
 
 // ===== CHẠY ĐỘC LẬP: node searchApi.js (server search thường trực, pm2) =====
 // Analyzer KHÔNG gọi initSearchServer nữa — server tự kết nối Mongo, retry
